@@ -14,6 +14,9 @@ the first attempt?
   intended structure and repairs them (warning `W0004`).
 - **Values, not references.** Values have no shared mutable aliases. Mutation is marked where
   the call happens, as `(mut x)`, so data races and aliasing bugs cannot be written.
+- **Functions are arguments, never values.** A parameter can be `(Fn A B R)` and the caller
+  passes a `lambda`; `map`, `filter`, `fold`, `sort-by` and friends take them. Lambdas only read
+  their surroundings and cannot be stored, so there are no capture rules and no allocation.
 - **Effects are capabilities.** A function can print, read files or open sockets only if it was
   given that capability, and capabilities come down from `main`.
 - **No undefined behavior.** Integer overflow, out-of-bounds access and failed `expect` stop the
@@ -165,8 +168,11 @@ target/release/ail web ../examples/dodge.ail          # build for the browser an
 | [`bench/`](bench) | ail vs Rust: native tasks, HTTP server, browser game |
 | [`experiment/`](experiment) | AI agents writing ail vs Rust vs TypeScript |
 | [`examples/`](examples) | programs, including a JSON REST API and a browser game |
+| [`tests/`](tests) | language tests, run with `ail test` |
+| [`tools/`](tools) | `regress.py` (every program still builds and passes) and `ab.py` (compiler A/B timing) |
 
 ## Status
 
-ail is at v0.3, an early research language. The pieces above work and are measured. Generics
-for user types, lambdas, concurrency and modules are not built yet.
+ail is an early research language: v0.3 is released and v0.4 (string views, functions as
+arguments) is in development on `main`. The pieces above work and are measured. Generics for user
+types, concurrency and modules are not built yet.

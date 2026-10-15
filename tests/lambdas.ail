@@ -58,7 +58,8 @@
   (let xs (vec 1 2 3 4))
   (assert (== (fold xs 0 (lambda (acc x) (+ acc x))) 10))
   (assert (== (fold xs "" (lambda (acc x) (str acc x))) "1234"))
-  (let pairs (fold xs (Vec I64) (vec) (lambda (acc x) (concat acc (vec x x)))))
+  (let none-yet (Vec I64) (vec))
+  (let pairs (fold xs none-yet (lambda (acc x) (concat acc (vec x x)))))
   (assert (== (len pairs) 8)))
 
 (test "sort-by, min-by and max-by"
@@ -96,7 +97,7 @@
 (test "loops inside a lambda"
   (let xs (vec 3 5))
   (assert (== (map xs (lambda (n)
-                (var s 0)
-                (for i (range 0 n) (if (== i 2) continue) (set s (+ s i)))
-                s))
+                        (var s 0)
+                        (for i (range 0 n) (if (== i 2) continue) (set s (+ s i)))
+                        s))
               (vec 1 8))))

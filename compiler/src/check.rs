@@ -39,6 +39,8 @@ pub enum Res {
     None,
     UnitVariant(String, usize),
     UserFn(String),
+    /// Call of a parameter of type (Fn ...).
+    LocalFn(BindId),
     Variant(String, usize),
     Builtin(String),
     Nothing,
@@ -53,6 +55,8 @@ pub struct Checked {
     pub decl: HashMap<usize, BindId>,
     /// Params of each fn, in order.
     pub fn_params: HashMap<String, Vec<BindId>>,
+    /// Params of each lambda (by expr id), in order.
+    pub lambda_params: HashMap<u32, Vec<BindId>>,
     /// Binding of `result` in ensures clauses, per fn.
     pub result_binding: HashMap<String, BindId>,
 }
@@ -71,6 +75,9 @@ pub fn check(prog: &Program) -> (Checked, Vec<Diag>) {
         bindings: Vec::new(),
         decl: HashMap::new(),
         fn_params: HashMap::new(),
+        lambda_params: HashMap::new(),
+        lambda_floor: None,
+        loop_floor: 0,
         result_binding: HashMap::new(),
         diags: Vec::new(),
         scopes: Vec::new(),
@@ -133,6 +140,7 @@ pub fn check(prog: &Program) -> (Checked, Vec<Diag>) {
         decl: c.decl,
         fn_params: c.fn_params,
         result_binding: c.result_binding,
+        lambda_params: c.lambda_params,
     };
     (checked, c.diags)
 }
@@ -165,6 +173,11 @@ struct Checker {
     clash_uses: HashMap<String, Vec<Span>>,
     /// Expressions whose value is discarded (statement position): their branches may differ in type.
     stmt_ids: std::collections::HashSet<u32>,
+    lambda_params: HashMap<u32, Vec<BindId>>,
+    /// Inside a lambda: bindings below this id belong to the code around it (read-only there).
+    lambda_floor: Option<usize>,
+    /// break/continue need a loop deeper than this (a lambda body starts a new level).
+    loop_floor: u32,
 }
 
 /// Names that cannot be variables or functions. Clause names (params, body...) are not here:
@@ -172,6 +185,7 @@ struct Checker {
 const KEYWORDS: &[&str] = &[
     "let", "var", "set", "if", "do", "while", "for", "break", "continue", "return", "match",
     "case", "new", "with", "try", "as", "copy", "mut", "range", "true", "false", "unit", "none",
+    "lambda",
 ];
 
 pub const BUILTINS: &[&str] = &[
@@ -230,6 +244,16 @@ pub const BUILTINS: &[&str] = &[
     "reverse",
     "sum",
     "map",
+    "filter",
+    "any",
+    "all",
+    "count",
+    "find",
+    "find-index",
+    "fold",
+    "sort-by",
+    "min-by",
+    "max-by",
     "put",
     "get",
     "has",
@@ -457,6 +481,9 @@ impl Checker {
                             ));
                         }
                         let t = self.resolve_type(te);
+                        if t.contains_fn() {
+                            self.err(Diag::error("E0320", te.span, "functions can only be passed as parameters: (Fn ...) cannot be stored in data, returned or bound with let"));
+                        }
                         if t.contains_cap() {
                             self.err(Diag::error(
                                 "E0304",
@@ -481,6 +508,9 @@ impl Checker {
                             ));
                         }
                         let ts: Vec<Ty> = tys.iter().map(|t| self.resolve_type(t)).collect();
+                        if ts.iter().any(|t| t.contains_fn()) {
+                            self.err(Diag::error("E0320", *vspan, "functions can only be passed as parameters: (Fn ...) cannot be stored in data, returned or bound with let"));
+                        }
                         if ts.iter().any(|t| t.contains_cap()) {
                             self.err(Diag::error(
                                 "E0304",
@@ -516,6 +546,14 @@ impl Checker {
                             f.ret.as_ref().unwrap().span,
                             "functions cannot return capabilities",
                         ));
+                    }
+                    if ret.contains_fn() {
+                        self.err(Diag::error("E0320", f.ret.as_ref().unwrap().span, "functions can only be passed as parameters: (Fn ...) cannot be stored in data, returned or bound with let"));
+                    }
+                    for (p, (_, t, m)) in f.params.iter().zip(params.iter()) {
+                        if t.contains_fn() && (*m || !matches!(t, Ty::Fn(..))) {
+                            self.err(Diag::error("E0320", p.ty.span, "a function parameter is written (f (Fn A B Result)); it cannot be mut or sit inside another type"));
+                        }
                     }
                     self.info.fns.insert(f.name.clone(), FnSig { params, ret });
                 }
@@ -681,6 +719,22 @@ impl Checker {
                     ));
                 }
                 return Ty::Map(Box::new(k), Box::new(v));
+            }
+            "Fn" => {
+                if te.args.is_empty() {
+                    self.err(Diag::error(
+                        "E0108",
+                        te.span,
+                        "a function type lists its argument types and then its result: (Fn I64 I64 Bool)",
+                    ));
+                    return Ty::Err;
+                }
+                let mut ts: Vec<Ty> = te.args.iter().map(|a| self.resolve_type(a)).collect();
+                let r = ts.pop().unwrap();
+                if ts.iter().chain(std::iter::once(&r)).any(|t| t.contains_fn()) {
+                    self.err(Diag::error("E0320", te.span, "a (Fn ...) cannot take or return functions"));
+                }
+                return Ty::Fn(ts, Box::new(r));
             }
             "Result" => {
                 if !arity(self, 2, "(Result T E)") {
@@ -1018,6 +1072,15 @@ impl Checker {
             },
             ExprKind::Str(_) => Ty::Str,
             ExprKind::Var(name) => self.check_var(e, name, exp),
+            ExprKind::Lambda(..) => {
+                self.err(
+                    Diag::error("E0321", e.span, "a lambda can only be passed as an argument where a (Fn ...) parameter is expected")
+                        .note("declare the parameter as (f (Fn A B Result)) and call it as (f a b)"),
+                );
+                let n = match &e.kind { ExprKind::Lambda(ps, _) => ps.len(), _ => 0 };
+                self.check_lambda(e, &vec![Ty::Err; n], &Ty::Err);
+                Ty::Err
+            }
             ExprKind::Let {
                 name,
                 name_span,
@@ -1056,6 +1119,9 @@ impl Checker {
                     ));
                 }
                 let vt = if vt == Ty::Never { Ty::Err } else { vt };
+                if vt.contains_fn() {
+                    self.err(Diag::error("E0320", e.span, "functions can only be passed as parameters: (Fn ...) cannot be stored in data, returned or bound with let"));
+                }
                 let mut b = self.local(name, vt, BindKind::Local { mutable: *mutable });
                 b.decl_kw = Some(*kw_span);
                 let bid = self.bind(b);
@@ -1209,7 +1275,21 @@ impl Checker {
                         e.span,
                         "break/continue outside of a loop",
                     ));
+                } else if self.loop_depth <= self.loop_floor {
+                    self.err(Diag::error(
+                        "E0323",
+                        e.span,
+                        "break/continue cannot leave a lambda",
+                    ));
                 }
+                Ty::Never
+            }
+            ExprKind::Return(_) if self.lambda_floor.is_some() => {
+                self.err(Diag::error(
+                    "E0323",
+                    e.span,
+                    "return cannot leave a lambda: the lambda's value is its last expression",
+                ));
                 Ty::Never
             }
             ExprKind::Return(v) => {
@@ -1315,6 +1395,15 @@ impl Checker {
                         Ty::Err
                     }
                 }
+            }
+            ExprKind::Try(inner) if self.lambda_floor.is_some() => {
+                self.check(inner, None);
+                self.err(Diag::error(
+                    "E0323",
+                    e.span,
+                    "try cannot leave a lambda; handle the Option/Result inside it with match or unwrap-or",
+                ));
+                Ty::Err
             }
             ExprKind::Try(inner) => {
                 let it = self.check(inner, None);
@@ -1450,6 +1539,14 @@ impl Checker {
         if let Some(b) = self.lookup(name) {
             self.res[id] = Res::Local(b);
             let t = self.bindings[b].ty.clone();
+            if matches!(t, Ty::Fn(..)) {
+                self.err(Diag::error(
+                    "E0321",
+                    e.span,
+                    &format!("'{name}' is a function: call it as ({name} ...) or pass it on as an argument"),
+                ));
+                return Ty::Err;
+            }
             if self.in_contract && matches!(t, Ty::Cap(_)) {
                 self.err(Diag::error(
                     "E0303",
@@ -1619,6 +1716,17 @@ impl Checker {
             return None;
         };
         let b = self.bindings[root].clone();
+        if self.lambda_floor.is_some_and(|f| root < f) {
+            self.err(
+                Diag::error(
+                    "E0322",
+                    place.span,
+                    &format!("a lambda cannot {what} '{}', which belongs to the code around it", b.name),
+                )
+                .note("lambdas only read their surroundings; compute a value with the lambda (map, fold, filter...) and assign it after the call"),
+            );
+            return None;
+        }
         match b.kind {
             BindKind::Local { mutable: true } | BindKind::Param { mutable: true } => {}
             BindKind::Local { mutable: false } => {
@@ -1971,6 +2079,23 @@ impl Checker {
         exp: Option<&Ty>,
     ) -> Ty {
         let id = e.id as usize;
+        if let Some(b) = self.lookup(name) {
+            if let Ty::Fn(ps, r) = self.bindings[b].ty.clone() {
+                self.res[id] = Res::LocalFn(b);
+                if args.len() != ps.len() {
+                    self.err(Diag::error(
+                        "E0211",
+                        nspan,
+                        &format!("'{name}' takes {} argument(s), got {}", ps.len(), args.len()),
+                    ));
+                }
+                for (a, p) in args.iter().zip(ps.iter().chain(std::iter::repeat(&Ty::Err))) {
+                    let x = self.arg_val(a);
+                    self.check_expect(x, p);
+                }
+                return *r;
+            }
+        }
         if self.info.fns.contains_key(name) {
             if let Some(v) = self.clash_uses.get_mut(name) {
                 v.push(nspan);
@@ -2274,8 +2399,23 @@ impl Checker {
                             ),
                         ));
                     }
+                } else if let Ty::Fn(..) = pt {
+                    self.check_fn_arg(x, pt);
                 } else {
                     self.check_expect(x, pt);
+                }
+            }
+        }
+        // A lambda argument cannot read what the same call mutates.
+        for (root, _) in &mut_roots {
+            for a in args {
+                if matches!(a.expr().kind, ExprKind::Lambda(..)) && self.mentions(a.expr(), *root) {
+                    let bname = self.bindings[*root].name.clone();
+                    self.err(Diag::error(
+                        "E0404",
+                        a.expr().span,
+                        &format!("'{bname}' is mutated by this call, so the lambda cannot read it (aliasing)"),
+                    ));
                 }
             }
         }
@@ -2328,6 +2468,100 @@ impl Checker {
             ));
         }
         sig.ret
+    }
+
+    /// An argument for a `(Fn ...)` parameter: a lambda, a fn name, or a Fn parameter passed
+    /// on. A result type of Err in `want` means "infer it". Returns the argument's Fn type.
+    fn check_fn_arg(&mut self, x: &Expr, want: &Ty) -> Ty {
+        let Ty::Fn(ps, r) = want else { return self.check(x, None) };
+        let t = match &x.kind {
+            ExprKind::Lambda(..) => self.check_lambda(x, ps, r),
+            ExprKind::Var(name) => {
+                let id = x.id as usize;
+                if let Some(b) = self.lookup(name) {
+                    self.res[id] = Res::Local(b);
+                    let t = self.bindings[b].ty.clone();
+                    if !matches!(t, Ty::Fn(..)) && !t.is_err() {
+                        self.err(Diag::error("E0321", x.span, &format!("expected a function {want} here, found {t}"))
+                            .note("pass a lambda: (lambda (x) ...)"));
+                    }
+                    t
+                } else if let Some(sig) = self.info.fns.get(name).cloned() {
+                    self.res[id] = Res::UserFn(name.clone());
+                    if sig.params.iter().any(|p| p.2) {
+                        self.err(Diag::error("E0321", x.span, &format!("'{name}' has mut parameters, so it cannot be passed as a function")));
+                    }
+                    Ty::Fn(sig.params.iter().map(|p| p.1.clone()).collect(), Box::new(sig.ret.clone()))
+                } else {
+                    self.check(x, None);
+                    Ty::Err
+                }
+            }
+            _ => {
+                let t = self.check(x, None);
+                if !t.is_err() {
+                    self.err(Diag::error("E0321", x.span, &format!("expected a function {want} here, found {t}"))
+                        .note("pass a lambda: (lambda (x) ...)"));
+                }
+                Ty::Err
+            }
+        };
+        if let Ty::Fn(tp, tr) = &t {
+            let params_ok = tp.len() == ps.len() && tp.iter().zip(ps.iter()).all(|(a, b)| Self::compat(a, b) && Self::compat(b, a));
+            let ret_ok = r.is_err() || Self::compat(tr, r);
+            if !params_ok || !ret_ok {
+                self.err(Diag::error("E0308", x.span, &format!("expected a function {want}, found {t}")));
+            }
+        }
+        self.set_ty(x, t)
+    }
+
+    /// Check a lambda against the parameter types it will receive. `r` Err: infer the result.
+    fn check_lambda(&mut self, e: &Expr, ps: &[Ty], r: &Ty) -> Ty {
+        let ExprKind::Lambda(params, body) = &e.kind else { unreachable!() };
+        if params.len() != ps.len() {
+            self.err(Diag::error(
+                "E0324",
+                e.span,
+                &format!("this lambda takes {} parameter(s), but it is called with {}", params.len(), ps.len()),
+            ));
+        }
+        let saved = (self.loop_depth, self.loop_floor, self.lambda_floor);
+        self.lambda_floor = Some(self.bindings.len());
+        self.loop_depth += 1;
+        self.loop_floor = self.loop_depth;
+        self.scopes.push(HashMap::new());
+        let mut ids = Vec::new();
+        for (i, p) in params.iter().enumerate() {
+            let want = ps.get(i).cloned().unwrap_or(Ty::Err);
+            let t = match &p.ty {
+                Some(te) => {
+                    let t = self.resolve_type(te);
+                    if !want.is_err() && !t.is_err() && t != want {
+                        self.err(Diag::error("E0308", te.span, &format!("this parameter receives {want}, not {t}")));
+                    }
+                    t
+                }
+                None => want,
+            };
+            if KEYWORDS.contains(&p.name.as_str()) {
+                self.err(Diag::error("E0105", p.span, &format!("'{}' is a keyword", p.name)));
+            }
+            ids.push(self.bind(self.local(&p.name, t, BindKind::Param { mutable: false })));
+        }
+        self.lambda_params.insert(e.id, ids);
+        let bt = if r.is_err() {
+            self.check_block(body, None)
+        } else if *r == Ty::Unit {
+            self.check_block(body, None);
+            Ty::Unit
+        } else {
+            self.check_block_expect(body, r, e.span)
+        };
+        self.scopes.pop();
+        (self.loop_depth, self.loop_floor, self.lambda_floor) = saved;
+        let bt = if r.is_err() { bt } else { r.clone() };
+        self.set_ty(e, Ty::Fn(ps.to_vec(), Box::new(bt)))
     }
 
     fn check_builtin(
@@ -2827,9 +3061,74 @@ impl Checker {
                 }
                 el
             }
+            "map" if n == 2 => {
+                let (el, f) = self.hof_head(name, args);
+                let want_r = match exp {
+                    Some(Ty::Vec(r)) => (**r).clone(),
+                    _ => Ty::Err,
+                };
+                let ft = self.check_fn_arg(f, &Ty::Fn(vec![el], Box::new(want_r)));
+                Ty::Vec(Box::new(fn_result(&ft)))
+            }
+            "filter" | "any" | "all" | "count" | "find" | "find-index" => {
+                ar!(2, &format!("({name} vec (lambda (x) condition))"));
+                let (el, f) = self.hof_head(name, args);
+                self.check_fn_arg(f, &Ty::Fn(vec![el.clone()], Box::new(Ty::Bool)));
+                match name {
+                    "filter" => Ty::Vec(Box::new(el)),
+                    "any" | "all" => Ty::Bool,
+                    "count" => Ty::Int(IntK::I64),
+                    "find" => Ty::Opt(Box::new(el)),
+                    _ => Ty::Opt(Box::new(Ty::Int(IntK::I64))),
+                }
+            }
+            "fold" => {
+                ar!(3, "(fold vec initial (lambda (acc x) new-acc))");
+                let xs = self.arg_val(&args[0]);
+                let vt = self.check(xs, None);
+                let el = self.vec_elem(&vt, xs.span, name);
+                let init = self.arg_val(&args[1]);
+                let at = self.check(init, exp);
+                let f = self.arg_val(&args[2]);
+                self.check_fn_arg(f, &Ty::Fn(vec![at.clone(), el], Box::new(at.clone())));
+                at
+            }
+            "min-by" | "max-by" | "sort-by" => {
+                let mut sorted_root = None;
+                let (el, f) = if name == "sort-by" {
+                    ar!(2, "(sort-by (mut vec) (lambda (x) key))");
+                    let (vt, root) = self.arg_mut(&args[0]);
+                    sorted_root = root;
+                    let el = self.vec_elem(&vt, args[0].expr().span, name);
+                    (el, self.arg_val(&args[1]))
+                } else {
+                    ar!(2, &format!("({name} vec (lambda (x) key))"));
+                    self.hof_head(name, args)
+                };
+                let ft = self.check_fn_arg(f, &Ty::Fn(vec![el.clone()], Box::new(Ty::Err)));
+                if let Some(r) = sorted_root {
+                    if self.mentions(f, r) {
+                        let bname = self.bindings[r].name.clone();
+                        self.err(Diag::error(
+                            "E0404",
+                            f.span,
+                            &format!("'{bname}' is being sorted, so the key function cannot read it (aliasing)"),
+                        ));
+                    }
+                }
+                let k = fn_result(&ft);
+                if !self.info.orderable(&k) {
+                    self.err(Diag::error(
+                        "E0214",
+                        f.span,
+                        &format!("{name} needs a key that can be ordered, found {k}"),
+                    ));
+                }
+                if name == "sort-by" { Ty::Unit } else { Ty::Opt(Box::new(el)) }
+            }
             "map" => {
                 if n != 0 {
-                    self.err(Diag::error("E0211", span, "(map) creates an empty map and takes no arguments; add entries with (put (mut m) k v)").note("ail has no higher-order map; use a for loop"));
+                    self.err(Diag::error("E0211", span, "(map) with no arguments creates an empty map; (map vec (lambda (x) ...)) transforms a Vec"));
                 }
                 match exp {
                     Some(t @ Ty::Map(..)) => t.clone(),
@@ -3310,6 +3609,23 @@ impl Checker {
         }
     }
 
+    /// The Vec and the function of a higher-order builtin: (name vec f). Catches the Lisp
+    /// argument order (name f vec).
+    fn hof_head<'a>(&mut self, name: &str, args: &'a [Arg]) -> (Ty, &'a Expr) {
+        let xs = self.arg_val(&args[0]);
+        let f = self.arg_val(&args[1]);
+        if matches!(xs.kind, ExprKind::Lambda(..)) && !matches!(f.kind, ExprKind::Lambda(..)) {
+            self.err(
+                Diag::error("E0213", xs.span, &format!("({name} ...) takes the Vec first and the function second"))
+                    .note(format!("write ({name} vec (lambda (x) ...))")),
+            );
+            self.check(f, None);
+            return (Ty::Err, xs);
+        }
+        let vt = self.check(xs, None);
+        (self.vec_elem(&vt, xs.span, name), f)
+    }
+
     fn vec_elem(&mut self, t: &Ty, span: Span, what: &str) -> Ty {
         match t {
             Ty::Vec(el) => (**el).clone(),
@@ -3685,6 +4001,13 @@ fn ctor_key(name: &str) -> String {
     }
 }
 
+fn fn_result(t: &Ty) -> Ty {
+    match t {
+        Ty::Fn(_, r) => (**r).clone(),
+        _ => Ty::Err,
+    }
+}
+
 fn has_float_lit(e: &Expr) -> bool {
     match &e.kind {
         ExprKind::Float(_) => true,
@@ -3788,6 +4111,7 @@ pub fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         }
         ExprKind::Field(b, _, _) => walk(b, f),
         ExprKind::Try(x) | ExprKind::As(_, x) | ExprKind::Copy(x) => walk(x, f),
+        ExprKind::Lambda(_, b) => b.iter().for_each(|x| walk(x, f)),
     }
 }
 

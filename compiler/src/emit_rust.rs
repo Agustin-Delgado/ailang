@@ -283,6 +283,7 @@ pub fn rty(t: &Ty) -> String {
         Ty::Res(a, b) => format!("Result<{}, {}>", rty(a), rty(b)),
         Ty::User(n) => ty_name(n),
         Ty::Cap(c) => format!("ail_rt::{}", c.name()),
+        Ty::Fn(..) => "_".into(),
         Ty::Err => "_".into(),
     }
 }
@@ -391,6 +392,7 @@ pub fn compute_moves(body: &[Expr], ck: &Checked) -> HashSet<u32> {
             ExprKind::Try(x) | ExprKind::As(_, x) | ExprKind::Copy(x) => {
                 expr(x, ck, uses, next, path, depth)
             }
+            ExprKind::Lambda(_, b) => block(b, ck, uses, next, path, depth + 1),
         }
     }
     block(body, ck, &mut uses, &mut next_stmt, &mut path, 0);
@@ -517,7 +519,10 @@ impl<'a> Emitter<'a> {
     }
 
     fn param_rty(&self, t: &Ty, m: bool) -> String {
-        if m {
+        if let Ty::Fn(ps, r) = t {
+            let ps: Vec<String> = ps.iter().map(|p| self.conv_ty(p)).collect();
+            format!("&impl Fn({}) -> {}", ps.join(", "), rty(r))
+        } else if m {
             format!("&mut {}", rty(t))
         } else if *t == Ty::Str {
             "&str".into()
@@ -950,7 +955,13 @@ impl<'a> Emitter<'a> {
                 Some(p) => format!("{p}.clone()"),
                 None => self.rvalue(inner),
             },
+            ExprKind::Lambda(..) => unreachable!("lambdas are emitted where they are passed"),
             ExprKind::Call(name, _, args) => match self.ck.res[id].clone() {
+                Res::LocalFn(b) => {
+                    let f = self.local_name(&self.ck.bindings[b].name);
+                    let parts: Vec<String> = args.iter().map(|a| self.conv_arg(a.expr())).collect();
+                    format!("{f}({})", parts.join(", "))
+                }
                 Res::UserFn(n) => match self.view_fns.get(&n).copied() {
                     Some((_, View::Ref)) => format!("String::from({})", self.user_call(&n, args)),
                     Some((_, View::Cow)) => format!("({}).into_owned()", self.user_call(&n, args)),
@@ -994,6 +1005,13 @@ impl<'a> Emitter<'a> {
                 } else {
                     parts.push(v);
                 }
+            } else if let Ty::Fn(..) = pt {
+                let cl = self.closure(x);
+                parts.push(if matches!(x.kind, ExprKind::Var(_)) && matches!(self.ck.res[x.id as usize], Res::Local(_)) {
+                    cl
+                } else {
+                    format!("&{cl}")
+                });
             } else if *pt == Ty::Str && self.view_arg_ok(x, args, has_mut) {
                 parts.push(self.sv(x));
             } else {
@@ -1359,6 +1377,70 @@ impl<'a> Emitter<'a> {
                 }
             }
             "sum" => format!("{}.iter().sum::<{}>()", self.pv(a(0)), rty(&t)),
+            "map" if args.len() == 2 => {
+                let (f, xs) = (self.closure(a(1)), self.pv(a(0)));
+                let c = self.conv_ref("__e", &self.elem_ty(a(0)));
+                format!("{{ let __f = {f}; {xs}.iter().map(|__e| __f({c})).collect::<Vec<_>>() }}")
+            }
+            "filter" | "any" | "all" | "count" | "find" | "find-index" => {
+                let (f, xs) = (self.closure(a(1)), self.pv(a(0)));
+                let el = self.elem_ty(a(0));
+                let c = self.conv_ref("__e", &el);
+                let cc = self.conv_ref("(*__e)", &el);
+                let body = match name {
+                    "filter" => format!("{xs}.iter().filter(|__e| __f({cc})).cloned().collect::<Vec<_>>()"),
+                    "any" => format!("{xs}.iter().any(|__e| __f({c}))"),
+                    "all" => format!("{xs}.iter().all(|__e| __f({c}))"),
+                    "count" => format!("({xs}.iter().filter(|__e| __f({cc})).count() as i64)"),
+                    "find" => format!("{xs}.iter().find(|__e| __f({cc})).cloned()"),
+                    _ => format!("{xs}.iter().position(|__e| __f({c})).map(|i| i as i64)"),
+                };
+                format!("{{ let __f = {f}; {body} }}")
+            }
+            "fold" => {
+                let xs = self.pv(a(0));
+                let init = self.val(a(1));
+                let f = self.closure(a(2));
+                let acc_t = self.ty(a(1)).clone();
+                let el = self.elem_ty(a(0));
+                let ca = self.conv_ref("(&__acc)", &acc_t);
+                let ce = self.conv_ref("__e", &el);
+                format!(
+                    "{{ let __f = {f}; let mut __acc: {} = {init}; for __e in {xs}.iter() {{ __acc = __f({ca}, {ce}); }} __acc }}",
+                    rty(&acc_t)
+                )
+            }
+            "sort-by" => {
+                let f = self.closure(a(1));
+                let el = self.elem_ty(a(0));
+                let k = match self.ty(a(1)) {
+                    Ty::Fn(_, r) => (**r).clone(),
+                    _ => Ty::Err,
+                };
+                let (ca, cb) = (self.conv_ref("__a", &el), self.conv_ref("__b", &el));
+                let cmp = key_cmp(&k, "__ka", "__kb");
+                let p = self.mut_place(&args[0]);
+                if self.is_copy(&k) {
+                    // Cheap keys are recomputed per comparison; others once per element.
+                    format!("{{ let __f = {f}; {p}.sort_by(|__a, __b| {{ let __ka = __f({ca}); let __kb = __f({cb}); {cmp} }}); }}")
+                } else {
+                    let ce = self.conv_ref("__e", &el);
+                    let cmp = key_cmp(&k, "(*__ka)", "(*__kb)");
+                    format!("{{ let __f = {f}; let __keys: Vec<_> = {p}.iter().map(|__e| __f({ce})).collect(); ail_rt::sort_by_keys(&mut {p}, __keys, |__ka, __kb| {cmp}); }}")
+                }
+            }
+            "min-by" | "max-by" => {
+                let (f, xs) = (self.closure(a(1)), self.pv(a(0)));
+                let el = self.elem_ty(a(0));
+                let k = match self.ty(a(1)) {
+                    Ty::Fn(_, r) => (**r).clone(),
+                    _ => Ty::Err,
+                };
+                let c = self.conv_ref("__e", &el);
+                // First element with the smallest (or largest) key.
+                let cmp = if name == "min-by" { key_cmp(&k, "__x.0", "__y.0") } else { key_cmp(&k, "__y.0", "__x.0") };
+                format!("{{ let __f = {f}; {xs}.iter().map(|__e| (__f({c}), __e)).min_by(|__x, __y| {cmp}).map(|(_, __e)| __e.clone()) }}")
+            }
             "map" => "ail_rt::AilMap::default()".into(),
             "put" => {
                 if let Some(code) = self.fused_update(args) {
@@ -1545,6 +1627,85 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// How a value of type `t` is passed to a function: by value when it is cheap to copy,
+    /// as `&str` for strings, by reference otherwise.
+    fn conv_ty(&self, t: &Ty) -> String {
+        if *t == Ty::Str {
+            "&str".into()
+        } else if self.is_copy(t) {
+            rty(t)
+        } else {
+            format!("&{}", rty(t))
+        }
+    }
+
+    /// Converts `r`, code of type `&T`, to the passing convention of `t`.
+    fn conv_ref(&self, r: &str, t: &Ty) -> String {
+        if *t == Ty::Str {
+            format!("&{r}[..]")
+        } else if self.is_copy(t) {
+            format!("*{r}")
+        } else {
+            r.to_string()
+        }
+    }
+
+    /// An argument passed by the convention of its type.
+    fn conv_arg(&mut self, x: &Expr) -> String {
+        let t = self.ty(x).clone();
+        if t == Ty::Str {
+            self.sv(x)
+        } else if self.is_copy(&t) {
+            self.val(x)
+        } else {
+            self.rf(x)
+        }
+    }
+
+    fn elem_ty(&self, xs: &Expr) -> Ty {
+        match self.ty(xs) {
+            Ty::Vec(t) => (**t).clone(),
+            _ => Ty::Err,
+        }
+    }
+
+    /// A Rust callable for a function argument: a closure for a lambda or a named fn, or the
+    /// Fn parameter itself (already a reference).
+    fn closure(&mut self, f: &Expr) -> String {
+        let Ty::Fn(ps, r) = self.ty(f).clone() else { unreachable!("closure of a non-function") };
+        let ret = rty(&r);
+        match &f.kind {
+            ExprKind::Lambda(_, body) => {
+                let ids = self.ck.lambda_params[&f.id].clone();
+                let params: Vec<String> = ids
+                    .iter()
+                    .zip(ps.iter())
+                    .map(|(b, t)| format!("{}: {}", self.local_name(&self.ck.bindings[*b].name), self.conv_ty(t)))
+                    .collect();
+                let saved = self.cur_view.take();
+                let b = self.block_as(body, r.as_ref() == &Ty::Unit);
+                self.cur_view = saved;
+                format!("(|{}| -> {ret} {b})", params.join(", "))
+            }
+            ExprKind::Var(n) => match self.ck.res[f.id as usize].clone() {
+                Res::Local(b) => self.local_name(&self.ck.bindings[b].name),
+                Res::UserFn(_) => {
+                    let names: Vec<String> = (0..ps.len()).map(|i| format!("__a{i}")).collect();
+                    let params: Vec<String> = names.iter().zip(ps.iter()).map(|(n, t)| format!("{n}: {}", self.conv_ty(t))).collect();
+                    let call = format!("{}({})", fn_name(n), names.join(", "));
+                    let call = match self.view_fns.get(n).copied() {
+                        Some((_, View::Ref)) => format!("String::from({call})"),
+                        Some((_, View::Cow)) => format!("({call}).into_owned()"),
+                        None => call,
+                    };
+                    format!("(|{}| -> {ret} {{ {call} }})", params.join(", "))
+                }
+                other => unreachable!("function value {other:?}"),
+            },
+            _ => unreachable!("function argument"),
+        }
+    }
+
     /// `(set s (str s a b ...))` appends to `s` in place instead of rebuilding it, so building
     /// a string in a loop is linear. Only when the appended parts don't read `s` itself.
     fn append_in_place(&mut self, place: &Expr, value: &Expr) -> Option<String> {
@@ -1610,22 +1771,6 @@ impl<'a> Emitter<'a> {
         args.iter().all(|x| matches!(self.ty(x.expr()), Ty::Str | Ty::Int(IntK::I64)))
     }
 
-    fn format_parts(&mut self, args: &[Arg]) -> (String, Vec<String>) {
-        let mut fmt = String::new();
-        let mut vals = Vec::new();
-        for x in args {
-            let ex = x.expr();
-            if let ExprKind::Str(s) = &ex.kind {
-                fmt.push_str(&s.replace('{', "{{").replace('}', "}}"));
-                continue;
-            }
-            let t = self.ty(ex).clone();
-            fmt.push_str(if t.is_float() { "{:?}" } else { "{}" });
-            vals.push(self.pv(ex));
-        }
-        (fmt, vals)
-    }
-
     fn format(&mut self, args: &[Arg]) -> String {
         if args.is_empty() {
             return "String::new()".into();
@@ -1649,6 +1794,15 @@ impl<'a> Emitter<'a> {
         } else {
             format!("format!({fmt:?}, {})", vals.join(", "))
         }
+    }
+}
+
+/// An Ordering between two keys of type `k`, given as places of type K.
+fn key_cmp(k: &Ty, a: &str, b: &str) -> String {
+    match k {
+        Ty::F32 | Ty::F64 => format!("({a}).total_cmp(&{b})"),
+        Ty::Int(_) | Ty::Str | Ty::Bool => format!("({a}).cmp(&{b})"),
+        _ => format!("({a}).partial_cmp(&{b}).unwrap_or(std::cmp::Ordering::Equal)"),
     }
 }
 
@@ -1980,6 +2134,7 @@ impl<'a> Emitter<'a> {
             | ExprKind::Try(x)
             | ExprKind::As(_, x)
             | ExprKind::Copy(x) => self.plan_views_in(x),
+            ExprKind::Lambda(_, b) => self.plan_views(b),
             _ => {}
         }
     }
