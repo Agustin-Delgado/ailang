@@ -9,7 +9,7 @@ byte-identical in every row. Times are best of 5 whole-process runs; lower ratio
 
 | benchmark | what it exercises | ail s | Rust s | ail/Rust |
 |---|---|---|---|---|
-| trees | allocation-heavy binary trees | 8.71 | 51.71 | **0.17** |
+| trees | allocation-heavy binary trees | 6.96 | 41.85 | **0.17** |
 | strings | string building and search | 0.32 | 0.63 | **0.50** |
 | hashmap | integer hash map | 1.28 | 2.51 | **0.51** |
 | json | build, serialize, parse 40k-record docs (Rust: serde_json::Value) | 1.90 | 3.22 | **0.59** |
@@ -21,12 +21,11 @@ byte-identical in every row. Times are best of 5 whole-process runs; lower ratio
 | nbody | f64 struct math | 3.35 | 3.13 | 1.07 |
 | game | 4000-entity arena, spatial grid collisions | 1.38 | 1.28 | 1.08 |
 | interp | bytecode VM, enum dispatch | 3.74 | 3.25 | 1.15 |
-| wordfreq | tokenize 3M words, count, sort | 0.64 | 0.41 | 1.56 |
+| wordfreq | tokenize 3M words, count, sort | 0.52 | 0.33 | 1.58 |
 
 \* runs under 0.1 s are dominated by process start-up.
-`trees` comes from a separate run with the same compiler, and `wordfreq` from the run before the
-per-thread allocator change: the final full run was stopped by the system for lack of memory after
-the other 11 rows.
+`trees` and `wordfreq` were measured in a second run with the same compiler: the system stopped the
+first full run for lack of memory after the other 11 rows.
 
 ## Browser game (WebAssembly, `web/`)
 
@@ -80,7 +79,7 @@ Rust std server and matches axum without the program having to deal with concurr
 
 ## Where ail still loses, and why
 
-- **wordfreq (1.56)**: every substring is an owned `Str` (`substr` and `lower` allocate). Rust
+- **wordfreq (1.58)**: every substring is an owned `Str` (`substr` and `lower` allocate). Rust
   borrows slices. Borrowed string views are the next step.
 - **interp / game (~1.1)**: always-on overflow checks in the hot loop. The ail game also uses a
   `Vec` of `Vec`s as its grid, while the Rust agent used a flat counting-sort grid.

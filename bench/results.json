@@ -78,18 +78,16 @@
  },
  {
   "bench": "trees",
-  "ail_s": 8.711,
-  "rust_s": 51.706,
-  "ratio": 0.168,
-  "same_output": true,
-  "note": "separate run, same compiler"
+  "ail_s": 6.9574,
+  "rust_s": 41.8532,
+  "ratio": 0.166,
+  "same_output": true
  },
  {
   "bench": "wordfreq",
-  "ail_s": 0.641,
-  "rust_s": 0.41,
-  "ratio": 1.56,
-  "same_output": true,
-  "note": "run before the per-thread allocator change"
+  "ail_s": 0.5216,
+  "rust_s": 0.3302,
+  "ratio": 1.58,
+  "same_output": true
  }
 ]
