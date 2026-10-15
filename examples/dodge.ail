@@ -1,0 +1,97 @@
+; A small browser game: dodge the falling blocks. Build and play with: ail web dodge.ail
+(struct Block (x F64) (y F64) (size F64) (speed F64))
+
+(struct Game
+  (w F64) (h F64)
+  (px F64) (left Bool) (right Bool)
+  (blocks (Vec Block))
+  (spawn-in F64)
+  (score F64) (best F64)
+  (over Bool))
+
+(const PLAYER-W F64 60.0)
+(const PLAYER-H F64 14.0)
+(const PLAYER-SPEED F64 420.0)
+
+(fn init (returns Game)
+  (body
+    (new Game (w 800.0) (h 600.0) (px 370.0) (left false) (right false)
+      (blocks (vec)) (spawn-in 0.0) (score 0.0) (best 0.0) (over false))))
+
+(fn restart (params (g (mut Game)))
+  (body
+    (set (. g blocks) (vec))
+    (set (. g score) 0.0)
+    (set (. g spawn-in) 0.0)
+    (set (. g px) (/ (- (. g w) PLAYER-W) 2.0))
+    (set (. g over) false)))
+
+(fn hits-player (params (g Game) (b Block)) (returns Bool)
+  (body
+    (let top (- (. g h) 40.0))
+    (and (< (. b x) (+ (. g px) PLAYER-W))
+         (> (+ (. b x) (. b size)) (. g px))
+         (< (. b y) (+ top PLAYER-H))
+         (> (+ (. b y) (. b size)) top))))
+
+(fn step (params (g (mut Game)) (dt F64) (rng Rand))
+  (body
+    (var dx 0.0)
+    (if (. g left) (set dx (- dx PLAYER-SPEED)))
+    (if (. g right) (set dx (+ dx PLAYER-SPEED)))
+    (set (. g px) (max 0.0 (min (- (. g w) PLAYER-W) (+ (. g px) (* dx dt)))))
+    (set (. g spawn-in) (- (. g spawn-in) dt))
+    (if (<= (. g spawn-in) 0.0)
+      (do
+        (let size (+ 20.0 (* 40.0 (rand-f64 rng))))
+        (let x (* (rand-f64 rng) (- (. g w) size)))
+        (let speed (+ 150.0 (* 4.0 (. g score)) (* 120.0 (rand-f64 rng))))
+        (push (mut (. g blocks)) (new Block (x x) (y (- size)) (size size) (speed speed)))
+        (set (. g spawn-in) (max 0.15 (- 0.7 (* 0.01 (. g score)))))))
+    (var alive (Vec Block) (vec))
+    (for b (. g blocks)
+      (let moved (with b (y (+ (. b y) (* (. b speed) dt)))))
+      (if (hits-player g moved) (set (. g over) true))
+      (if (< (. moved y) (. g h)) (push (mut alive) moved)))
+    (set (. g blocks) alive)
+    (set (. g score) (+ (. g score) dt))
+    (if (. g over) (set (. g best) (max (. g best) (. g score))))))
+
+(fn update (params (g (mut Game)) (e Event) (rng Rand))
+  (body
+    (match e
+      (case (Event.Tick dt) (if (not (. g over)) (step (mut g) dt rng)))
+      (case (Event.KeyDown k)
+        (match k
+          (case "ArrowLeft" (set (. g left) true))
+          (case "ArrowRight" (set (. g right) true))
+          (case " " (if (. g over) (restart (mut g))))
+          (case _ unit)))
+      (case (Event.KeyUp k)
+        (match k
+          (case "ArrowLeft" (set (. g left) false))
+          (case "ArrowRight" (set (. g right) false))
+          (case _ unit)))
+      (case (Event.MouseMove x _) (set (. g px) (max 0.0 (min (- (. g w) PLAYER-W) (- x (/ PLAYER-W 2.0))))))
+      (case (Event.MouseDown _ _) (if (. g over) (restart (mut g))))
+      (case (Event.Resize w h)
+        (set (. g w) w)
+        (set (. g h) h))
+      (case _ unit))))
+
+(fn view (params (g Game) (gfx Gfx))
+  (body
+    (draw-clear gfx "#10131a")
+    (for b (. g blocks)
+      (draw-rect gfx (. b x) (. b y) (. b size) (. b size) "#ff5d73"))
+    (draw-rect gfx (. g px) (- (. g h) 40.0) PLAYER-W PLAYER-H "#4dd0e1")
+    (draw-text gfx 16.0 14.0 22.0 "#e6e6e6" (str "score " (fmt-float (. g score) 1) "   best " (fmt-float (. g best) 1)))
+    (if (. g over)
+      (do
+        (draw-text gfx (- (/ (. g w) 2.0) 150.0) (- (/ (. g h) 2.0) 40.0) 48.0 "#ffffff" "game over")
+        (draw-text gfx (- (/ (. g w) 2.0) 150.0) (+ (/ (. g h) 2.0) 20.0) 20.0 "#9aa4b2" "press space or click to play again")))))
+
+(test "player collides with a block at its position"
+  (var g (init))
+  (let b (new Block (x (. g px)) (y (- (. g h) 40.0)) (size 20.0) (speed 0.0)))
+  (assert (hits-player g b)))

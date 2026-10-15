@@ -21,7 +21,7 @@ Toolchain: `ail check f.ail --json` (instant, JSON diagnostics with fixes), `ail
 ## Types
 
 `I8 I16 I32 I64 U8 U16 U32 U64 F32 F64 Bool Str Unit`, `(Vec T)`, `(Map K V)` (K: integer, Str, Bool),
-`(Option T)`, `(Result T E)`, user structs and enums, and capabilities `Console Fs Clock Rand Env Net`.
+`(Option T)`, `(Result T E)`, user structs and enums, and capabilities `Console Fs Clock Rand Env Net Gfx`.
 Indexes and lengths are always `I64`.
 
 ## Top-level items
@@ -148,11 +148,28 @@ Effects (first argument is the capability):
 `(http-next net port max-body-bytes)` -> `(Result Request Str)` waits for the next HTTP request (larger bodies
 are rejected with 400 automatically). `(http-respond net req status content-type body)` -> `(Result Unit Str)`.
 
+## Apps for the browser (games and pages)
+
+An app replaces `main` with three functions; extra capability parameters (e.g. `(rng Rand)`) may follow:
+
+```
+(fn init (returns Model))
+(fn update (params (m (mut Model)) (e Event)))      ; Event is a prelude enum
+(fn view (params (m Model) (g Gfx)))                 ; draw on a canvas, every frame
+; or (fn page (params (m Model)) (returns Str))      ; HTML; elements with data-on="name" send Click/Input
+```
+
+Drawing (pixels as F64, colors as CSS strings): `(draw-clear g color)` `(draw-rect g x y w h color)`
+`(draw-circle g x y r color)` `(draw-line g x1 y1 x2 y2 width color)` `(draw-text g x y size color text)`.
+`ail web app.ail` builds to WebAssembly and serves it; `ail build app.ail --target web -o dir` writes the files.
+
 ## Prelude types (always available)
 
 ```
 (enum Json (Null) (Bool Bool) (Num F64) (Str Str) (Arr (Vec Json)) (Obj (Map Str Json)))
 (struct Request (id I64) (method Str) (path Str) (query (Map Str Str)) (headers (Map Str Str)) (body Str))
+(enum Event (Tick F64) (KeyDown Str) (KeyUp Str) (MouseDown F64 F64) (MouseUp F64 F64) (MouseMove F64 F64)
+  (Click Str) (Input Str Str) (Resize F64 F64))      ; Tick carries seconds since the last frame
 ```
 
 `(json-parse text)` -> `(Result Json Str)`, `(json-str j)` -> Str (compact, object keys sorted).

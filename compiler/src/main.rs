@@ -5,6 +5,7 @@ mod emit_rust;
 mod parinfer;
 mod runtime;
 mod runtime_net;
+mod runtime_web;
 mod sexpr;
 mod types;
 
@@ -21,6 +22,8 @@ usage:
   ail run   <file.ail> [args...]    compile (cached) and run
   ail test  <file.ail> [--json]     run (test ...) blocks
   ail build <file.ail> [-o out]     native optimized binary
+  ail build <file.ail> --target web [-o dir]   browser app: dir/index.html + dir/app.wasm
+  ail web   <file.ail> [--port 8000]           build for the browser and serve it locally
   ail fix   <file.ail>              apply every machine-applicable fix, repeatedly
   ail emit  <file.ail>              print the generated Rust
   ail spec                          print the language specification
@@ -53,6 +56,8 @@ fn fill_sentinels(src: &str, diags: &mut [Diag]) {
 const PRELUDE: &str = "
 (enum Json (Null) (Bool Bool) (Num F64) (Str Str) (Arr (Vec Json)) (Obj (Map Str Json)))
 (struct Request (id I64) (method Str) (path Str) (query (Map Str Str)) (headers (Map Str Str)) (body Str))
+(enum Event (Tick F64) (KeyDown Str) (KeyUp Str) (MouseDown F64 F64) (MouseUp F64 F64) (MouseMove F64 F64)
+  (Click Str) (Input Str Str) (Resize F64 F64))
 ";
 
 fn frontend(src: &str) -> Result<Front, Vec<Diag>> {
@@ -166,6 +171,8 @@ struct Opts {
     json: bool,
     fast: bool,
     native: bool,
+    web: bool,
+    port: u16,
     out: Option<String>,
 }
 
@@ -184,7 +191,7 @@ fn main() -> ExitCode {
         eprint!("{USAGE}");
         return ExitCode::from(2);
     };
-    let mut opts = Opts { json: false, fast: false, native: false, out: None };
+    let mut opts = Opts { json: false, fast: false, native: false, web: cmd == "web", port: 8000, out: None };
     let mut prog_args = Vec::new();
     let mut i = 2;
     while i < argv.len() {
@@ -192,9 +199,24 @@ fn main() -> ExitCode {
             "--json" if cmd != "run" => opts.json = true,
             "--fast" if cmd != "run" || prog_args.is_empty() => opts.fast = true,
             "--native" if cmd != "run" || prog_args.is_empty() => opts.native = true,
-            "-o" if cmd == "build" => {
+            "-o" if cmd == "build" || cmd == "web" => {
                 i += 1;
                 opts.out = argv.get(i).cloned();
+            }
+            "--target" if cmd == "build" || cmd == "emit" => {
+                i += 1;
+                match argv.get(i).map(|s| s.as_str()) {
+                    Some("web") => opts.web = true,
+                    Some("native") => opts.web = false,
+                    other => {
+                        eprintln!("unknown target {:?}; use native or web", other.unwrap_or(""));
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--port" if cmd == "web" => {
+                i += 1;
+                opts.port = argv.get(i).and_then(|p| p.parse().ok()).unwrap_or(8000);
             }
             "--" if cmd == "run" => {
                 prog_args.extend(argv[i + 1..].iter().cloned());
@@ -257,7 +279,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        "emit" | "build" | "run" | "test" => {
+        "emit" | "build" | "run" | "test" | "web" => {
             let (f, src) = match frontend_lenient(&src) {
                 Ok(x) => x,
                 Err(d) => {
@@ -268,7 +290,21 @@ fn main() -> ExitCode {
             if !opts.json {
                 report(&f.warnings, &src, &fname, false);
             }
-            let mode = if cmd == "test" { emit_rust::Mode::Test } else { emit_rust::Mode::Run };
+            let mode = if cmd == "test" {
+                emit_rust::Mode::Test
+            } else if opts.web {
+                if !f.ck.info.fns.contains_key("init") {
+                    eprintln!("the web target needs an app: (fn init ...), (fn update ...) and (fn view ...) or (fn page ...)");
+                    return ExitCode::from(1);
+                }
+                emit_rust::Mode::Web
+            } else {
+                if !f.ck.info.fns.contains_key("main") && cmd != "emit" {
+                    eprintln!("{fname} is an app (init/update/view); build it with --target web or run it with `ail web`");
+                    return ExitCode::from(1);
+                }
+                emit_rust::Mode::Run
+            };
             if cmd == "test" && !f.prog.items.iter().any(|i| matches!(i, ast::Item::Test(_))) {
                 eprintln!("no (test ...) blocks in {fname}");
                 return ExitCode::from(1);
@@ -287,6 +323,20 @@ fn main() -> ExitCode {
                     return ExitCode::from(3);
                 }
             };
+            if opts.web {
+                let dir = PathBuf::from(opts.out.clone().unwrap_or_else(|| {
+                    format!("{}-web", Path::new(file).file_stem().unwrap().to_string_lossy())
+                }));
+                std::fs::create_dir_all(&dir).expect("create output dir");
+                std::fs::copy(&bin, dir.join("app.wasm")).expect("copy wasm");
+                let title = Path::new(file).file_stem().unwrap().to_string_lossy().to_string();
+                std::fs::write(dir.join("index.html"), runtime_web::HOST_HTML.replace("{TITLE}", &title)).expect("write html");
+                eprintln!("built {}", dir.display());
+                if cmd == "web" {
+                    return serve(&dir, opts.port);
+                }
+                return ExitCode::SUCCESS;
+            }
             if cmd == "build" {
                 let out = opts.out.clone().unwrap_or_else(|| {
                     let stem = Path::new(file).file_stem().unwrap().to_string_lossy().to_string();
@@ -304,6 +354,40 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Minimal static file server for `ail web` (wasm must be served over http).
+fn serve(dir: &Path, port: u16) -> ExitCode {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("cannot listen on port {port}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    eprintln!("serving http://localhost:{port}/  (Ctrl+C to stop)");
+    for stream in listener.incoming().flatten() {
+        let mut s = stream;
+        let mut line = String::new();
+        if BufReader::new(&s).read_line(&mut line).is_err() {
+            continue;
+        }
+        let path = line.split_whitespace().nth(1).unwrap_or("/").split('?').next().unwrap_or("/").to_string();
+        let name = if path == "/" { "index.html".to_string() } else { path.trim_start_matches('/').to_string() };
+        let safe = !name.contains("..") && !name.contains('\\');
+        match std::fs::read(dir.join(&name)) {
+            Ok(body) if safe => {
+                let ct = if name.ends_with(".wasm") { "application/wasm" } else if name.ends_with(".html") { "text/html; charset=utf-8" } else { "application/octet-stream" };
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", body.len());
+                let _ = s.write_all(&body);
+            }
+            _ => {
+                let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn fnv(s: &str) -> u64 {
@@ -327,9 +411,12 @@ fn compile(rust: &str, test: bool, o: &Opts) -> Result<PathBuf, String> {
     if o.native {
         flags.extend(["-C", "target-cpu=native"]);
     }
+    if o.web {
+        flags.extend(["--target", "wasm32-unknown-unknown", "--crate-type", "cdylib"]);
+    }
     let key = format!("{:016x}", fnv(&format!("{}{}", rust, flags.join(" "))));
     let dir = std::env::temp_dir().join("ail-cache").join(&key);
-    let bin = dir.join(if cfg!(windows) { "prog.exe" } else { "prog" });
+    let bin = dir.join(if o.web { "prog.wasm" } else if cfg!(windows) { "prog.exe" } else { "prog" });
     if bin.exists() {
         return Ok(bin);
     }
