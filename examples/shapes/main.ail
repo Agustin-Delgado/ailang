@@ -1,0 +1,9 @@
+; A program split across files: (use name) loads name.ail next to this file.
+(use geo/shapes)
+(use report)
+
+(fn main (params (con Console))
+  (body
+    (let all (vec (Shape.Circle 1.0) (Shape.Rect 2.0 3.0) (Shape.Circle 0.5)))
+    (println con (summary all))
+    (println con "largest: " (fmt-float (expect (max-area all) "shapes") 2))))

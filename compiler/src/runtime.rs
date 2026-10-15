@@ -152,7 +152,12 @@ mod ail_rt {
         let msg = if let Some(s) = info.payload().downcast_ref::<&str>() { s.to_string() }
             else if let Some(s) = info.payload().downcast_ref::<String>() { s.clone() }
             else { "trap".to_string() };
-        let at = info.location().and_then(|l| ail_location(l.line())).map(|(l, c)| format!("{}:{}:{}", unsafe { FILE }, l, c));
+        // Source lines carry the file index in their top byte; FILE lists the files by line.
+        let at = info.location().and_then(|l| ail_location(l.line())).map(|(l, c)| {
+            let files = unsafe { FILE };
+            let name = files.split('\n').nth((l >> 24) as usize).unwrap_or(files);
+            format!("{}:{}:{}", name, l & 0xFF_FFFF, c)
+        });
         match at { Some(a) => format!("{msg}\n  at {a}"), None => msg }
     }
 

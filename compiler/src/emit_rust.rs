@@ -102,7 +102,9 @@ enum ModeKind {
     Web,
 }
 
-pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> String {
+/// `file_lines`: the line of `src` where each source file starts (the first is 1); `file` lists
+/// the file names, one per line.
+pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, file_lines: &[usize], mode: Mode) -> String {
     let mode_kind = if matches!(mode, Mode::Web) {
         ModeKind::Web
     } else {
@@ -242,7 +244,7 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
             out.push_str("    ];\n    ail_rt::run_tests(tests);\n}\n");
         }
     }
-    let (body, table) = line_table(&out, src);
+    let (body, table) = line_table(&out, src, file_lines);
     let mut fin = body;
     writeln!(fin, "static AIL_FILE: &str = {:?};", file).unwrap();
     writeln!(
@@ -268,7 +270,7 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
 }
 
 /// Replace `/*@OFFSET*/` markers with a table (rust line -> ail line, col).
-fn line_table(out: &str, src: &str) -> (String, Vec<(u32, u32, u32)>) {
+fn line_table(out: &str, src: &str, file_lines: &[usize]) -> (String, Vec<(u32, u32, u32)>) {
     let li = LineIndex::new(src);
     let mut table = Vec::new();
     let mut res = String::with_capacity(out.len());
@@ -291,7 +293,9 @@ fn line_table(out: &str, src: &str) -> (String, Vec<(u32, u32, u32)>) {
         let mark = first_marker.or(cur);
         if let Some(off) = mark {
             let (l, c) = li.pos(off);
-            table.push(((n + 1) as u32, l as u32, c as u32));
+            let fi = file_lines.partition_point(|&s| s <= l).saturating_sub(1);
+            let local = l + 1 - file_lines.get(fi).copied().unwrap_or(1);
+            table.push(((n + 1) as u32, ((fi as u32) << 24) | local as u32, c as u32));
         }
         res.push_str(&clean);
         res.push('\n');

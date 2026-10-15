@@ -34,6 +34,100 @@ flags:
   --native    optimize for this CPU (target-cpu=native)
 ";
 
+/// A program's files: the entry file and every file it uses, read into one text so that spans
+/// are global. Each file starts on a known line of that text.
+struct Sources {
+    text: String,
+    files: Vec<SrcFile>,
+    /// Problems found while loading (a used file that does not exist).
+    diags: Vec<Diag>,
+}
+
+struct SrcFile {
+    /// As shown in diagnostics: relative to the entry file's directory.
+    name: String,
+    path: PathBuf,
+    start_line: usize,
+}
+
+impl Sources {
+    fn file_lines(&self) -> Vec<usize> {
+        self.files.iter().map(|f| f.start_line).collect()
+    }
+    fn names(&self) -> String {
+        self.files.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join("\n")
+    }
+    /// The file holding `offset` of `text` (which may be a repaired copy with the same lines):
+    /// index, byte range.
+    fn locate(&self, text: &str, offset: usize) -> (usize, usize, usize) {
+        let li = diag::LineIndex::new(text);
+        let (line, _) = li.pos(offset.min(text.len()));
+        let i = self.files.partition_point(|f| f.start_line <= line).saturating_sub(1);
+        let start = li.line_start(self.files[i].start_line);
+        let end = match self.files.get(i + 1) {
+            Some(n) => li.line_start(n.start_line).saturating_sub(1),
+            None => text.len(),
+        };
+        (i, start, end)
+    }
+}
+
+/// Read `entry` and, transitively, every `(use name)` it mentions (`name.ail` next to the file
+/// that uses it). `texts` overrides what is on disk (used by `ail fix`).
+fn load_sources(entry: &Path, texts: &std::collections::HashMap<PathBuf, String>) -> Result<Sources, String> {
+    let root = entry.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let mut queue = vec![entry.to_path_buf()];
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut out = Sources { text: String::new(), files: Vec::new(), diags: Vec::new() };
+    while let Some(path) = queue.first().cloned() {
+        queue.remove(0);
+        let key = std::fs::canonicalize(&path).unwrap_or(path.clone());
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        let text = match texts.get(&path) {
+            Some(t) => t.clone(),
+            None => std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?
+                .replace("\r\n", "\n"),
+        };
+        let base = out.text.len();
+        let start_line = out.text.matches('\n').count() + 1;
+        let name = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if let Ok(forms) = sexpr::read(&text) {
+            let dir = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            for f in &forms {
+                if f.head() != Some("use") {
+                    continue;
+                }
+                let Some(l) = f.list() else { continue };
+                let Some(m) = l.get(1).and_then(|x| x.sym()) else { continue };
+                let p = dir.join(format!("{m}.ail"));
+                if p.exists() {
+                    queue.push(p);
+                } else {
+                    out.diags.push(Diag::error(
+                        "E0031",
+                        diag::Span::new(base + l[1].span.start, base + l[1].span.end),
+                        &format!("cannot find {m}.ail next to {name}"),
+                    ));
+                }
+            }
+        }
+        out.files.push(SrcFile { name, path, start_line });
+        out.text.push_str(&text);
+        if !text.ends_with('\n') {
+            out.text.push('\n');
+        }
+    }
+    Ok(out)
+}
+
 struct Front {
     prog: ast::Program,
     ck: check::Checked,
@@ -166,9 +260,17 @@ fn frontend_raw(src: &str) -> Result<Front, Vec<Diag>> {
     })
 }
 
-fn report(diags: &[Diag], src: &str, file: &str, json: bool) {
+/// Report diagnostics of a (possibly multi-file) program, each in the coordinates of its file.
+fn report(diags: &[Diag], src: &str, srcs: &Sources, json: bool) {
+    let local: Vec<(Diag, String, String)> = diags
+        .iter()
+        .map(|d| {
+            let (i, a, b) = srcs.locate(src, d.span.start);
+            (diag::shifted(d, a, b - a), src[a..b].to_string(), srcs.files[i].name.clone())
+        })
+        .collect();
     if json {
-        let items: Vec<String> = diags.iter().map(|d| diag::to_json(d, src, file)).collect();
+        let items: Vec<String> = local.iter().map(|(d, s, f)| diag::to_json(d, s, f)).collect();
         let errors = diags.iter().filter(|d| d.severity == "error").count();
         println!(
             "{{\"ok\":{},\"errors\":{},\"diagnostics\":[{}]}}",
@@ -177,8 +279,8 @@ fn report(diags: &[Diag], src: &str, file: &str, json: bool) {
             items.join(",")
         );
     } else {
-        for d in diags {
-            eprint!("{}", diag::render_human(d, src, file));
+        for (d, s, f) in &local {
+            eprint!("{}", diag::render_human(d, s, f));
         }
     }
 }
@@ -252,61 +354,89 @@ fn main() -> ExitCode {
         }
         i += 1;
     }
-    let src = match std::fs::read_to_string(file) {
-        Ok(s) => s.replace("\r\n", "\n"),
+    let entry = Path::new(file);
+    let srcs = match load_sources(entry, &std::collections::HashMap::new()) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("cannot read {file}: {e}");
+            eprintln!("{e}");
             return ExitCode::from(2);
         }
     };
-    let fname = Path::new(file)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or(file.clone());
+    let src = srcs.text.clone();
+    let fname = srcs.names();
+    if !srcs.diags.is_empty() && cmd != "fix" {
+        report(&srcs.diags, &src, &srcs, opts.json);
+        return ExitCode::from(1);
+    }
     match cmd {
         "check" => match frontend_lenient(&src) {
             Ok((f, eff)) => {
-                report(&f.warnings, &eff, &fname, opts.json);
+                report(&f.warnings, &eff, &srcs, opts.json);
                 if !opts.json {
                     eprintln!("ok");
                 }
                 ExitCode::SUCCESS
             }
             Err(d) => {
-                report(&d, &src, &fname, opts.json);
+                report(&d, &src, &srcs, opts.json);
                 ExitCode::from(1)
             }
         },
         "fix" => {
-            let mut cur = src.clone();
+            // Fixes are applied file by file; the program is re-read after each round.
+            let mut texts: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
             let mut total = 0;
             for _ in 0..20 {
-                let diags = match frontend(&cur) {
+                let Ok(cur) = load_sources(entry, &texts) else { break };
+                let diags = match frontend(&cur.text) {
                     Ok(f) => f.warnings,
                     Err(d) => d,
                 };
-                let errors: Vec<Diag> = diags
-                    .into_iter()
-                    .filter(|d| d.severity == "error")
-                    .collect();
-                let (next, n) = diag::apply_fixes(&cur, &errors);
-                if n == 0 || next == cur {
+                let mut n_round = 0;
+                for (i, sf) in cur.files.iter().enumerate() {
+                    let errors: Vec<Diag> = diags
+                        .iter()
+                        .filter(|d| d.severity == "error" && cur.locate(&cur.text, d.span.start).0 == i)
+                        .map(|d| {
+                            let (_, a, b) = cur.locate(&cur.text, d.span.start);
+                            diag::shifted(d, a, b - a)
+                        })
+                        .collect();
+                    let (_, a, b) = cur.locate(&cur.text, cur.text.len().min(diag::LineIndex::new(&cur.text).line_start(sf.start_line)));
+                    let old = cur.text[a..b].to_string();
+                    let (next, n) = diag::apply_fixes(&old, &errors);
+                    if n > 0 && next != old {
+                        n_round += n;
+                        texts.insert(sf.path.clone(), next);
+                    }
+                }
+                if n_round == 0 {
                     break;
                 }
-                total += n;
-                cur = next;
+                total += n_round;
             }
-            if total > 0 {
-                std::fs::write(file, &cur).expect("write");
+            for (p, t) in &texts {
+                std::fs::write(p, t).expect("write");
             }
             eprintln!("applied {total} fix(es)");
-            match frontend(&cur) {
+            let cur = match load_sources(entry, &texts) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(2);
+                }
+            };
+            if !cur.diags.is_empty() {
+                report(&cur.diags, &cur.text, &cur, opts.json);
+                return ExitCode::from(1);
+            }
+            match frontend(&cur.text) {
                 Ok(f) => {
-                    report(&f.warnings, &cur, &fname, opts.json);
+                    report(&f.warnings, &cur.text, &cur, opts.json);
                     ExitCode::SUCCESS
                 }
                 Err(d) => {
-                    report(&d, &cur, &fname, opts.json);
+                    report(&d, &cur.text, &cur, opts.json);
                     ExitCode::from(1)
                 }
             }
@@ -315,12 +445,12 @@ fn main() -> ExitCode {
             let (f, src) = match frontend_lenient(&src) {
                 Ok(x) => x,
                 Err(d) => {
-                    report(&d, &src, &fname, opts.json);
+                    report(&d, &src, &srcs, opts.json);
                     return ExitCode::from(1);
                 }
             };
             if !opts.json {
-                report(&f.warnings, &src, &fname, false);
+                report(&f.warnings, &src, &srcs, false);
             }
             let mode = if cmd == "test" {
                 emit_rust::Mode::Test
@@ -345,7 +475,7 @@ fn main() -> ExitCode {
                 eprintln!("no (test ...) blocks in {fname}");
                 return ExitCode::from(1);
             }
-            let rust = emit_rust::emit(&f.prog, &f.ck, &src, &fname, mode);
+            let rust = emit_rust::emit(&f.prog, &f.ck, &src, &fname, &srcs.file_lines(), mode);
             if cmd == "emit" {
                 print!("{rust}");
                 return ExitCode::SUCCESS;
@@ -359,7 +489,7 @@ fn main() -> ExitCode {
                         "internal compiler error: generated Rust did not compile",
                     )
                     .note(e.lines().take(40).collect::<Vec<_>>().join("\n"));
-                    report(&[d], &src, &fname, opts.json);
+                    report(&[d], &src, &srcs, opts.json);
                     return ExitCode::from(3);
                 }
             };
