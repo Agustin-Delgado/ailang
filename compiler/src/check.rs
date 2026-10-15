@@ -4,7 +4,7 @@
 use crate::ast::*;
 use crate::diag::{Diag, Edit, Span};
 use crate::types::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub type BindId = usize;
 
@@ -57,13 +57,18 @@ pub struct Checked {
     pub fn_params: HashMap<String, Vec<BindId>>,
     /// Params of each lambda (by expr id), in order.
     pub lambda_params: HashMap<u32, Vec<BindId>>,
+    /// Concrete copies of generic fns, one per set of type arguments used.
+    pub instances: Vec<FnDef>,
+    /// Pattern-key epoch of each instance (its patterns share spans with the generic fn).
+    pub fn_epoch: HashMap<String, usize>,
     /// Binding of `result` in ensures clauses, per fn.
     pub result_binding: HashMap<String, BindId>,
 }
 
-pub fn pat_key(span: Span) -> usize {
+pub fn pat_key(span: Span, epoch: usize) -> usize {
     // Pattern spans and expr ids live in the same map; offset pattern keys to avoid collisions.
-    (1usize << 40) + span.start
+    // Each copy of a generic fn has its own epoch, since its patterns have the same spans.
+    (1usize << 40) + (epoch << 41) + span.start
 }
 
 pub fn check(prog: &Program) -> (Checked, Vec<Diag>) {
@@ -78,6 +83,18 @@ pub fn check(prog: &Program) -> (Checked, Vec<Diag>) {
         lambda_params: HashMap::new(),
         lambda_floor: None,
         loop_floor: 0,
+        generic_types: HashMap::new(),
+        generic_sigs: HashMap::new(),
+        generic_fns: HashMap::new(),
+        generic_used: HashSet::new(),
+        tparams: Vec::new(),
+        type_subst: HashMap::new(),
+        pending: Vec::new(),
+        instances: Vec::new(),
+        fn_epoch: HashMap::new(),
+        epoch: 0,
+        epochs: 0,
+        next_id: prog.expr_count,
         result_binding: HashMap::new(),
         diags: Vec::new(),
         scopes: Vec::new(),
@@ -93,6 +110,7 @@ pub fn check(prog: &Program) -> (Checked, Vec<Diag>) {
     c.collect(prog);
     for it in &prog.items {
         match it {
+            Item::Fn(f) if !f.type_params.is_empty() => {}
             Item::Fn(f) => c.check_fn(f),
             Item::Test(t) => c.check_test(t),
             Item::Const(k) => {
@@ -110,6 +128,35 @@ pub fn check(prog: &Program) -> (Checked, Vec<Diag>) {
             _ => {}
         }
     }
+    // Copies of generic fns, checked with their concrete types (and they may ask for more).
+    while let Some((def, m, ep)) = c.pending.pop() {
+        let saved = std::mem::replace(&mut c.type_subst, m);
+        c.epoch = ep;
+        let dlen = c.diags.len();
+        c.check_fn(&def);
+        let note = format!("while checking {}", def.name);
+        for d in &mut c.diags[dlen..] {
+            *d = d.clone().note(note.clone());
+        }
+        c.type_subst = saved;
+        c.epoch = 0;
+        c.fn_epoch.insert(def.name.clone(), ep);
+        c.instances.push(def);
+    }
+    for it in &prog.items {
+        if let Item::Fn(f) = it {
+            if !f.type_params.is_empty() && !c.generic_used.contains(&f.name) {
+                c.diags.push(Diag::warning(
+                    "W0005",
+                    f.name_span,
+                    &format!("generic fn '{}' is never called, so its body has not been checked", f.name),
+                ));
+            }
+        }
+    }
+    // The same mistake in a generic fn is reported once, not once per use.
+    let mut seen = HashSet::new();
+    c.diags.retain(|d| seen.insert((d.code, d.span.start, d.span.end, d.message.clone())));
     let mut clashes: Vec<(String, Vec<Span>)> = c.clash_uses.drain().collect();
     clashes.sort_by_key(|x| x.1[0].start);
     for (name, spans) in clashes {
@@ -141,6 +188,8 @@ pub fn check(prog: &Program) -> (Checked, Vec<Diag>) {
         fn_params: c.fn_params,
         result_binding: c.result_binding,
         lambda_params: c.lambda_params,
+        instances: c.instances,
+        fn_epoch: c.fn_epoch,
     };
     (checked, c.diags)
 }
@@ -178,6 +227,45 @@ struct Checker {
     lambda_floor: Option<usize>,
     /// break/continue need a loop deeper than this (a lambda body starts a new level).
     loop_floor: u32,
+    /// Generic definitions, kept apart from the concrete ones in `info`.
+    generic_types: HashMap<String, GenericType>,
+    generic_sigs: HashMap<String, (Vec<String>, FnSig)>,
+    generic_fns: HashMap<String, FnDef>,
+    generic_used: HashSet<String>,
+    /// Type parameters in scope while reading a generic definition's signature.
+    tparams: Vec<String>,
+    /// Type parameter -> concrete type while checking a copy of a generic fn.
+    type_subst: HashMap<String, Ty>,
+    /// Copies of generic fns waiting to be checked: (fn, type arguments, pattern epoch).
+    pending: Vec<(FnDef, HashMap<String, Ty>, usize)>,
+    instances: Vec<FnDef>,
+    fn_epoch: HashMap<String, usize>,
+    epoch: usize,
+    epochs: usize,
+    next_id: u32,
+}
+
+#[derive(Clone)]
+struct GenericType {
+    params: Vec<String>,
+    /// None while the definition is still being read.
+    kind: Option<GKind>,
+}
+
+#[derive(Clone)]
+enum GKind {
+    Struct(Vec<(String, Ty)>),
+    Enum(Vec<(String, Vec<Ty>)>),
+}
+
+fn item_tparams(it: &Item) -> Vec<String> {
+    let tp = match it {
+        Item::Fn(f) => &f.type_params,
+        Item::Struct(s) => &s.type_params,
+        Item::Enum(e) => &e.type_params,
+        _ => return Vec::new(),
+    };
+    tp.iter().map(|t| t.0.clone()).collect()
 }
 
 /// Names that cannot be variables or functions. Clause names (params, body...) are not here:
@@ -437,6 +525,16 @@ impl Checker {
         }
         // First register type names so field types can refer to each other.
         for it in &prog.items {
+            let tps = item_tparams(it);
+            if !tps.is_empty() && !matches!(it, Item::Fn(_)) {
+                let name = match it {
+                    Item::Struct(s) => &s.name,
+                    Item::Enum(e) => &e.name,
+                    _ => unreachable!(),
+                };
+                self.generic_types.insert(name.clone(), GenericType { params: tps, kind: None });
+                continue;
+            }
             match it {
                 Item::Struct(s) => {
                     if !s.name.starts_with(|c: char| c.is_ascii_uppercase()) {
@@ -468,7 +566,11 @@ impl Checker {
                 _ => {}
             }
         }
-        for it in &prog.items {
+        // Generic definitions first, so concrete ones can use their instances.
+        let generic = |i: &&Item| !item_tparams(i).is_empty() && !matches!(i, Item::Fn(_));
+        let ordered: Vec<&Item> = prog.items.iter().filter(generic).chain(prog.items.iter().filter(|i| !generic(i))).collect();
+        for it in ordered {
+            self.tparams = if matches!(it, Item::Fn(_)) { Vec::new() } else { item_tparams(it) };
             match it {
                 Item::Struct(s) => {
                     let mut fields = Vec::new();
@@ -493,9 +595,11 @@ impl Checker {
                         }
                         fields.push((fname.clone(), t));
                     }
-                    self.info
-                        .structs
-                        .insert(s.name.clone(), StructInfo { fields });
+                    if self.tparams.is_empty() {
+                        self.info.structs.insert(s.name.clone(), StructInfo { fields });
+                    } else {
+                        self.generic_types.get_mut(&s.name).unwrap().kind = Some(GKind::Struct(fields));
+                    }
                 }
                 Item::Enum(e) => {
                     let mut variants = Vec::new();
@@ -520,9 +624,11 @@ impl Checker {
                         }
                         variants.push((vname.clone(), ts));
                     }
-                    self.info
-                        .enums
-                        .insert(e.name.clone(), EnumInfo { variants });
+                    if self.tparams.is_empty() {
+                        self.info.enums.insert(e.name.clone(), EnumInfo { variants });
+                    } else {
+                        self.generic_types.get_mut(&e.name).unwrap().kind = Some(GKind::Enum(variants));
+                    }
                 }
                 _ => {}
             }
@@ -530,6 +636,7 @@ impl Checker {
         for it in &prog.items {
             match it {
                 Item::Fn(f) => {
+                    self.tparams = item_tparams(it);
                     let params = f
                         .params
                         .iter()
@@ -555,7 +662,14 @@ impl Checker {
                             self.err(Diag::error("E0320", p.ty.span, "a function parameter is written (f (Fn A B Result)); it cannot be mut or sit inside another type"));
                         }
                     }
-                    self.info.fns.insert(f.name.clone(), FnSig { params, ret });
+                    if self.tparams.is_empty() {
+                        self.info.fns.insert(f.name.clone(), FnSig { params, ret });
+                    } else {
+                        let tps = std::mem::take(&mut self.tparams);
+                        self.generic_sigs.insert(f.name.clone(), (tps, FnSig { params, ret }));
+                        self.generic_fns.insert(f.name.clone(), f.clone());
+                    }
+                    self.tparams.clear();
                 }
                 Item::Const(k) => {
                     let t = self.resolve_type(&k.ty);
@@ -564,6 +678,7 @@ impl Checker {
                 _ => {}
             }
         }
+        self.tparams.clear();
         self.info.finalize();
         let is_app = self.info.fns.contains_key("init") && self.info.fns.contains_key("update");
         if is_app {
@@ -711,7 +826,7 @@ impl Checker {
                 }
                 let k = self.resolve_type(&te.args[0]);
                 let v = self.resolve_type(&te.args[1]);
-                if !k.is_hashable() {
+                if !k.is_hashable() && !matches!(k, Ty::Param(_)) {
                     self.err(Diag::error(
                         "E0109",
                         te.args[0].span,
@@ -743,6 +858,35 @@ impl Checker {
                 let a = self.resolve_type(&te.args[0]);
                 let b = self.resolve_type(&te.args[1]);
                 return Ty::Res(Box::new(a), Box::new(b));
+            }
+            n if self.type_subst.contains_key(n) || self.tparams.iter().any(|p| p == n) => {
+                if !simple {
+                    self.err(Diag::error("E0108", te.span, &format!("type parameter {n} takes no arguments")));
+                }
+                return self.type_subst.get(n).cloned().unwrap_or(Ty::Param(n.to_string()));
+            }
+            n if self.generic_types.contains_key(n) => {
+                let g = self.generic_types[n].clone();
+                if te.args.len() != g.params.len() {
+                    self.err(Diag::error(
+                        "E0108",
+                        te.span,
+                        &format!("type {n} takes {} type argument(s): ({n} {})", g.params.len(), g.params.join(" ")),
+                    ));
+                    return Ty::Err;
+                }
+                let args: Vec<Ty> = te.args.iter().map(|a| self.resolve_type(a)).collect();
+                if args.iter().any(|a| a.is_err()) {
+                    return Ty::Err;
+                }
+                if args.iter().any(|a| a.contains_fn() || a.contains_cap()) {
+                    self.err(Diag::error("E0320", te.span, "type arguments cannot be functions or capabilities"));
+                    return Ty::Err;
+                }
+                if g.kind.is_none() || args.iter().any(|a| a.contains_param()) {
+                    return Ty::App(n.to_string(), args);
+                }
+                return Ty::User(self.instantiate_type(n, args));
             }
             n if self.info.structs.contains_key(n) || self.info.enums.contains_key(n) => {
                 Ty::User(n.to_string())
@@ -1318,6 +1462,25 @@ impl Checker {
                 Ty::Never
             }
             ExprKind::Match(scrut, arms) => self.check_match(e, scrut, arms, exp),
+            ExprKind::New(name, _, fields)
+                if matches!(self.generic_types.get(name), Some(GenericType { kind: Some(GKind::Struct(_)), .. })) =>
+            {
+                let g = self.generic_types[name].clone();
+                let Some(GKind::Struct(tf)) = &g.kind else { unreachable!() };
+                let pairs: Vec<(&Expr, Ty)> = fields
+                    .iter()
+                    .filter_map(|(f, _, v)| tf.iter().find(|x| &x.0 == f).map(|x| (v, x.1.clone())))
+                    .collect();
+                let Some(inst) = self.infer_instance(name, &g.params, &pairs, exp, e.span) else {
+                    for (_, _, v) in fields {
+                        self.check(v, None);
+                    }
+                    return Ty::Err;
+                };
+                let si = self.info.structs[&inst].clone();
+                self.check_fields(e, name, &si, fields, true);
+                Ty::User(inst)
+            }
             ExprKind::New(name, nspan, fields) => {
                 let Some(si) = self.info.structs.get(name).cloned() else {
                     let mut d = Diag::error("E0110", *nspan, &format!("unknown struct '{name}'"));
@@ -1596,6 +1759,17 @@ impl Checker {
             return t.clone();
         }
         if let Some((en, vn)) = name.split_once('.') {
+            if let Some(GenericType { params, kind: Some(GKind::Enum(vs)) }) = self.generic_types.get(en).cloned() {
+                if let Some(vi) = vs.iter().position(|v| v.0 == vn) {
+                    if !vs[vi].1.is_empty() {
+                        self.err(Diag::error("E0115", e.span, &format!("variant {name} has {} field(s); construct it as ({name} ...)", vs[vi].1.len())));
+                        return Ty::Err;
+                    }
+                    let Some(inst) = self.infer_instance(en, &params, &[], exp, e.span) else { return Ty::Err };
+                    self.res[id] = Res::UnitVariant(inst.clone(), vi);
+                    return Ty::User(inst);
+                }
+            }
             if let Some(ei) = self.info.enums.get(en) {
                 if let Some(vi) = ei.variants.iter().position(|v| v.0 == vn) {
                     if !ei.variants[vi].1.is_empty() {
@@ -1656,6 +1830,7 @@ impl Checker {
 
     fn unknown_variant(&mut self, span: Span, en: &str, vn: &str) -> Ty {
         let ei = &self.info.enums[en];
+        let en = self.info.base(en);
         let names: Vec<&str> = ei.variants.iter().map(|v| v.0.as_str()).collect();
         let mut d = Diag::error("E0117", span, &format!("enum {en} has no variant '{vn}'"))
             .note(format!("variants of {en}: {}", names.join(", ")));
@@ -2079,6 +2254,40 @@ impl Checker {
         exp: Option<&Ty>,
     ) -> Ty {
         let id = e.id as usize;
+        if self.lookup(name).is_none() {
+            if let Some((tps, sig)) = self.generic_sigs.get(name).cloned() {
+                return self.check_generic_call(e, name, nspan, args, exp, &tps, &sig);
+            }
+        }
+        if let Some((en, vn)) = name.split_once('.') {
+            if let Some(GenericType { params, kind: Some(GKind::Enum(vs)) }) = self.generic_types.get(en).cloned() {
+                let Some(vi) = vs.iter().position(|v| v.0 == vn) else {
+                    for a in args {
+                        self.check(a.expr(), None);
+                    }
+                    let names: Vec<&str> = vs.iter().map(|v| v.0.as_str()).collect();
+                    self.err(Diag::error("E0117", nspan, &format!("enum {en} has no variant '{vn}'")).note(format!("variants of {en}: {}", names.join(", "))));
+                    return Ty::Err;
+                };
+                let pairs: Vec<(&Expr, Ty)> = args.iter().zip(vs[vi].1.iter()).map(|(a, t)| (a.expr(), t.clone())).collect();
+                let Some(inst) = self.infer_instance(en, &params, &pairs, exp, e.span) else {
+                    for a in args {
+                        self.check(a.expr(), None);
+                    }
+                    return Ty::Err;
+                };
+                let fts = self.info.enums[&inst].variants[vi].1.clone();
+                if args.len() != fts.len() {
+                    self.err(Diag::error("E0211", e.span, &format!("{name} takes {} field(s)", fts.len())));
+                }
+                for (a, t) in args.iter().zip(fts.iter()) {
+                    let ex = self.arg_val(a);
+                    self.check_expect(ex, t);
+                }
+                self.res[id] = Res::Variant(inst.clone(), vi);
+                return Ty::User(inst);
+            }
+        }
         if let Some(b) = self.lookup(name) {
             if let Ty::Fn(ps, r) = self.bindings[b].ty.clone() {
                 self.res[id] = Res::LocalFn(b);
@@ -2468,6 +2677,218 @@ impl Checker {
             ));
         }
         sig.ret
+    }
+
+    // ---------- generics ----------
+
+    /// The concrete type "(Name A B)" for a generic type applied to concrete arguments,
+    /// created (fields and all) the first time it is used.
+    fn instantiate_type(&mut self, name: &str, args: Vec<Ty>) -> String {
+        let inst = format!("({name}{})", args.iter().map(|a| format!(" {a}")).collect::<String>());
+        if self.info.instances.contains_key(&inst) {
+            return inst;
+        }
+        let Some(g) = self.generic_types.get(name).cloned() else { return inst };
+        let m: HashMap<String, Ty> = g.params.iter().cloned().zip(args.iter().cloned()).collect();
+        self.info.instances.insert(inst.clone(), (name.to_string(), args));
+        match g.kind {
+            Some(GKind::Struct(fs)) => {
+                self.info.structs.insert(inst.clone(), StructInfo { fields: Vec::new() });
+                let mut fields = Vec::new();
+                for (n, t) in &fs {
+                    fields.push((n.clone(), self.subst_ty(t, &m)));
+                }
+                self.info.structs.insert(inst.clone(), StructInfo { fields });
+            }
+            Some(GKind::Enum(vs)) => {
+                self.info.enums.insert(inst.clone(), EnumInfo { variants: Vec::new() });
+                let mut variants = Vec::new();
+                for (n, ts) in &vs {
+                    let mut out = Vec::new();
+                    for t in ts {
+                        out.push(self.subst_ty(t, &m));
+                    }
+                    variants.push((n.clone(), out));
+                }
+                self.info.enums.insert(inst.clone(), EnumInfo { variants });
+            }
+            None => {}
+        }
+        self.info.finalize();
+        inst
+    }
+
+    /// Replace type parameters; a parameter not in `m` becomes Err (unknown yet).
+    fn subst_ty(&mut self, t: &Ty, m: &HashMap<String, Ty>) -> Ty {
+        match t {
+            Ty::Param(n) => m.get(n).cloned().unwrap_or(Ty::Err),
+            Ty::App(n, a) => {
+                let a2: Vec<Ty> = a.iter().map(|x| self.subst_ty(x, m)).collect();
+                if a2.iter().any(|x| x.is_err()) {
+                    Ty::Err
+                } else if a2.iter().any(|x| x.contains_param()) {
+                    Ty::App(n.clone(), a2)
+                } else {
+                    Ty::User(self.instantiate_type(n, a2))
+                }
+            }
+            Ty::Vec(a) => Ty::Vec(Box::new(self.subst_ty(a, m))),
+            Ty::Opt(a) => Ty::Opt(Box::new(self.subst_ty(a, m))),
+            Ty::Map(a, b) => Ty::Map(Box::new(self.subst_ty(a, m)), Box::new(self.subst_ty(b, m))),
+            Ty::Res(a, b) => Ty::Res(Box::new(self.subst_ty(a, m)), Box::new(self.subst_ty(b, m))),
+            Ty::Fn(ps, r) => Ty::Fn(ps.iter().map(|x| self.subst_ty(x, m)).collect(), Box::new(self.subst_ty(r, m))),
+            other => other.clone(),
+        }
+    }
+
+    /// Bind the type parameters of `tm` by matching it against a concrete type.
+    fn unify(&self, tm: &Ty, act: &Ty, m: &mut HashMap<String, Ty>) {
+        match (tm, act) {
+            (_, Ty::Err | Ty::Never) => {}
+            (Ty::Param(n), a) => {
+                if !a.contains_fn() {
+                    m.entry(n.clone()).or_insert_with(|| a.clone());
+                }
+            }
+            (Ty::Vec(x), Ty::Vec(y)) | (Ty::Opt(x), Ty::Opt(y)) => self.unify(x, y, m),
+            (Ty::Map(a, b), Ty::Map(c, d)) | (Ty::Res(a, b), Ty::Res(c, d)) => {
+                self.unify(a, c, m);
+                self.unify(b, d, m);
+            }
+            (Ty::Fn(p, r), Ty::Fn(q, s)) => {
+                for (x, y) in p.iter().zip(q.iter()) {
+                    self.unify(x, y, m);
+                }
+                self.unify(r, s, m);
+            }
+            (Ty::App(n, xs), Ty::User(inst)) => {
+                if let Some((b, ys)) = self.info.instances.get(inst) {
+                    if b == n {
+                        for (x, y) in xs.iter().zip(ys.iter()) {
+                            self.unify(x, y, m);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Learn type parameters from the arguments by checking them once, quietly: the real check
+    /// (and its diagnostics) happens after, against the concrete types. Arguments that decide
+    /// types go first, then literals (typed by what is known), then functions.
+    fn infer_from_args(&mut self, pairs: &[(&Expr, Ty)], m: &mut HashMap<String, Ty>) {
+        let dlen = self.diags.len();
+        for (x, t) in pairs {
+            if t.contains_param() && !matches!(t, Ty::Fn(..)) && !Self::is_literal(x) && !matches!(x.kind, ExprKind::Lambda(..)) {
+                let want = self.subst_ty(t, m);
+                let at = self.check(x, if want.contains_err() || want.contains_param() { None } else { Some(&want) });
+                self.unify(t, &at, m);
+            }
+        }
+        for (x, t) in pairs {
+            if t.contains_param() && Self::is_literal(x) {
+                let want = self.subst_ty(t, m);
+                let at = self.check(x, if want.contains_err() || want.contains_param() { None } else { Some(&want) });
+                self.unify(t, &at, m);
+            }
+        }
+        for (x, t) in pairs {
+            if let Ty::Fn(..) = t {
+                if t.contains_param() {
+                    let want = self.subst_ty(t, m);
+                    let at = self.check_fn_arg(x, &want);
+                    self.unify(t, &at, m);
+                }
+            }
+        }
+        self.diags.truncate(dlen);
+    }
+
+    /// The instance of generic type `name` that a construction builds: from the expected type
+    /// if there is one, otherwise from the values given.
+    fn infer_instance(&mut self, name: &str, params: &[String], pairs: &[(&Expr, Ty)], exp: Option<&Ty>, span: Span) -> Option<String> {
+        let mut m = HashMap::new();
+        if let Some(Ty::User(i)) = exp {
+            if let Some((b, a)) = self.info.instances.get(i).cloned() {
+                if b == name {
+                    m.extend(params.iter().cloned().zip(a));
+                }
+            }
+        }
+        self.infer_from_args(pairs, &mut m);
+        let missing: Vec<&String> = params.iter().filter(|p| !m.contains_key(*p)).collect();
+        if !missing.is_empty() {
+            let shown: Vec<String> = missing.iter().map(|s| s.to_string()).collect();
+            self.err(
+                Diag::error("E0325", span, &format!("cannot tell which {name} this is: {} not known here", shown.join(", ")))
+                    .note(format!("write the type on the binding: (let x ({name} {}) ...)", params.join(" "))),
+            );
+            return None;
+        }
+        let args: Vec<Ty> = params.iter().map(|p| m[p].clone()).collect();
+        Some(self.instantiate_type(name, args))
+    }
+
+    /// A call of a generic fn: work out its type arguments, make (once) the concrete copy, and
+    /// check the call against it like any other call.
+    #[allow(clippy::too_many_arguments)]
+    fn check_generic_call(&mut self, e: &Expr, name: &str, nspan: Span, args: &[Arg], exp: Option<&Ty>, tps: &[String], sig: &FnSig) -> Ty {
+        self.generic_used.insert(name.to_string());
+        if args.len() != sig.params.len() {
+            self.err(Diag::error("E0211", nspan, &format!("'{name}' takes {} argument(s), got {}", sig.params.len(), args.len())));
+            for a in args {
+                self.check(a.expr(), None);
+            }
+            return Ty::Err;
+        }
+        let mut m = HashMap::new();
+        if let Some(x) = exp {
+            if !matches!(x, Ty::Unit | Ty::Err) {
+                self.unify(&sig.ret, x, &mut m);
+            }
+        }
+        let pairs: Vec<(&Expr, Ty)> = args.iter().zip(sig.params.iter()).map(|(a, p)| (a.expr(), p.1.clone())).collect();
+        self.infer_from_args(&pairs, &mut m);
+        let missing: Vec<&String> = tps.iter().filter(|t| !m.contains_key(*t)).collect();
+        if !missing.is_empty() {
+            let shown: Vec<String> = missing.iter().map(|s| s.to_string()).collect();
+            self.err(
+                Diag::error("E0325", nspan, &format!("cannot work out the type parameter(s) {} of '{name}' from this call", shown.join(", ")))
+                    .note("give the arguments a known type, or write the result type on the binding: (let x (Vec I64) (...))"),
+            );
+            for a in args {
+                if !matches!(a.expr().kind, ExprKind::Lambda(..)) {
+                    self.check(a.expr(), None);
+                }
+            }
+            return Ty::Err;
+        }
+        let targs: Vec<Ty> = tps.iter().map(|t| m[t].clone()).collect();
+        let inst = format!("{name}<{}>", targs.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "));
+        if !self.info.fns.contains_key(&inst) {
+            let params = sig.params.iter().map(|(n, t, mu)| (n.clone(), self.subst_ty(t, &m), *mu)).collect();
+            let ret = self.subst_ty(&sig.ret, &m);
+            let params: Vec<(String, Ty, bool)> = params;
+            if let Some(k) = params.iter().map(|p| &p.1).chain(std::iter::once(&ret)).find_map(bad_map_key) {
+                self.err(Diag::error("E0109", nspan, &format!("'{name}' would use {k} as a map key; map keys must be an integer type, Str or Bool")));
+            }
+            self.info.fns.insert(inst.clone(), FnSig { params, ret });
+            if self.fn_epoch.len() + self.pending.len() > 2000 || inst.len() > 400 {
+                self.err(Diag::error("E0326", nspan, &format!("'{name}' keeps calling itself with bigger types; generic recursion must reuse its type parameters")));
+            } else {
+                let mut def = self.generic_fns[name].clone();
+                def.name = inst.clone();
+                def.type_params.clear();
+                crate::ast::renumber_fn(&mut def, &mut self.next_id);
+                self.ty.resize(self.next_id as usize, Ty::Err);
+                self.res.resize(self.next_id as usize, Res::Nothing);
+                self.epochs += 1;
+                self.pending.push((def, m, self.epochs));
+            }
+        }
+        self.res[e.id as usize] = Res::UserFn(inst.clone());
+        self.check_user_call(e, &inst, nspan, args)
     }
 
     /// An argument for a `(Fn ...)` parameter: a lambda, a fn name, or a Fn parameter passed
@@ -3729,6 +4150,7 @@ impl Checker {
                         .variants
                         .iter()
                         .map(|(v, fs)| {
+                            let n = self.info.base(n);
                             let p = if fs.is_empty() {
                                 format!("{n}.{v}")
                             } else {
@@ -3802,6 +4224,7 @@ impl Checker {
                 // A bare name that matches a variant is almost certainly a mistake.
                 if let Ty::User(en) = t {
                     if let Some(ei) = self.info.enums.get(en) {
+                        let en = self.info.base(en);
                         if ei.variants.iter().any(|v| &v.0 == name) {
                             self.err(
                                 Diag::error(
@@ -3838,7 +4261,7 @@ impl Checker {
                 }
                 let b = self.local(name, t.clone(), kind);
                 let bid = self.bind(b);
-                self.decl.insert(pat_key(*span), bid);
+                self.decl.insert(pat_key(*span, self.epoch), bid);
                 false
             }
             Pat::Int(v, span) => {
@@ -3931,7 +4354,7 @@ impl Checker {
                     }
                     (_, Ty::User(en)) if name.contains('.') && self.info.enums.contains_key(en) => {
                         let (pen, vn) = name.split_once('.').unwrap();
-                        if pen != en {
+                        if pen != self.info.base(en) {
                             self.err(Diag::error(
                                 "E0505",
                                 *span,
@@ -3998,6 +4421,23 @@ fn ctor_key(name: &str) -> String {
     match name.split_once('.') {
         Some((_, v)) => v.to_string(),
         None => name.to_string(),
+    }
+}
+
+/// A map key type that cannot be hashed, anywhere inside `t`.
+fn bad_map_key(t: &Ty) -> Option<Ty> {
+    match t {
+        Ty::Map(k, v) => {
+            if !k.is_hashable() {
+                Some((**k).clone())
+            } else {
+                bad_map_key(v)
+            }
+        }
+        Ty::Vec(a) | Ty::Opt(a) => bad_map_key(a),
+        Ty::Res(a, b) => bad_map_key(a).or_else(|| bad_map_key(b)),
+        Ty::Fn(ps, r) => ps.iter().find_map(bad_map_key).or_else(|| bad_map_key(r)),
+        _ => None,
     }
 }
 

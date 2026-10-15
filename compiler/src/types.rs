@@ -118,6 +118,10 @@ pub enum Ty {
     Cap(Cap),
     /// A function passed as a parameter: argument types and result.
     Fn(Vec<Ty>, Box<Ty>),
+    /// Only in the signatures of generic definitions: a type parameter, and a generic type
+    /// applied to arguments that still mention parameters. Checked code never sees these.
+    Param(String),
+    App(String, Vec<Ty>),
     /// Poison type after an error; compatible with everything to avoid cascades.
     Err,
 }
@@ -146,6 +150,26 @@ impl Ty {
     }
     pub fn is_hashable(&self) -> bool {
         matches!(self, Ty::Int(_) | Ty::Str | Ty::Bool | Ty::Err)
+    }
+    pub fn contains_err(&self) -> bool {
+        match self {
+            Ty::Err => true,
+            Ty::App(_, a) => a.iter().any(|t| t.contains_err()),
+            Ty::Vec(a) | Ty::Opt(a) => a.contains_err(),
+            Ty::Map(a, b) | Ty::Res(a, b) => a.contains_err() || b.contains_err(),
+            Ty::Fn(ps, r) => ps.iter().any(|t| t.contains_err()) || r.contains_err(),
+            _ => false,
+        }
+    }
+    pub fn contains_param(&self) -> bool {
+        match self {
+            Ty::Param(_) => true,
+            Ty::App(_, a) => a.iter().any(|t| t.contains_param()),
+            Ty::Vec(a) | Ty::Opt(a) => a.contains_param(),
+            Ty::Map(a, b) | Ty::Res(a, b) => a.contains_param() || b.contains_param(),
+            Ty::Fn(ps, r) => ps.iter().any(|t| t.contains_param()) || r.contains_param(),
+            _ => false,
+        }
     }
     pub fn contains_fn(&self) -> bool {
         match self {
@@ -188,6 +212,14 @@ impl fmt::Display for Ty {
                 }
                 write!(f, " {r})")
             }
+            Ty::Param(n) => write!(f, "{n}"),
+            Ty::App(n, a) => {
+                write!(f, "({n}")?;
+                for t in a {
+                    write!(f, " {t}")?;
+                }
+                write!(f, ")")
+            }
             Ty::Err => write!(f, "?"),
         }
     }
@@ -223,9 +255,16 @@ pub struct TypeInfo {
     pub copy_types: HashSet<String>,
     /// User types with a total field-by-field ordering (no maps inside).
     pub ord_types: HashSet<String>,
+    /// Instances of generic types: "(Pair I64 Str)" -> ("Pair", [I64, Str]).
+    pub instances: HashMap<String, (String, Vec<Ty>)>,
 }
 
 impl TypeInfo {
+    /// The name a program writes for a type: "Tree" for the instance "(Tree I64)".
+    pub fn base<'a>(&'a self, name: &'a str) -> &'a str {
+        self.instances.get(name).map(|i| i.0.as_str()).unwrap_or(name)
+    }
+
     pub fn is_copy(&self, t: &Ty) -> bool {
         match t {
             Ty::Int(_)

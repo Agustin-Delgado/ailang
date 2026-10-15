@@ -27,6 +27,12 @@ pub struct Emitter<'a> {
     cur_view: Option<View>,
     /// Expression ids whose code is fixed in advance (see `fused_update`).
     subst: HashMap<u32, String>,
+    /// Pattern-key epoch of the fn being emitted (see `check::pat_key`).
+    epoch: usize,
+}
+
+struct StructName {
+    name: String,
 }
 
 /// How a borrowed string view is represented: `&str`, or a `Cow` when it is sometimes a copy
@@ -46,6 +52,20 @@ enum Tail {
     Cow,
 }
 
+/// The fns that are emitted: the non-generic ones and the concrete copies of generic ones.
+fn concrete_fns<'p>(prog: &'p Program, ck: &'p Checked) -> Vec<&'p FnDef> {
+    let mut v: Vec<&FnDef> = prog
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Fn(f) if f.type_params.is_empty() => Some(f),
+            _ => None,
+        })
+        .collect();
+    v.extend(ck.instances.iter());
+    v
+}
+
 pub fn mangle(n: &str) -> String {
     let mut o = String::new();
     for c in n.chars() {
@@ -53,6 +73,11 @@ pub fn mangle(n: &str) -> String {
             '-' => o.push('_'),
             '?' => o.push_str("_q"),
             '.' => o.push_str("__"),
+            // Instances of generic definitions: "(Pair I64 Str)", "largest<I64>".
+            '(' | '<' => o.push_str("_L"),
+            ')' | '>' => o.push_str("_R"),
+            ' ' => o.push('_'),
+            ',' => {}
             c => o.push(c),
         }
     }
@@ -94,14 +119,15 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
         view_fns: HashMap::new(),
         cur_view: None,
         subst: HashMap::new(),
+        epoch: 0,
     };
     em.infer_view_fns(prog);
     let mut out = String::new();
     out.push_str("#![allow(warnings)]\n#![allow(unconditional_panic, arithmetic_overflow)]\n");
     for it in &prog.items {
         match it {
-            Item::Struct(s) => em.emit_struct(s, &mut out),
-            Item::Enum(e) => em.emit_enum(e, &mut out),
+            Item::Struct(s) if s.type_params.is_empty() => em.emit_struct(&s.name, &mut out),
+            Item::Enum(e) if e.type_params.is_empty() => em.emit_enum(&e.name, &mut out),
             Item::Const(c) => {
                 let t = &ck.info.consts[&c.name];
                 let v = em.val(&c.value);
@@ -110,10 +136,17 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
             _ => {}
         }
     }
-    for it in &prog.items {
-        if let Item::Fn(f) = it {
-            em.emit_fn(f, &mut out);
+    let mut insts: Vec<&String> = ck.info.instances.keys().collect();
+    insts.sort();
+    for n in insts {
+        if ck.info.structs.contains_key(n) {
+            em.emit_struct(n, &mut out);
+        } else {
+            em.emit_enum(n, &mut out);
         }
+    }
+    for f in concrete_fns(prog, ck) {
+        em.emit_fn(f, &mut out);
     }
     match mode {
         Mode::Run => {
@@ -192,6 +225,7 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
             for (i, it) in prog.items.iter().enumerate() {
                 if let Item::Test(t) = it {
                     em.moves = compute_moves(&t.body, ck);
+                    em.epoch = 0;
                     em.views.clear();
                     em.view_roots.clear();
                     em.plan_views(&t.body);
@@ -283,7 +317,7 @@ pub fn rty(t: &Ty) -> String {
         Ty::Res(a, b) => format!("Result<{}, {}>", rty(a), rty(b)),
         Ty::User(n) => ty_name(n),
         Ty::Cap(c) => format!("ail_rt::{}", c.name()),
-        Ty::Fn(..) => "_".into(),
+        Ty::Fn(..) | Ty::Param(_) | Ty::App(..) => "_".into(),
         Ty::Err => "_".into(),
     }
 }
@@ -438,7 +472,8 @@ impl<'a> Emitter<'a> {
         &self.src[e.span.start..e.span.end]
     }
 
-    fn emit_struct(&mut self, s: &StructDef, out: &mut String) {
+    fn emit_struct(&mut self, name: &str, out: &mut String) {
+        let s = StructName { name: name.to_string() };
         let si = &self.ck.info.structs[&s.name];
         if crate::check::json_encodable(&self.ck.info, &Ty::User(s.name.clone()), &mut Vec::new()) {
             // (json-str value) writes the struct straight to text, fields in name order.
@@ -479,7 +514,8 @@ impl<'a> Emitter<'a> {
         out.push_str("}\n");
     }
 
-    fn emit_enum(&mut self, e: &EnumDef, out: &mut String) {
+    fn emit_enum(&mut self, name: &str, out: &mut String) {
+        let e = StructName { name: name.to_string() };
         let ei = &self.ck.info.enums[&e.name];
         let copy = if self.ck.info.copy_types.contains(&e.name) {
             ", Copy"
@@ -535,6 +571,7 @@ impl<'a> Emitter<'a> {
 
     fn emit_fn(&mut self, f: &FnDef, out: &mut String) {
         let sig = &self.ck.info.fns[&f.name];
+        self.epoch = self.ck.fn_epoch.get(&f.name).copied().unwrap_or(0);
         self.moves = compute_moves(&f.body, self.ck);
         self.views.clear();
         self.view_roots.clear();
@@ -905,7 +942,8 @@ impl<'a> Emitter<'a> {
             ExprKind::Match(scrut, arms) => {
                 self.emit_match(scrut, arms, if t == Ty::Unit { Tail::Unit } else { Tail::Val })
             }
-            ExprKind::New(name, _, fields) => {
+            ExprKind::New(_, _, fields) => {
+                let Ty::User(name) = &t else { unreachable!("struct literal of type {t}") };
                 let si = self.ck.info.structs[name].clone();
                 let mut parts = Vec::new();
                 for (f, _, v) in fields {
@@ -1134,7 +1172,7 @@ impl<'a> Emitter<'a> {
         match p {
             Pat::Wild(_) => "_".into(),
             Pat::Bind(n, span) => {
-                let b = self.ck.decl[&pat_key(*span)];
+                let b = self.ck.decl[&pat_key(*span, self.epoch)];
                 let _ = n;
                 self.local_name(&self.ck.bindings[b].name)
             }
@@ -1826,14 +1864,14 @@ fn cast(v: &str, from: &Ty, to: &Ty) -> String {
 // copy, as long as the strings it borrows from are neither changed nor moved while it lives.
 // The language does not change: views are only how the program is emitted.
 
-fn pat_binds(p: &Pat, ck: &Checked, out: &mut HashSet<BindId>) {
+fn pat_binds(p: &Pat, ck: &Checked, epoch: usize, out: &mut HashSet<BindId>) {
     match p {
         Pat::Bind(_, span) => {
-            if let Some(b) = ck.decl.get(&pat_key(*span)) {
+            if let Some(b) = ck.decl.get(&pat_key(*span, epoch)) {
                 out.insert(*b);
             }
         }
-        Pat::Ctor(_, subs, _) => subs.iter().for_each(|s| pat_binds(s, ck, out)),
+        Pat::Ctor(_, subs, _) => subs.iter().for_each(|s| pat_binds(s, ck, epoch, out)),
         _ => {}
     }
 }
@@ -1883,7 +1921,7 @@ impl<'a> Emitter<'a> {
                 let mut roots = vec![];
                 let mut inner = HashSet::new();
                 for a in arms {
-                    pat_binds(&a.pat, self.ck, &mut inner);
+                    pat_binds(&a.pat, self.ck, self.epoch, &mut inner);
                     if a.body.len() != 1 {
                         return None;
                     }
@@ -2142,10 +2180,11 @@ impl<'a> Emitter<'a> {
     /// Find fns whose Str result is always a piece of one Str param (or a literal): they return
     /// a view of it instead of a copy.
     fn infer_view_fns(&mut self, prog: &Program) {
+        let ck = self.ck;
         loop {
             let mut changed = false;
-            for it in &prog.items {
-                let Item::Fn(f) = it else { continue };
+            for f in concrete_fns(prog, ck) {
+                self.epoch = ck.fn_epoch.get(&f.name).copied().unwrap_or(0);
                 if self.view_fns.contains_key(&f.name)
                     || !f.ensures.is_empty()
                     || f.body.is_empty()
@@ -2193,6 +2232,7 @@ impl<'a> Emitter<'a> {
         }
         self.views.clear();
         self.view_roots.clear();
+        self.epoch = 0;
     }
 
     /// `(put (mut m) k (... (get m k) ...))` looks the key up once instead of twice, and copies

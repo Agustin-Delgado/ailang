@@ -91,7 +91,15 @@ function argument compiles to a direct, inlinable call. `map`, `filter`, `fold`,
 friends cover the common loops; a `for` loop is still the way to change variables or exit
 early.
 
-## 9. Toolchain
+## 9. Generics without bounds
+
+`(type-params T)` on a fn, struct or enum. There is no trait or bound syntax to learn: every use
+with concrete types is type-checked as a concrete copy, and an operation the type does not support
+is reported at the line inside the generic body, naming the copy (`while checking total<Str>`).
+The copies are also what is compiled, so generic code is exactly as fast as code written for
+one type. The price is that a generic fn nobody calls is not checked; the compiler says so.
+
+## 10. Toolchain
 
 `ail check` (instant), `ail fix`, `ail run`, `ail test`, `ail build`, `ail emit` (generated Rust),
 `ail spec` (the specification an agent should read, embedded in the binary).

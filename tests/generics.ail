@@ -1,0 +1,127 @@
+; Tests for generic fns, structs and enums. Each use with concrete types gets its own checked,
+; specialized copy. Run with: ail test tests/generics.ail
+
+(struct Pair (type-params A B) (first A) (second B))
+
+(struct Stack (type-params T) (items (Vec T)))
+
+(enum Tree (type-params T) (Leaf) (Node (Tree T) T (Tree T)))
+
+(enum Outcome (type-params T) (Good T) (Bad Str))
+
+(struct Scored (name Str) (score I64))
+
+(fn largest (type-params T) (params (xs (Vec T))) (returns (Option T))
+  (body
+    (if (is-empty xs)
+      none
+      (do
+        (var best (at xs 0))
+        (for x xs (if (> x best) (set best x)))
+        (some best)))))
+
+(fn swap-pair (type-params A B) (params (p (Pair A B))) (returns (Pair B A))
+  (body (new Pair (first (. p second)) (second (. p first)))))
+
+(fn push-item (type-params T) (params (s (mut (Stack T))) (x T))
+  (body (push (mut (. s items)) x)))
+
+(fn pop-item (type-params T) (params (s (mut (Stack T)))) (returns (Option T))
+  (body (pop (mut (. s items)))))
+
+(fn insert (type-params T) (params (t (Tree T)) (x T)) (returns (Tree T))
+  (body
+    (match t
+      (case Tree.Leaf (Tree.Node Tree.Leaf x Tree.Leaf))
+      (case (Tree.Node l v r)
+        (if (< x v)
+          (Tree.Node (insert l x) v r)
+          (Tree.Node l v (insert r x)))))))
+
+(fn in-order (type-params T) (params (t (Tree T)) (out (mut (Vec T))))
+  (body
+    (match t
+      (case Tree.Leaf unit)
+      (case (Tree.Node l v r)
+        (in-order l (mut out))
+        (push (mut out) v)
+        (in-order r (mut out))))))
+
+(fn tree-of (type-params T) (params (xs (Vec T))) (returns (Tree T))
+  (body
+    (var t (Tree T) Tree.Leaf)
+    (for x xs (set t (insert t x)))
+    t))
+
+(fn map-all (type-params T U) (params (xs (Vec T)) (f (Fn T U))) (returns (Vec U))
+  (body
+    (var out (Vec U) (vec))
+    (for x xs (push (mut out) (f x)))
+    out))
+
+(fn count-equal (type-params K) (params (xs (Vec K)) (k K)) (returns I64)
+  (body (count xs (lambda (x) (== x k)))))
+
+(fn tally (type-params K) (params (xs (Vec K))) (returns (Map K I64))
+  (body
+    (var m (Map K I64) (map))
+    (for x xs (put (mut m) x (+ 1 (unwrap-or (get m x) 0))))
+    m))
+
+(fn value-or (type-params T) (params (o (Outcome T)) (d T)) (returns T)
+  (body (match o (case (Outcome.Good v) v) (case (Outcome.Bad _) d))))
+
+(test "generic fns over several types"
+  (assert (== (largest (vec 3 9 2)) (some 9)))
+  (assert (== (largest (vec "pear" "apple")) (some "pear")))
+  (assert (== (largest (vec 1.5 -2.0)) (some 1.5)))
+  (let none-here (Vec I64) (vec))
+  (assert (is-none (largest none-here)))
+  (let best (largest (vec (new Scored (name "a") (score 1)) (new Scored (name "b") (score 0)))))
+  (assert (== (. (expect best "some") name) "b")))
+
+(test "generic structs"
+  (let p (new Pair (first 1) (second "one")))
+  (let q (swap-pair p))
+  (assert (== (. q first) "one"))
+  (assert (== (. q second) 1))
+  (let r (Pair F64 Bool) (new Pair (first 2) (second true)))
+  (assert (== (. r first) 2.0))
+  (var s (Stack Str) (new Stack (items (vec))))
+  (push-item (mut s) "x")
+  (push-item (mut s) "y")
+  (assert (== (pop-item (mut s)) (some "y")))
+  (assert (== (len (. s items)) 1))
+  (var n (new Stack (items (vec 1 2))))
+  (push-item (mut n) 3)
+  (assert (== (. n items) (vec 1 2 3))))
+
+(test "a generic recursive enum"
+  (let t (tree-of (vec 5 2 8 1 9 3)))
+  (var out (Vec I64) (vec))
+  (in-order t (mut out))
+  (assert (== out (vec 1 2 3 5 8 9)))
+  (let ws (tree-of (vec "kiwi" "apple" "fig")))
+  (var wout (Vec Str) (vec))
+  (in-order ws (mut wout))
+  (assert (== wout (vec "apple" "fig" "kiwi")))
+  (let empty (Tree I64) Tree.Leaf)
+  (var eout (Vec I64) (vec))
+  (in-order empty (mut eout))
+  (assert (is-empty eout)))
+
+(test "generic fns with functions and maps"
+  (assert (== (map-all (vec 1 2 3) (lambda (x) (* x 10))) (vec 10 20 30)))
+  (assert (== (map-all (vec "a" "bb") (lambda (s) (len s))) (vec 1 2)))
+  (assert (== (count-equal (vec "a" "b" "a") "a") 2))
+  (let m (tally (vec "x" "y" "x")))
+  (assert (== (get m "x") (some 2)))
+  (let mi (tally (vec 7 7 7)))
+  (assert (== (get mi 7) (some 3))))
+
+(test "generic enums with payloads"
+  (let g (Outcome I64) (Outcome.Good 4))
+  (let b (Outcome I64) (Outcome.Bad "nope"))
+  (assert (== (value-or g 0) 4))
+  (assert (== (value-or b 0) 0))
+  (assert (== (value-or (Outcome.Good "s") "d") "s")))
