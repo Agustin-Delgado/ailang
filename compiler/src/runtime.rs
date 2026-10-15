@@ -93,6 +93,7 @@ mod ail_rt {
     #[derive(Clone, Copy)] pub struct Rand;
     #[derive(Clone, Copy)] pub struct Env;
     #[derive(Clone, Copy)] pub struct Net;
+    #[derive(Clone, Copy)] pub struct Gfx;
 
     // Fast non-cryptographic hasher (word-at-a-time multiply-rotate).
     #[derive(Default, Clone, Copy)]
@@ -129,6 +130,9 @@ mod ail_rt {
         static LAST_TRAP: RefCell<Option<String>> = RefCell::new(None);
     }
 
+    #[cfg(target_arch = "wasm32")]
+    fn seed() -> u64 { (super::ail_web::now_ms() * 1000.0) as u64 ^ 0x9E37_79B9_7F4A_7C15 | 1 }
+    #[cfg(not(target_arch = "wasm32"))]
     fn seed() -> u64 {
         let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
         let a = &t as *const u64 as u64;
@@ -149,6 +153,7 @@ mod ail_rt {
         match at { Some(a) => format!("{msg}\n  at {a}"), None => msg }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn init(lines: &'static [(u32, u32, u32)], file: &'static str) {
         unsafe { LINES = lines; FILE = file; }
         std::panic::set_hook(Box::new(|info| {
@@ -157,11 +162,35 @@ mod ail_rt {
             std::process::exit(101);
         }));
     }
+    #[cfg(target_arch = "wasm32")]
+    pub fn init(lines: &'static [(u32, u32, u32)], file: &'static str) {
+        unsafe { LINES = lines; FILE = file; }
+        std::panic::set_hook(Box::new(|info| {
+            flush();
+            super::ail_web::trap(&describe(info));
+        }));
+    }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn flush() { OUT.with(|o| { let _ = o.borrow_mut().flush(); }); }
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn print(s: &String) { OUT.with(|o| { let _ = o.borrow_mut().write_all(s.as_bytes()); }); }
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn println(s: &String) { OUT.with(|o| { let mut o = o.borrow_mut(); let _ = o.write_all(s.as_bytes()); let _ = o.write_all(b"\n"); }); }
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn eprintln(s: &String) { flush(); eprintln!("{s}"); }
+
+    // In the browser, console output goes to the developer console, one message per line.
+    #[cfg(target_arch = "wasm32")]
+    thread_local! { static LINE: RefCell<String> = RefCell::new(String::new()); }
+    #[cfg(target_arch = "wasm32")]
+    pub fn flush() { LINE.with(|l| { let mut l = l.borrow_mut(); if !l.is_empty() { super::ail_web::log(&l, false); l.clear(); } }); }
+    #[cfg(target_arch = "wasm32")]
+    pub fn print(s: &String) { LINE.with(|l| l.borrow_mut().push_str(s)); }
+    #[cfg(target_arch = "wasm32")]
+    pub fn println(s: &String) { LINE.with(|l| { let mut l = l.borrow_mut(); l.push_str(s); super::ail_web::log(&l, false); l.clear(); }); }
+    #[cfg(target_arch = "wasm32")]
+    pub fn eprintln(s: &String) { flush(); super::ail_web::log(s, true); }
 
     pub fn main_error<E: std::fmt::Display>(e: &E) -> ! {
         flush();
@@ -300,9 +329,15 @@ mod ail_rt {
     pub fn write_file(path: &String, content: &String) -> Result<(), String> {
         std::fs::write(path, content).map_err(|e| format!("{path}: {e}"))
     }
+    #[cfg(target_arch = "wasm32")]
+    pub fn now_ms() -> i64 { super::ail_web::now_ms() as i64 }
+    #[cfg(target_arch = "wasm32")]
+    pub fn now_ns() -> i64 { (super::ail_web::now_ms() * 1e6) as i64 }
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn now_ms() -> i64 {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
     }
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn now_ns() -> i64 {
         static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
         START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as i64

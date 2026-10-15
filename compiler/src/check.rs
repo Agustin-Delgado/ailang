@@ -144,7 +144,7 @@ struct Checker {
     in_contract: bool,
     in_test: bool,
     /// Roots currently being iterated by for-each loops (cannot be mutated inside).
-    iter_roots: Vec<BindId>,
+    iter_roots: Vec<(BindId, Vec<String>)>,
     /// User fns whose name clashes with a builtin: definition span and call-site spans.
     clash_uses: HashMap<String, Vec<Span>>,
     /// Expressions whose value is discarded (statement position): their branches may differ in type.
@@ -165,7 +165,7 @@ pub const BUILTINS: &[&str] = &[
     "concat", "contains", "index-of", "sort", "reverse", "sum", "map", "put", "get", "has", "del", "keys", "values", "some",
     "ok", "err", "unwrap-or", "expect", "is-some", "is-none", "is-ok", "is-err", "substr", "split", "trim", "starts-with",
     "ends-with", "replace", "upper", "lower", "join", "parse-i64", "parse-f64", "chars", "byte-at", "repeat", "fmt-float", "from-code", "print",
-    "println", "eprintln", "read-line", "read-file", "write-file", "now-ms", "now-ns", "rand-int", "rand-f64", "args", "fail", "json-parse", "json-str", "http-next", "http-respond", "read-all", "lines", "is-digit", "is-alpha", "is-alnum", "is-space", "is-upper", "is-lower", "code-of", "sort-desc",
+    "println", "eprintln", "read-line", "read-file", "write-file", "now-ms", "now-ns", "rand-int", "rand-f64", "args", "fail", "json-parse", "json-str", "http-next", "http-respond", "read-all", "lines", "is-digit", "is-alpha", "is-alnum", "is-space", "is-upper", "is-lower", "code-of", "sort-desc", "draw-clear", "draw-rect", "draw-circle", "draw-line", "draw-text",
     "assert",
 ];
 
@@ -346,11 +346,63 @@ impl Checker {
             }
         }
         self.info.finalize();
-        if !self.info.fns.contains_key("main") && !prog.items.iter().any(|i| matches!(i, Item::Test(_))) {
+        let is_app = self.info.fns.contains_key("init") && self.info.fns.contains_key("update");
+        if is_app {
+            self.check_app_signatures(prog);
+        }
+        if !is_app && !self.info.fns.contains_key("main") && !prog.items.iter().any(|i| matches!(i, Item::Test(_))) {
             self.err(
                 Diag::error("E0107", Span::new(0, 0), "program has no (fn main ...) and no tests")
                     .note("entry point: (fn main (params (con Console)) (body (println con \"hello\")))"),
             );
+        }
+    }
+
+    /// An app (web or game) is init/update plus view (canvas) or page (HTML).
+    fn check_app_signatures(&mut self, prog: &Program) {
+        let span_of = |n: &str| {
+            prog.items.iter().find_map(|i| match i {
+                Item::Fn(f) if f.name == n => Some(f.name_span),
+                _ => None,
+            })
+        };
+        let model = self.info.fns["init"].ret.clone();
+        let only_caps = |ps: &[(String, Ty, bool)]| ps.iter().all(|p| matches!(p.1, Ty::Cap(_)) && !p.2);
+        let bad = |c: &mut Checker, f: &str, want: String| {
+            let sp = span_of(f).unwrap_or_default();
+            c.err(Diag::error("E0308", sp, &format!("app function '{f}' must have the signature {want}")).note("an app is (fn init (returns Model)), (fn update (params (m (mut Model)) (e Event))) and (fn view (params (m Model) (g Gfx))) for a canvas or (fn page (params (m Model)) (returns Str)) for HTML; extra capability parameters may follow"));
+        };
+        if model == Ty::Unit || !only_caps(&self.info.fns["init"].params) {
+            bad(self, "init", "(fn init (returns Model) ...)".into());
+        }
+        let u = self.info.fns["update"].clone();
+        let ok_u = u.params.len() >= 2
+            && u.params[0].1 == model
+            && u.params[0].2
+            && u.params[1].1 == Ty::User("Event".into())
+            && !u.params[1].2
+            && only_caps(&u.params[2..])
+            && u.ret == Ty::Unit;
+        if !ok_u {
+            bad(self, "update", format!("(fn update (params (m (mut {model})) (e Event)) ...)"));
+        }
+        match (self.info.fns.get("view").cloned(), self.info.fns.get("page").cloned()) {
+            (None, None) => {
+                let sp = span_of("init").unwrap_or_default();
+                self.err(Diag::error("E0308", sp, "an app needs (fn view (params (m Model) (g Gfx)) ...) to draw on a canvas or (fn page (params (m Model)) (returns Str) ...) for an HTML page"));
+            }
+            (Some(v), _) => {
+                let ok = v.params.len() >= 2 && v.params[0].1 == model && !v.params[0].2 && v.params[1].1 == Ty::Cap(Cap::Gfx) && only_caps(&v.params[2..]);
+                if !ok {
+                    bad(self, "view", format!("(fn view (params (m {model}) (g Gfx)) ...)"));
+                }
+            }
+            (None, Some(p)) => {
+                let ok = !p.params.is_empty() && p.params[0].1 == model && !p.params[0].2 && only_caps(&p.params[1..]) && p.ret == Ty::Str;
+                if !ok {
+                    bad(self, "page", format!("(fn page (params (m {model})) (returns Str) ...)"));
+                }
+            }
         }
     }
 
@@ -384,6 +436,7 @@ impl Checker {
             "Rand" => Ty::Cap(Cap::Rand),
             "Env" => Ty::Cap(Cap::Env),
             "Net" => Ty::Cap(Cap::Net),
+            "Gfx" => Ty::Cap(Cap::Gfx),
             "Vec" => {
                 if !arity(self, 1, "(Vec T)") {
                     return Ty::Err;
@@ -420,7 +473,7 @@ impl Checker {
                 let mut d = Diag::error("E0103", te.span, &format!("unknown type '{n}'"));
                 let fix = known_alias(n).map(|s| s.to_string()).or_else(|| {
                     let mut names: Vec<&str> =
-                        vec!["I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "F32", "F64", "Bool", "Str", "Unit", "Vec", "Map", "Option", "Result", "Console", "Fs", "Clock", "Rand", "Env", "Net"];
+                        vec!["I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "F32", "F64", "Bool", "Str", "Unit", "Vec", "Map", "Option", "Result", "Console", "Fs", "Clock", "Rand", "Env", "Net", "Gfx"];
                     names.extend(self.info.structs.keys().map(|s| s.as_str()));
                     names.extend(self.info.enums.keys().map(|s| s.as_str()));
                     closest(n, names.into_iter())
@@ -788,18 +841,19 @@ impl Checker {
                                 Ty::Err
                             }
                         };
-                        (elem, BindKind::Borrow, self.place_root(v))
+                        (elem, BindKind::Borrow, self.place_path(v))
                     }
                 };
                 self.loop_depth += 1;
                 let b = self.local(var, elem, kind);
                 let bid = self.bind(b);
                 self.decl.insert(id, bid);
+                let pushed = root.is_some();
                 if let Some(r) = root {
                     self.iter_roots.push(r);
                 }
                 self.check_block(body, None);
-                if root.is_some() {
+                if pushed {
                     self.iter_roots.pop();
                 }
                 self.loop_depth -= 1;
@@ -1082,6 +1136,27 @@ impl Checker {
         }
     }
 
+    /// Root binding plus field path of a place; `[]` stands for any element of a Vec.
+    fn place_path(&self, e: &Expr) -> Option<(BindId, Vec<String>)> {
+        match &e.kind {
+            ExprKind::Var(_) => match self.res[e.id as usize] {
+                Res::Local(b) => Some((b, Vec::new())),
+                _ => None,
+            },
+            ExprKind::Field(b, f, _) => {
+                let (r, mut p) = self.place_path(b)?;
+                p.push(f.clone());
+                Some((r, p))
+            }
+            ExprKind::Call(n, _, args) if n == "at" && args.len() == 2 => {
+                let (r, mut p) = self.place_path(args[0].expr())?;
+                p.push("[]".into());
+                Some((r, p))
+            }
+            _ => None,
+        }
+    }
+
     fn require_mutable_place(&mut self, place: &Expr, what: &str) -> Option<BindId> {
         let Some(root) = self.place_root(place) else {
             if !self.ty[place.id as usize].is_err() {
@@ -1122,7 +1197,8 @@ impl Checker {
                 ).note("copy it into a var first: (var tmp (copy x))"));
             }
         }
-        if self.iter_roots.contains(&root) {
+        let path = self.place_path(place).map(|p| p.1).unwrap_or_default();
+        if self.iter_roots.iter().any(|(r, p)| *r == root && paths_overlap(p, &path)) {
             self.err(Diag::error(
                 "E0403",
                 place.span,
@@ -1466,6 +1542,7 @@ impl Checker {
             return sig.ret;
         }
         let mut mut_roots: Vec<(BindId, Span)> = Vec::new();
+        let path_of = |c: &Checker, x: &Expr| c.place_path(x).map(|p| p.1).unwrap_or_default();
         for (a, (pname, pt, pmut)) in args.iter().zip(sig.params.iter()) {
             if *pmut {
                 match a {
@@ -1506,10 +1583,12 @@ impl Checker {
                     continue;
                 }
                 let by_ref = !self.info.is_copy(pt) && self.place_root(x).is_some();
+                let mpath = args.iter().find(|a| a.expr().span == *rspan).map(|a| path_of(self, a.expr())).unwrap_or_default();
+                let xpath = path_of(self, x);
                 let conflict = if *pmut {
-                    mut_roots.iter().enumerate().any(|(k, (r2, s2))| k != i && r2 == root && *s2 == x.span)
+                    mut_roots.iter().enumerate().any(|(k, (r2, s2))| k != i && r2 == root && *s2 == x.span) && paths_overlap(&mpath, &xpath)
                 } else {
-                    by_ref && self.place_root(x) == Some(*root)
+                    by_ref && self.place_root(x) == Some(*root) && paths_overlap(&mpath, &xpath)
                 };
                 let _ = j;
                 if conflict {
@@ -2174,6 +2253,27 @@ impl Checker {
                 }
                 Ty::Vec(Box::new(Ty::Str))
             }
+            "draw-clear" | "draw-rect" | "draw-circle" | "draw-line" | "draw-text" => {
+                let (nums, strs, shape) = match name {
+                    "draw-clear" => (0, 1, "(draw-clear g color)"),
+                    "draw-rect" => (4, 1, "(draw-rect g x y width height color)"),
+                    "draw-circle" => (3, 1, "(draw-circle g x y radius color)"),
+                    "draw-line" => (5, 1, "(draw-line g x1 y1 x2 y2 width color)"),
+                    _ => (3, 2, "(draw-text g x y size color text)"),
+                };
+                if let Some(rest) = self.need_cap(Cap::Gfx, args, nspan, span) {
+                    if rest.len() != nums + strs {
+                        self.err(Diag::error("E0211", span, &format!("'{name}' is {shape}; numbers are F64 pixels, colors are CSS strings like \"#ff8800\"")));
+                    } else {
+                        for (i, a) in rest.iter().enumerate() {
+                            let x = self.arg_val(a);
+                            let want = if i < nums { Ty::F64 } else { Ty::Str };
+                            self.check_expect(x, &want);
+                        }
+                    }
+                }
+                Ty::Unit
+            }
             "read-all" => {
                 if self.need_cap(Cap::Console, args, nspan, span).is_some() && n != 1 {
                     self.err(Diag::error("E0211", span, "(read-all con) takes only the capability"));
@@ -2493,6 +2593,11 @@ impl Checker {
             }
         }
     }
+}
+
+/// Two places overlap unless they diverge into different fields.
+fn paths_overlap(a: &[String], b: &[String]) -> bool {
+    a.iter().zip(b.iter()).all(|(x, y)| x == y || x == "[]" || y == "[]")
 }
 
 fn ctor_key(name: &str) -> String {

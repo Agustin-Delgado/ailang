@@ -81,6 +81,7 @@ pub const RUNTIME_WEB: &str = r####"
 mod ail_web {
     use std::cell::RefCell;
 
+    #[link(wasm_import_module = "env")]
     extern "C" {
         pub fn host_log(ptr: *const u8, len: usize, is_err: u32);
         pub fn host_now() -> f64;

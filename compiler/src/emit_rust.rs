@@ -43,9 +43,16 @@ fn ty_name(n: &str) -> String {
 pub enum Mode {
     Run,
     Test,
+    Web,
+}
+
+enum ModeKind {
+    Native,
+    Web,
 }
 
 pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> String {
+    let mode_kind = if matches!(mode, Mode::Web) { ModeKind::Web } else { ModeKind::Native };
     let mut em = Emitter { ck, src, moves: HashSet::new(), tmp: 0, fn_name: String::new() };
     let mut out = String::new();
     out.push_str("#![allow(warnings)]\n#![allow(unconditional_panic, arithmetic_overflow)]\n");
@@ -87,6 +94,22 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
                 out.push_str("fn main() {}\n");
             }
         }
+        Mode::Web => {
+            let model = rty(&ck.info.fns["init"].ret);
+            // Extra capability parameters of the app functions are supplied by the host.
+            let caps = |f: &str, skip: usize| -> String {
+                ck.info.fns.get(f).map(|s| s.params.iter().skip(skip).map(|(_, t, _)| format!(", {}", rty(t))).collect::<String>()).unwrap_or_default()
+            };
+            let mut ex = crate::runtime_web::exports(&model, ck.info.fns.contains_key("view"), ck.info.fns.contains_key("page"));
+            ex = ex.replace("f_init()", &format!("f_init({})", caps("init", 0).trim_start_matches(", ")));
+            ex = ex.replace("f_update(m, &ev)", &format!("f_update(m, &ev{})", caps("update", 2)));
+            ex = ex.replace("ail_rt::Gfx);", &format!("ail_rt::Gfx{});", caps("view", 2)));
+            ex = ex.replace("f_page(c.as_ref().expect(\"ail_init must run first\"))", &format!("f_page(c.as_ref().expect(\"ail_init must run first\"){})", caps("page", 1)));
+            if ck.info.is_copy(&ck.info.fns["init"].ret) {
+                ex = ex.replace("f_view(c.as_ref()", "f_view(*c.as_ref()").replace("f_page(c.as_ref()", "f_page(*c.as_ref()");
+            }
+            out.push_str(&ex);
+        }
         Mode::Test => {
             let mut names = Vec::new();
             for (i, it) in prog.items.iter().enumerate() {
@@ -111,6 +134,9 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
     writeln!(fin, "static AIL_LINES: [(u32, u32, u32); {}] = [{}];", table.len(), table.iter().map(|(a, b, c)| format!("({a},{b},{c})")).collect::<Vec<_>>().join(",")).unwrap();
     fin.push_str(crate::runtime::RUNTIME);
     fin.push_str(crate::runtime_net::RUNTIME_NET);
+    if matches!(mode_kind, ModeKind::Web) {
+        fin.push_str(crate::runtime_web::RUNTIME_WEB);
+    }
     fin
 }
 
@@ -948,6 +974,11 @@ impl<'a> Emitter<'a> {
             "rand-f64" => "ail_rt::rand_f64()".into(),
             "args" => "ail_rt::args()".into(),
             "read-all" => "ail_rt::read_all()".into(),
+            "draw-clear" => format!("ail_web::clear({})", self.rf(a(1))),
+            "draw-rect" => format!("ail_web::rect({}, {}, {}, {}, {})", self.val(a(1)), self.val(a(2)), self.val(a(3)), self.val(a(4)), self.rf(a(5))),
+            "draw-circle" => format!("ail_web::circle({}, {}, {}, {})", self.val(a(1)), self.val(a(2)), self.val(a(3)), self.rf(a(4))),
+            "draw-line" => format!("ail_web::line({}, {}, {}, {}, {}, {})", self.val(a(1)), self.val(a(2)), self.val(a(3)), self.val(a(4)), self.val(a(5)), self.rf(a(6))),
+            "draw-text" => format!("ail_web::text({}, {}, {}, {}, {})", self.val(a(1)), self.val(a(2)), self.val(a(3)), self.rf(a(4)), self.rf(a(5))),
             "lines" => format!("ail_rt::lines({})", self.rf(a(0))),
             "is-digit" => format!("ail_rt::all_chars({}, |c| c.is_ascii_digit())", self.rf(a(0))),
             "is-alpha" => format!("ail_rt::all_chars({}, |c| c.is_alphabetic())", self.rf(a(0))),
