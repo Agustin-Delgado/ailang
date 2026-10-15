@@ -18,6 +18,32 @@ pub struct Emitter<'a> {
     moves: HashSet<u32>,
     tmp: usize,
     fn_name: String,
+    /// Str locals emitted as borrowed views, and the bindings each one borrows from.
+    views: HashMap<BindId, View>,
+    view_roots: HashMap<BindId, Vec<BindId>>,
+    /// Fns that return a view of one of their Str params: name -> (param index, kind).
+    view_fns: HashMap<String, (usize, View)>,
+    /// Set while emitting the body of a view fn: how its results are returned.
+    cur_view: Option<View>,
+    /// Expression ids whose code is fixed in advance (see `fused_update`).
+    subst: HashMap<u32, String>,
+}
+
+/// How a borrowed string view is represented: `&str`, or a `Cow` when it is sometimes a copy
+/// (`lower` of a string that has upper-case letters).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum View {
+    Ref,
+    Cow,
+}
+
+/// What the value of a block's last expression is turned into.
+#[derive(Clone, Copy, PartialEq)]
+enum Tail {
+    Val,
+    Unit,
+    Ref,
+    Cow,
 }
 
 pub fn mangle(n: &str) -> String {
@@ -63,7 +89,13 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
         moves: HashSet::new(),
         tmp: 0,
         fn_name: String::new(),
+        views: HashMap::new(),
+        view_roots: HashMap::new(),
+        view_fns: HashMap::new(),
+        cur_view: None,
+        subst: HashMap::new(),
     };
+    em.infer_view_fns(prog);
     let mut out = String::new();
     out.push_str("#![allow(warnings)]\n#![allow(unconditional_panic, arithmetic_overflow)]\n");
     for it in &prog.items {
@@ -160,6 +192,9 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
             for (i, it) in prog.items.iter().enumerate() {
                 if let Item::Test(t) = it {
                     em.moves = compute_moves(&t.body, ck);
+                    em.views.clear();
+                    em.view_roots.clear();
+                    em.plan_views(&t.body);
                     em.fn_name = format!("test \"{}\"", t.name);
                     let body = em.block_as(&t.body, true);
                     writeln!(out, "fn t_{i}() {{\n    let _: () = {body};\n}}").unwrap();
@@ -484,6 +519,8 @@ impl<'a> Emitter<'a> {
     fn param_rty(&self, t: &Ty, m: bool) -> String {
         if m {
             format!("&mut {}", rty(t))
+        } else if *t == Ty::Str {
+            "&str".into()
         } else if self.is_copy(t) {
             rty(t)
         } else {
@@ -494,19 +531,34 @@ impl<'a> Emitter<'a> {
     fn emit_fn(&mut self, f: &FnDef, out: &mut String) {
         let sig = &self.ck.info.fns[&f.name];
         self.moves = compute_moves(&f.body, self.ck);
+        self.views.clear();
+        self.view_roots.clear();
+        self.plan_views(&f.body);
         self.fn_name = f.name.clone();
+        let vf = self.view_fns.get(&f.name).copied();
+        self.cur_view = vf.map(|v| v.1);
         let params: Vec<String> = f
             .params
             .iter()
             .zip(sig.params.iter())
-            .map(|(p, (_, t, m))| {
-                format!("{}: {}", self.local_name(&p.name), self.param_rty(t, *m))
+            .enumerate()
+            .map(|(i, (p, (_, t, m)))| {
+                let ty = if vf.is_some_and(|v| v.0 == i) {
+                    "&'a str".to_string()
+                } else {
+                    self.param_rty(t, *m)
+                };
+                format!("{}: {}", self.local_name(&p.name), ty)
             })
             .collect();
-        let ret = rty(&sig.ret);
+        let (generics, ret) = match vf {
+            Some((_, View::Ref)) => ("<'a>", "&'a str".to_string()),
+            Some((_, View::Cow)) => ("<'a>", "std::borrow::Cow<'a, str>".to_string()),
+            None => ("", rty(&sig.ret)),
+        };
         writeln!(
             out,
-            "fn {}({}) -> {} {{",
+            "fn {}{generics}({}) -> {} {{",
             fn_name(&f.name),
             params.join(", "),
             ret
@@ -523,7 +575,14 @@ impl<'a> Emitter<'a> {
             )
             .unwrap();
         }
-        let body = self.block_as(&f.body, sig.ret == Ty::Unit);
+        let tail = match vf {
+            Some((_, View::Ref)) => Tail::Ref,
+            Some((_, View::Cow)) => Tail::Cow,
+            None if sig.ret == Ty::Unit => Tail::Unit,
+            None => Tail::Val,
+        };
+        let body = self.block_tail(&f.body, tail);
+        self.cur_view = None;
         if f.ensures.is_empty() {
             writeln!(out, "    let __r: {ret} = {body};\n    __r\n}}").unwrap();
         } else {
@@ -567,6 +626,7 @@ impl<'a> Emitter<'a> {
     fn place(&mut self, e: &Expr) -> Option<String> {
         match &e.kind {
             ExprKind::Var(_) => match self.ck.res[e.id as usize] {
+                Res::Local(b) if self.views.contains_key(&b) => None,
                 Res::Local(b) => Some(self.bind_place(b)),
                 _ => None,
             },
@@ -599,6 +659,16 @@ impl<'a> Emitter<'a> {
 
     /// Owned value of the expression.
     pub fn val(&mut self, e: &Expr) -> String {
+        if let (ExprKind::Var(_), Res::Local(b)) = (&e.kind, &self.ck.res[e.id as usize]) {
+            if let Some(k) = self.views.get(b) {
+                let n = self.local_name(&self.ck.bindings[*b].name);
+                return if *k == View::Cow && self.moves.contains(&e.id) {
+                    format!("{n}.into_owned()")
+                } else {
+                    format!("String::from(&{n}[..])")
+                };
+            }
+        }
         if let Some(p) = self.place(e) {
             let t = self.ty(e).clone();
             if self.is_copy(&t) {
@@ -608,6 +678,10 @@ impl<'a> Emitter<'a> {
                 if self.moves.contains(&e.id) {
                     return p;
                 }
+            }
+            if t == Ty::Str {
+                // The place may be a borrowed `str` (a param), which has no `clone`.
+                return format!("String::from(&{p}[..])");
             }
             return format!("{p}.clone()");
         }
@@ -624,6 +698,9 @@ impl<'a> Emitter<'a> {
 
     /// `&T` to the expression's value.
     fn rf(&mut self, e: &Expr) -> String {
+        if self.ty(e) == &Ty::Str {
+            return self.sv(e);
+        }
         match self.place(e) {
             Some(p) => format!("&{p}"),
             None => format!("&({})", self.rvalue(e)),
@@ -632,6 +709,9 @@ impl<'a> Emitter<'a> {
 
     /// Something usable where Rust auto-refs (method receivers, format args): a place or an rvalue.
     fn pv(&mut self, e: &Expr) -> String {
+        if self.ty(e) == &Ty::Str {
+            return self.sv(e);
+        }
         match self.place(e) {
             Some(p) => p,
             None => format!("({})", self.rvalue(e)),
@@ -649,6 +729,11 @@ impl<'a> Emitter<'a> {
 
     /// A block; when `unit` is set, a non-Unit final value is discarded so the block is `()`.
     pub fn block_as(&mut self, es: &[Expr], unit: bool) -> String {
+        self.block_tail(es, if unit { Tail::Unit } else { Tail::Val })
+    }
+
+    fn block_tail(&mut self, es: &[Expr], tail: Tail) -> String {
+        let unit = tail == Tail::Unit;
         let mut o = String::from("{\n");
         for (i, e) in es.iter().enumerate() {
             let last = i + 1 == es.len();
@@ -663,7 +748,11 @@ impl<'a> Emitter<'a> {
                     } else {
                         format!(": {}", rty(&bi.ty))
                     };
-                    let v = self.val(value);
+                    let (ann, v) = match self.views.get(&b).copied() {
+                        Some(View::Ref) => (": &str".to_string(), self.vref(value)),
+                        Some(View::Cow) => (": std::borrow::Cow<str>".to_string(), self.vcow(value)),
+                        None => (ann, self.val(value)),
+                    };
                     let mu = if *mutable { "mut " } else { "" };
                     writeln!(o, "{m}let {mu}{name}{ann} = {v};").unwrap();
                     if last {
@@ -671,7 +760,11 @@ impl<'a> Emitter<'a> {
                     }
                 }
                 _ => {
-                    let code = self.rvalue_or_place(e);
+                    let code = match tail {
+                        Tail::Ref if last => self.vref(e),
+                        Tail::Cow if last => self.vcow(e),
+                        _ => self.rvalue_or_place(e),
+                    };
                     let discard = unit && !matches!(self.ty(e), Ty::Unit | Ty::Never);
                     if last && discard {
                         writeln!(o, "{m}let _ = {code};\n()").unwrap();
@@ -705,6 +798,9 @@ impl<'a> Emitter<'a> {
 
     fn rvalue(&mut self, e: &Expr) -> String {
         let id = e.id as usize;
+        if let Some(code) = self.subst.get(&e.id) {
+            return code.clone();
+        }
         let t = self.ty(e).clone();
         match &e.kind {
             ExprKind::Int(v) => self.lit_int(*v, &t),
@@ -722,6 +818,7 @@ impl<'a> Emitter<'a> {
                     let v = &self.ck.info.enums[en].variants[*vi].0;
                     format!("{}::{}", ty_name(en), mangle(v))
                 }
+                Res::Local(b) if self.views.contains_key(b) => self.val(e),
                 Res::Local(b) => self.bind_place(*b),
                 other => unreachable!("var resolved to {other:?}"),
             },
@@ -770,10 +867,20 @@ impl<'a> Emitter<'a> {
                                 && !self.body_mutates(body, args[0].expr()) =>
                         {
                             let s = self.rf(args[0].expr());
-                            let sep = self.rf(args[1].expr());
+                            let sep = match &args[1].expr().kind {
+                                ExprKind::Str(x) if x.len() == 1 => {
+                                    let s = s.clone();
+                                    let c = x.chars().next().unwrap();
+                                    let bd = self.block(body);
+                                    return format!(
+                                        "for __p in {s}.split({c:?}) {{ let {var}: &str = __p; let _ = {bd}; }}"
+                                    );
+                                }
+                                _ => self.rf(args[1].expr()),
+                            };
                             let bd = self.block(body);
                             return format!(
-                                "{{ let mut __buf = String::new(); for __p in ail_rt::split_iter({s}, {sep}) {{ __buf.clear(); __buf.push_str(__p); let {var} = &__buf; let _ = {bd}; }} }}"
+                                "for __p in ail_rt::split_iter({s}, {sep}) {{ let {var}: &str = __p; let _ = {bd}; }}"
                             );
                         }
                         _ => format!("{}.iter()", self.pv(v)),
@@ -785,10 +892,14 @@ impl<'a> Emitter<'a> {
             ExprKind::Break => "break".into(),
             ExprKind::Continue => "continue".into(),
             ExprKind::Return(v) => match v {
+                Some(v) if self.cur_view == Some(View::Ref) => format!("return {}", self.vref(v)),
+                Some(v) if self.cur_view == Some(View::Cow) => format!("return {}", self.vcow(v)),
                 Some(v) => format!("return {}", self.val(v)),
                 None => "return ()".into(),
             },
-            ExprKind::Match(scrut, arms) => self.emit_match(scrut, arms, t == Ty::Unit),
+            ExprKind::Match(scrut, arms) => {
+                self.emit_match(scrut, arms, if t == Ty::Unit { Tail::Unit } else { Tail::Val })
+            }
             ExprKind::New(name, _, fields) => {
                 let si = self.ck.info.structs[name].clone();
                 let mut parts = Vec::new();
@@ -835,11 +946,16 @@ impl<'a> Emitter<'a> {
                 cast(&v, &from, &t)
             }
             ExprKind::Copy(inner) => match self.place(inner) {
+                Some(p) if t == Ty::Str => format!("String::from(&{p}[..])"),
                 Some(p) => format!("{p}.clone()"),
                 None => self.rvalue(inner),
             },
             ExprKind::Call(name, _, args) => match self.ck.res[id].clone() {
-                Res::UserFn(n) => self.user_call(&n, args),
+                Res::UserFn(n) => match self.view_fns.get(&n).copied() {
+                    Some((_, View::Ref)) => format!("String::from({})", self.user_call(&n, args)),
+                    Some((_, View::Cow)) => format!("({}).into_owned()", self.user_call(&n, args)),
+                    None => self.user_call(&n, args),
+                },
                 Res::Variant(en, vi) => {
                     let v = self.ck.info.enums[&en].variants[vi].0.clone();
                     let mut parts = Vec::new();
@@ -878,6 +994,8 @@ impl<'a> Emitter<'a> {
                 } else {
                     parts.push(v);
                 }
+            } else if *pt == Ty::Str && self.view_arg_ok(x, args, has_mut) {
+                parts.push(self.sv(x));
             } else {
                 match self.place(x) {
                     Some(p) => parts.push(format!("&{p}")),
@@ -949,7 +1067,7 @@ impl<'a> Emitter<'a> {
         self.arms_mutate(std::slice::from_ref(&arm), b)
     }
 
-    fn emit_match(&mut self, scrut: &Expr, arms: &[Arm], unit: bool) -> String {
+    fn emit_match(&mut self, scrut: &Expr, arms: &[Arm], tail: Tail) -> String {
         // Pattern bindings are read-only views of the scrutinee. Borrow it unless an arm
         // mutates the variable it comes from; then the arms see a snapshot (value semantics).
         let mutated = self
@@ -984,7 +1102,7 @@ impl<'a> Emitter<'a> {
             } else {
                 format!(" if {}", guards.join(" && "))
             };
-            let body = self.block_as(&arm.body, unit);
+            let body = self.block_tail(&arm.body, tail);
             writeln!(o, "{p}{g} => {body},").unwrap();
         }
         if arms.is_empty() {
@@ -1008,7 +1126,7 @@ impl<'a> Emitter<'a> {
                 .to_string(),
             Pat::Str(s, _) => {
                 let v = self.fresh();
-                guards.push(format!("{v}.as_str() == {s:?}"));
+                guards.push(format!("&{v}[..] == {s:?}"));
                 v
             }
             Pat::Ctor(name, subs, _) => match (name.as_str(), t) {
@@ -1185,7 +1303,9 @@ impl<'a> Emitter<'a> {
             "concat" => format!("ail_rt::concat({}, {})", self.rf(a(0)), self.rf(a(1))),
             "contains" => {
                 if at(self, 0) == Ty::Str {
-                    format!("{}.contains({}.as_str())", self.pv(a(0)), self.pv(a(1)))
+                    format!("{}.contains({})", self.pv(a(0)), self.sv(a(1)))
+                } else if at(self, 1) == Ty::Str {
+                    format!("{}.iter().any(|__x| &__x[..] == {})", self.pv(a(0)), self.sv(a(1)))
                 } else {
                     format!("{}.contains({})", self.pv(a(0)), self.rf(a(1)))
                 }
@@ -1193,9 +1313,15 @@ impl<'a> Emitter<'a> {
             "index-of" => {
                 if at(self, 0) == Ty::Str {
                     format!(
-                        "{}.find({}.as_str()).map(|i| i as i64)",
+                        "{}.find({}).map(|i| i as i64)",
                         self.pv(a(0)),
-                        self.pv(a(1))
+                        self.sv(a(1))
+                    )
+                } else if at(self, 1) == Ty::Str {
+                    format!(
+                        "{}.iter().position(|__x| &__x[..] == {}).map(|i| i as i64)",
+                        self.pv(a(0)),
+                        self.sv(a(1))
                     )
                 } else {
                     format!("ail_rt::index_of({}, {})", self.rf(a(0)), self.rf(a(1)))
@@ -1235,6 +1361,20 @@ impl<'a> Emitter<'a> {
             "sum" => format!("{}.iter().sum::<{}>()", self.pv(a(0)), rty(&t)),
             "map" => "ail_rt::AilMap::default()".into(),
             "put" => {
+                if let Some(code) = self.fused_update(args) {
+                    return code;
+                }
+                if at(self, 1) == Ty::Str
+                    && matches!(self.view_of(a(1)), Some((View::Ref, _)))
+                {
+                    // A view key is copied only when it is new to the map.
+                    let v = self.val(a(2));
+                    let k = self.vref(a(1));
+                    let p = self.mut_place(&args[0]);
+                    return format!(
+                        "{{ let __v = {v}; let __k: &str = {k}; match {p}.get_mut(__k) {{ Some(__s) => *__s = __v, None => {{ {p}.insert(String::from(__k), __v); }} }} }}"
+                    );
+                }
                 // Look up by reference first: an existing key is updated in place without
                 // materializing (allocating) an owned copy of the key.
                 let v = self.val(a(2));
@@ -1289,15 +1429,15 @@ impl<'a> Emitter<'a> {
             "upper" | "lower" if self.place(a(0)).is_none() => format!("ail_rt::{name}_owned({})", self.val(a(0))),
             "upper" => format!("ail_rt::upper({})", self.rf(a(0))),
             "lower" => format!("ail_rt::lower({})", self.rf(a(0))),
-            "starts-with" => format!("{}.starts_with({}.as_str())", self.pv(a(0)), self.pv(a(1))),
-            "ends-with" => format!("{}.ends_with({}.as_str())", self.pv(a(0)), self.pv(a(1))),
+            "starts-with" => format!("{}.starts_with({})", self.pv(a(0)), self.sv(a(1))),
+            "ends-with" => format!("{}.ends_with({})", self.pv(a(0)), self.sv(a(1))),
             "replace" => format!(
-                "{}.replace({}.as_str(), {}.as_str())",
+                "{}.replace({}, {})",
                 self.pv(a(0)),
-                self.pv(a(1)),
-                self.pv(a(2))
+                self.sv(a(1)),
+                self.sv(a(2))
             ),
-            "join" => format!("{}.join({}.as_str())", self.pv(a(0)), self.pv(a(1))),
+            "join" => format!("{}.join({})", self.pv(a(0)), self.sv(a(1))),
             "parse-i64" => format!("{}.trim().parse::<i64>().ok()", self.pv(a(0))),
             "parse-f64" => format!("{}.trim().parse::<f64>().ok()", self.pv(a(0))),
             "chars" => format!("ail_rt::chars({})", self.rf(a(0))),
@@ -1436,15 +1576,38 @@ impl<'a> Emitter<'a> {
         if reads_root {
             return None;
         }
-        let (fmt, vals) = self.format_parts(&args[1..]);
-        Some(if vals.is_empty() {
-            format!("{p}.push_str({fmt:?});")
-        } else {
-            format!(
-                "{{ use std::fmt::Write as _; let _ = write!({p}, {fmt:?}, {}); }}",
-                vals.join(", ")
-            )
-        })
+        Some(format!("{{ {} }}", self.push_parts(&p, &args[1..])))
+    }
+
+    /// Statements appending each part to the String `target`: strings are copied in directly
+    /// and integers written without going through the formatting machinery.
+    fn push_parts(&mut self, target: &str, args: &[Arg]) -> String {
+        let mut o = String::new();
+        for x in args {
+            let ex = x.expr();
+            match (&ex.kind, self.ty(ex).clone()) {
+                (ExprKind::Str(s), _) => write!(o, "{target}.push_str({s:?}); ").unwrap(),
+                (_, Ty::Str) => {
+                    let v = self.sv(ex);
+                    write!(o, "{target}.push_str({v}); ").unwrap()
+                }
+                (_, Ty::Int(IntK::I64)) => {
+                    let v = self.val(ex);
+                    write!(o, "ail_rt::push_i64(&mut {target}, {v}); ").unwrap()
+                }
+                (_, t) => {
+                    let v = self.pv(ex);
+                    let f = if t.is_float() { "{:?}" } else { "{}" };
+                    write!(o, "{{ use std::fmt::Write as _; let _ = write!({target}, {f:?}, {v}); }} ").unwrap()
+                }
+            }
+        }
+        o
+    }
+
+    /// True if every part of a `str` call is a string or an integer.
+    fn simple_parts(&self, args: &[Arg]) -> bool {
+        args.iter().all(|x| matches!(self.ty(x.expr()), Ty::Str | Ty::Int(IntK::I64)))
     }
 
     fn format_parts(&mut self, args: &[Arg]) -> (String, Vec<String>) {
@@ -1481,6 +1644,8 @@ impl<'a> Emitter<'a> {
         }
         if vals.is_empty() {
             format!("String::from({fmt:?})")
+        } else if self.simple_parts(args) {
+            format!("{{ let mut __s = String::new(); {}__s }}", self.push_parts("__s", args))
         } else {
             format!("format!({fmt:?}, {})", vals.join(", "))
         }
@@ -1497,4 +1662,503 @@ fn cast(v: &str, from: &Ty, to: &Ty) -> String {
         (f, Ty::Int(k)) if f.is_float() => format!("ail_rt::f2i_{}(({v}) as f64)", k.rust()),
         (_, f) => format!("(({v}) as {})", rty(f)),
     }
+}
+
+// ---------- borrowed string views ----------
+//
+// A Str is a value, but reading part of one does not need a copy. An immutable local bound to a
+// piece of another string (a substring, a literal, a trimmed or lower-cased string, a helper that
+// returns part of its argument) becomes a borrowed `&str`, or a `Cow` when it is only sometimes a
+// copy, as long as the strings it borrows from are neither changed nor moved while it lives.
+// The language does not change: views are only how the program is emitted.
+
+fn pat_binds(p: &Pat, ck: &Checked, out: &mut HashSet<BindId>) {
+    match p {
+        Pat::Bind(_, span) => {
+            if let Some(b) = ck.decl.get(&pat_key(*span)) {
+                out.insert(*b);
+            }
+        }
+        Pat::Ctor(_, subs, _) => subs.iter().for_each(|s| pat_binds(s, ck, out)),
+        _ => {}
+    }
+}
+
+impl<'a> Emitter<'a> {
+    /// If `e` can be produced as a borrowed string with no temporaries, its kind and the
+    /// bindings it borrows from.
+    fn view_of(&self, e: &Expr) -> Option<(View, Vec<BindId>)> {
+        if self.ty(e) == &Ty::Never {
+            return Some((View::Ref, vec![]));
+        }
+        if self.ty(e) != &Ty::Str {
+            return None;
+        }
+        match &e.kind {
+            ExprKind::Str(_) => Some((View::Ref, vec![])),
+            ExprKind::Var(_) => match self.ck.res[e.id as usize] {
+                Res::Local(b) => {
+                    let mut roots = vec![b];
+                    if let Some(r) = self.view_roots.get(&b) {
+                        roots.extend(r.iter().copied());
+                    }
+                    Some((View::Ref, roots))
+                }
+                _ => None,
+            },
+            ExprKind::Field(..) => {
+                let mut cur = e;
+                while let ExprKind::Field(b, _, _) = &cur.kind {
+                    cur = b;
+                }
+                if !matches!(cur.kind, ExprKind::Var(_)) {
+                    return None;
+                }
+                Some((View::Ref, vec![self.root_of(e)?]))
+            }
+            ExprKind::Do(es) if es.len() == 1 => self.view_of(&es[0]),
+            ExprKind::If(_, t, Some(f)) => {
+                let (k1, mut r1) = self.view_of(t)?;
+                let (k2, r2) = self.view_of(f)?;
+                r1.extend(r2);
+                let k = if k1 == View::Ref && k2 == View::Ref { View::Ref } else { View::Cow };
+                Some((k, r1))
+            }
+            ExprKind::Match(_, arms) if !arms.is_empty() => {
+                let mut kind = View::Ref;
+                let mut roots = vec![];
+                let mut inner = HashSet::new();
+                for a in arms {
+                    pat_binds(&a.pat, self.ck, &mut inner);
+                    if a.body.len() != 1 {
+                        return None;
+                    }
+                    let (k, r) = self.view_of(&a.body[0])?;
+                    if k == View::Cow {
+                        kind = View::Cow;
+                    }
+                    roots.extend(r);
+                }
+                // A pattern binding lives only inside its arm.
+                if roots.iter().any(|r| inner.contains(r)) {
+                    return None;
+                }
+                Some((kind, roots))
+            }
+            ExprKind::Call(n, _, args) => match &self.ck.res[e.id as usize] {
+                Res::Builtin(_) => match n.as_str() {
+                    "substr" | "trim" => match self.view_of(args[0].expr())? {
+                        (View::Ref, r) => Some((View::Ref, r)),
+                        _ => None,
+                    },
+                    "lower" | "upper" => Some((View::Cow, self.view_of(args[0].expr())?.1)),
+                    _ => None,
+                },
+                Res::UserFn(f) => {
+                    let (k, kind) = *self.view_fns.get(f)?;
+                    match self.view_of(args[k].expr())? {
+                        (View::Ref, r) => Some((kind, r)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The place a view of a variable or field borrows from.
+    fn view_place(&mut self, e: &Expr) -> String {
+        if let (ExprKind::Var(_), Res::Local(b)) = (&e.kind, &self.ck.res[e.id as usize]) {
+            if self.views.contains_key(b) {
+                return self.local_name(&self.ck.bindings[*b].name);
+            }
+        }
+        self.place(e).expect("view of a place")
+    }
+
+    /// `&str` code for an expression whose `view_of` kind is `Ref`.
+    fn vref(&mut self, e: &Expr) -> String {
+        if self.ty(e) == &Ty::Never {
+            return self.rvalue(e);
+        }
+        match &e.kind {
+            ExprKind::Str(s) => format!("{s:?}"),
+            ExprKind::Var(_) => match self.ck.res[e.id as usize] {
+                Res::Local(b) if self.views.get(&b) == Some(&View::Ref) => {
+                    self.local_name(&self.ck.bindings[b].name)
+                }
+                _ => format!("(&{}[..])", self.view_place(e)),
+            },
+            ExprKind::Field(..) => format!("(&{}[..])", self.view_place(e)),
+            ExprKind::Do(es) => self.vref(&es[0]),
+            ExprKind::If(c, t, Some(f)) => {
+                let c = self.val(c);
+                let a = self.vref(t);
+                let b = self.vref(f);
+                format!("(if {c} {{ {a} }} else {{ {b} }})")
+            }
+            ExprKind::Match(s, arms) => self.emit_match(s, arms, Tail::Ref),
+            ExprKind::Call(n, _, args) => match self.ck.res[e.id as usize].clone() {
+                Res::Builtin(_) if n == "substr" => {
+                    let s = self.vref(args[0].expr());
+                    let i = self.val(args[1].expr());
+                    let j = self.val(args[2].expr());
+                    format!("ail_rt::substr_ref({s}, {i}, {j})")
+                }
+                Res::Builtin(_) if n == "trim" => format!("{}.trim()", self.vref(args[0].expr())),
+                Res::UserFn(f) => self.user_call(&f, args),
+                _ => unreachable!("vref of {n}"),
+            },
+            _ => unreachable!("vref"),
+        }
+    }
+
+    /// `Cow<str>` code for an expression that has a view.
+    fn vcow(&mut self, e: &Expr) -> String {
+        let (k, _) = self.view_of(e).expect("vcow of a view");
+        if k == View::Ref {
+            return format!("std::borrow::Cow::Borrowed({})", self.vref(e));
+        }
+        match &e.kind {
+            ExprKind::Do(es) => self.vcow(&es[0]),
+            ExprKind::If(c, t, Some(f)) => {
+                let c = self.val(c);
+                let a = self.vcow(t);
+                let b = self.vcow(f);
+                format!("(if {c} {{ {a} }} else {{ {b} }})")
+            }
+            ExprKind::Match(s, arms) => self.emit_match(s, arms, Tail::Cow),
+            ExprKind::Call(n, _, args) => match self.ck.res[e.id as usize].clone() {
+                Res::Builtin(_) => format!("ail_rt::{n}_cow({})", self.vcow(args[0].expr())),
+                Res::UserFn(f) => self.user_call(&f, args),
+                _ => unreachable!("vcow of {n}"),
+            },
+            _ => unreachable!("vcow"),
+        }
+    }
+
+    /// `&str` for any Str expression, inside a single expression (it may borrow a temporary).
+    fn sv(&mut self, e: &Expr) -> String {
+        match self.view_of(e) {
+            Some((View::Ref, _)) => self.vref(e),
+            Some((View::Cow, _)) => format!("(&{}[..])", self.vcow(e)),
+            None => match self.place(e) {
+                Some(p) => format!("(&{p}[..])"),
+                None => format!("(&({})[..])", self.rvalue(e)),
+            },
+        }
+    }
+
+    /// A Str argument can be passed as a view unless it borrows from a `(mut ...)` argument of
+    /// the same call.
+    fn view_arg_ok(&self, x: &Expr, args: &[Arg], has_mut: bool) -> bool {
+        let Some((_, roots)) = self.view_of(x) else { return false };
+        !has_mut
+            || !args.iter().any(|a| match a {
+                Arg::Mut(m, _) => self.root_of(m).is_some_and(|r| roots.contains(&r)),
+                _ => false,
+            })
+    }
+
+    /// True if nothing in `value` or `rest` changes or moves any of `roots`.
+    fn view_safe(&self, roots: &[BindId], value: &Expr, rest: &[Expr]) -> bool {
+        let mut ok = true;
+        let mut check = |e: &Expr| match &e.kind {
+            ExprKind::Set(p, _) => {
+                if self.root_of(p).is_some_and(|r| roots.contains(&r)) {
+                    ok = false
+                }
+            }
+            ExprKind::Call(_, _, args) => {
+                for a in args {
+                    if let Arg::Mut(x, _) = a {
+                        if self.root_of(x).is_some_and(|r| roots.contains(&r)) {
+                            ok = false
+                        }
+                    }
+                }
+            }
+            ExprKind::Var(_) => {
+                if let Res::Local(b) = self.ck.res[e.id as usize] {
+                    // A `&str` view local is never moved: using it by value copies.
+                    if roots.contains(&b)
+                        && self.moves.contains(&e.id)
+                        && self.views.get(&b) != Some(&View::Ref)
+                    {
+                        ok = false
+                    }
+                }
+            }
+            _ => {}
+        };
+        crate::check::walk(value, &mut check);
+        for x in rest {
+            crate::check::walk(x, &mut check);
+        }
+        ok
+    }
+
+    /// Decide which immutable Str locals of a block (and nested blocks) are views.
+    fn plan_views(&mut self, es: &[Expr]) {
+        for (i, e) in es.iter().enumerate() {
+            self.plan_views_in(e);
+            if let ExprKind::Let { mutable: false, value, .. } = &e.kind {
+                let b = self.ck.decl[&(e.id as usize)];
+                if self.ck.bindings[b].ty != Ty::Str || self.ty(value) != &Ty::Str {
+                    continue;
+                }
+                if let Some((k, roots)) = self.view_of(value) {
+                    // The view only has to stay valid up to the last statement that reads it.
+                    let rest = &es[i + 1..];
+                    let mut live = 0;
+                    for (j, x) in rest.iter().enumerate() {
+                        let mut uses = false;
+                        crate::check::walk(x, &mut |e| {
+                            if matches!(e.kind, ExprKind::Var(_))
+                                && matches!(self.ck.res[e.id as usize], Res::Local(u) if u == b)
+                            {
+                                uses = true;
+                            }
+                        });
+                        if uses {
+                            live = j + 1;
+                        }
+                    }
+                    if self.view_safe(&roots, value, &rest[..live]) {
+                        self.views.insert(b, k);
+                        self.view_roots.insert(b, roots);
+                    }
+                }
+            }
+        }
+    }
+
+    fn plan_views_in(&mut self, e: &Expr) {
+        match &e.kind {
+            ExprKind::Let { value, .. } => self.plan_views_in(value),
+            ExprKind::Set(a, b) => {
+                self.plan_views_in(a);
+                self.plan_views_in(b);
+            }
+            ExprKind::If(c, t, f) => {
+                self.plan_views_in(c);
+                self.plan_views(std::slice::from_ref(t));
+                if let Some(f) = f {
+                    self.plan_views(std::slice::from_ref(f));
+                }
+            }
+            ExprKind::Do(es) => self.plan_views(es),
+            ExprKind::While(c, b) => {
+                self.plan_views_in(c);
+                self.plan_views(b);
+            }
+            ExprKind::For(_, _, it, b) => {
+                match it {
+                    ForIter::Range(x, y) => {
+                        self.plan_views_in(x);
+                        self.plan_views_in(y);
+                    }
+                    ForIter::Each(v) => self.plan_views_in(v),
+                }
+                self.plan_views(b);
+            }
+            ExprKind::Match(s, arms) => {
+                self.plan_views_in(s);
+                for a in arms {
+                    self.plan_views(&a.body);
+                }
+            }
+            ExprKind::Call(_, _, args) => args.iter().for_each(|a| self.plan_views_in(a.expr())),
+            ExprKind::New(_, _, fs) => fs.iter().for_each(|f| self.plan_views_in(&f.2)),
+            ExprKind::With(b, fs) => {
+                self.plan_views_in(b);
+                fs.iter().for_each(|f| self.plan_views_in(&f.2));
+            }
+            ExprKind::Return(Some(x))
+            | ExprKind::Field(x, _, _)
+            | ExprKind::Try(x)
+            | ExprKind::As(_, x)
+            | ExprKind::Copy(x) => self.plan_views_in(x),
+            _ => {}
+        }
+    }
+
+    /// Find fns whose Str result is always a piece of one Str param (or a literal): they return
+    /// a view of it instead of a copy.
+    fn infer_view_fns(&mut self, prog: &Program) {
+        loop {
+            let mut changed = false;
+            for it in &prog.items {
+                let Item::Fn(f) = it else { continue };
+                if self.view_fns.contains_key(&f.name)
+                    || !f.ensures.is_empty()
+                    || f.body.is_empty()
+                    || matches!(f.name.as_str(), "main" | "init" | "update" | "view" | "page")
+                {
+                    continue;
+                }
+                let sig = self.ck.info.fns[&f.name].clone();
+                if sig.ret != Ty::Str {
+                    continue;
+                }
+                self.moves = compute_moves(&f.body, self.ck);
+                self.views.clear();
+                self.view_roots.clear();
+                self.plan_views(&f.body);
+                let mut tails: Vec<&Expr> = vec![f.body.last().unwrap()];
+                collect_returns(&f.body, &mut tails);
+                let params = self.ck.fn_params[&f.name].clone();
+                'p: for (k, (_, pt, pm)) in sig.params.iter().enumerate() {
+                    if *pm || *pt != Ty::Str {
+                        continue;
+                    }
+                    let pb = params[k];
+                    let mut kind = View::Ref;
+                    for t in &tails {
+                        let Some((tk, roots)) = self.view_of(t) else { continue 'p };
+                        if roots
+                            .iter()
+                            .any(|r| *r != pb && self.views.get(r) != Some(&View::Ref))
+                        {
+                            continue 'p;
+                        }
+                        if tk == View::Cow {
+                            kind = View::Cow;
+                        }
+                    }
+                    self.view_fns.insert(f.name.clone(), (k, kind));
+                    changed = true;
+                    break;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.views.clear();
+        self.view_roots.clear();
+    }
+
+    /// `(put (mut m) k (... (get m k) ...))` looks the key up once instead of twice, and copies
+    /// a Str key only when it is new to the map.
+    fn fused_update(&mut self, args: &[Arg]) -> Option<String> {
+        let (m, k, v) = (args[0].expr(), args[1].expr(), args[2].expr());
+        let local = |e: &Expr| match (&e.kind, &self.ck.res[e.id as usize]) {
+            (ExprKind::Var(_), Res::Local(b)) => Some(*b),
+            _ => None,
+        };
+        let mb = local(m)?;
+        let kb = local(k)?;
+        if mb == kb {
+            return None;
+        }
+        let mut get = None;
+        let mut map_uses = 0;
+        let mut ok = true;
+        crate::check::walk(v, &mut |e| match &e.kind {
+            ExprKind::Call(n, _, xs)
+                if n == "get"
+                    && matches!(self.ck.res[e.id as usize], Res::Builtin(_))
+                    && xs.len() == 2
+                    && local(xs[0].expr()) == Some(mb)
+                    && local(xs[1].expr()) == Some(kb) =>
+            {
+                if get.is_some() {
+                    ok = false;
+                }
+                get = Some(e.id);
+            }
+            ExprKind::Var(_) if local(e) == Some(mb) => map_uses += 1,
+            ExprKind::Match(s, _) => {
+                if matches!(&s.kind, ExprKind::Call(n, _, _) if n == "get") {
+                    ok = false;
+                }
+            }
+            ExprKind::Set(p, _) if self.root_of(p) == Some(kb) => ok = false,
+            ExprKind::Call(_, _, xs) => {
+                if xs.iter().any(|a| matches!(a, Arg::Mut(x, _) if self.root_of(x) == Some(kb))) {
+                    ok = false;
+                }
+            }
+            _ => {}
+        });
+        let gid = get?;
+        if !ok || map_uses != 1 {
+            return None;
+        }
+        let vt = match self.ck.ty[gid as usize].clone() {
+            Ty::Opt(t) => rty(&t),
+            _ => return None,
+        };
+        let kr = if self.ty(k) == &Ty::Str {
+            self.sv(k)
+        } else {
+            format!("&{}", self.place(k)?)
+        };
+        self.subst.insert(gid, format!("Some::<{vt}>(__s.clone())"));
+        let vs = self.val(v);
+        self.subst.insert(gid, format!("None::<{vt}>"));
+        let vn = self.val(v);
+        self.subst.remove(&gid);
+        let kown = self.val(k);
+        let p = self.mut_place(&args[0]);
+        Some(format!(
+            "{{ match {p}.get_mut({kr}) {{ Some(__s) => {{ let __v = {vs}; *__s = __v; }} None => {{ let __v = {vn}; {p}.insert({kown}, __v); }} }} }}"
+        ))
+    }
+}
+
+/// Every `(return x)` value in a fn body.
+fn collect_returns<'e>(es: &'e [Expr], out: &mut Vec<&'e Expr>) {
+    fn go<'e>(e: &'e Expr, out: &mut Vec<&'e Expr>) {
+        match &e.kind {
+            ExprKind::Return(Some(v)) => {
+                out.push(v);
+                go(v, out);
+            }
+            ExprKind::Let { value, .. } => go(value, out),
+            ExprKind::Set(a, b) => {
+                go(a, out);
+                go(b, out);
+            }
+            ExprKind::If(c, t, f) => {
+                go(c, out);
+                go(t, out);
+                if let Some(f) = f {
+                    go(f, out);
+                }
+            }
+            ExprKind::Do(es) => es.iter().for_each(|x| go(x, out)),
+            ExprKind::While(c, b) => {
+                go(c, out);
+                b.iter().for_each(|x| go(x, out));
+            }
+            ExprKind::For(_, _, it, b) => {
+                match it {
+                    ForIter::Range(x, y) => {
+                        go(x, out);
+                        go(y, out);
+                    }
+                    ForIter::Each(v) => go(v, out),
+                }
+                b.iter().for_each(|x| go(x, out));
+            }
+            ExprKind::Match(s, arms) => {
+                go(s, out);
+                arms.iter().for_each(|a| a.body.iter().for_each(|x| go(x, out)));
+            }
+            ExprKind::Call(_, _, args) => args.iter().for_each(|a| go(a.expr(), out)),
+            ExprKind::New(_, _, fs) => fs.iter().for_each(|f| go(&f.2, out)),
+            ExprKind::With(b, fs) => {
+                go(b, out);
+                fs.iter().for_each(|f| go(&f.2, out));
+            }
+            ExprKind::Field(x, _, _) | ExprKind::Try(x) | ExprKind::As(_, x) | ExprKind::Copy(x) => {
+                go(x, out)
+            }
+            _ => {}
+        }
+    }
+    es.iter().for_each(|e| go(e, out));
 }

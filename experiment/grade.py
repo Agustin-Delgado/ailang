@@ -6,7 +6,7 @@ Prints a JSON object: {"compiled": bool, "compile_output": str, "passed": n, "to
 import json, os, shutil, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-AIL = os.path.join(HERE, "..", "bin", "ail.exe")
+AIL = os.environ.get("AIL") or os.path.join(HERE, "..", "bin", "ail.exe")
 NODE_BIN = os.path.join(HERE, "node_modules", ".bin")
 TIMEOUT = 20
 

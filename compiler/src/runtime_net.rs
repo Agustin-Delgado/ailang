@@ -6,7 +6,7 @@ mod ail_json {
     use super::U_Json as J;
     use super::ail_rt::AilMap;
 
-    pub fn parse(s: &String) -> Result<J, String> {
+    pub fn parse(s: &str) -> Result<J, String> {
         let mut p = P { b: s.as_bytes(), i: 0, depth: 0 };
         p.ws();
         let v = p.value()?;
@@ -161,6 +161,7 @@ mod ail_json {
     impl Enc for f32 { fn enc(&self, o: &mut String) { num(*self as f64, o) } }
     impl Enc for bool { fn enc(&self, o: &mut String) { o.push_str(if *self { "true" } else { "false" }) } }
     impl Enc for String { fn enc(&self, o: &mut String) { write_str(self, o) } }
+    impl Enc for str { fn enc(&self, o: &mut String) { write_str(self, o) } }
     impl Enc for J { fn enc(&self, o: &mut String) { write(self, o) } }
     impl<T: Enc> Enc for Box<T> { fn enc(&self, o: &mut String) { (**self).enc(o) } }
     impl<T: Enc> Enc for Option<T> { fn enc(&self, o: &mut String) { match self { Some(v) => v.enc(o), None => o.push_str("null") } } }
@@ -434,7 +435,7 @@ mod ail_http {
         }
     }
 
-    pub fn respond(req: &R, status: i64, content_type: &String, body: &String) -> Result<(), String> {
+    pub fn respond(req: &R, status: i64, content_type: &str, body: &str) -> Result<(), String> {
         if !(100..=999).contains(&status) { return Err(format!("invalid status {status}")); }
         let stream = PENDING.with(|p| p.borrow_mut().remove(&req.id));
         let Some(s) = stream else { return Err(format!("request {} was already answered", req.id)) };

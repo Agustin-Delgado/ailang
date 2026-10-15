@@ -1,0 +1,159 @@
+; Tests for how strings are emitted: borrowed views, view-returning functions, map updates that
+; look the key up once, and appending in place. Every case must behave exactly like a copy.
+; Run with: ail test tests/strings.ail
+
+(struct Named (name Str) (n I64))
+
+(fn bang (params (s (mut Str))) (body (set s (str s "!"))))
+
+(fn first-word (params (t Str)) (returns Str)
+  (body
+    (match (index-of t " ")
+      (case (some i) (substr t 0 i))
+      (case none t))))
+
+(fn early (params (t Str)) (returns Str)
+  (body
+    (if (is-empty t) (return "empty"))
+    (trim t)))
+
+(fn norm (params (t Str)) (returns Str) (body (lower (trim t))))
+
+(fn pick (params (a Str) (b Str) (first Bool)) (returns Str) (body (if first a b)))
+
+(fn less (params (a Str) (b Str)) (returns Bool) (body (< a b)))
+
+(fn kind (params (t Str)) (returns I64) (body (match t (case "a" 1) (case "bb" 2) (case _ 3))))
+
+(fn same (params (t Str)) (returns Str) (ensures (== result t)) (body t))
+
+(fn wrap (params (t Str)) (returns Named) (body (new Named (name t) (n (len t)))))
+
+(fn checked-head (params (t Str) (ok Bool)) (returns Str)
+  (body (if ok (substr t 0 1) (fail "not ok"))))
+
+(test "a view does not see later changes to its source"
+  (var s "hello world")
+  (let w (substr s 0 5))
+  (set s "changed")
+  (assert (== w "hello"))
+  (assert (== s "changed")))
+
+(test "a view does not see appends or mut calls"
+  (var s "abc")
+  (let w (substr s 0 2))
+  (set s (str s "def"))
+  (bang (mut s))
+  (assert (== w "ab"))
+  (assert (== s "abcdef!")))
+
+(test "a view does not break when its source moves"
+  (var v (Vec Str) (vec))
+  (var s "hello")
+  (let w (substr s 0 2))
+  (push (mut v) s)
+  (assert (== w "he"))
+  (assert (== (at v 0) "hello")))
+
+(test "views of views"
+  (let s "programming")
+  (let a (substr s 0 7))
+  (let b (substr a 3 7))
+  (assert (== b "gram"))
+  (assert (== (len a) 7)))
+
+(test "field views follow the record"
+  (var r (new Named (name "first") (n 1)))
+  (let n (. r name))
+  (set (. r name) "second")
+  (assert (== n "first"))
+  (assert (== (. r name) "second")))
+
+(test "view-returning functions"
+  (assert (== (first-word "hello big world") "hello"))
+  (assert (== (first-word "single") "single"))
+  (assert (== (early "") "empty"))
+  (assert (== (early "  x  ") "x"))
+  (assert (== (first-word (early "  two words ")) "two"))
+  (let w (first-word "keep this"))
+  (var v (Vec Str) (vec))
+  (push (mut v) w)
+  (push (mut v) w)
+  (assert (== (join v "+") "keep+keep")))
+
+(test "lower and upper copy only when needed"
+  (assert (== (norm "  HeLLo ") "hello"))
+  (assert (== (norm "abc") "abc"))
+  (assert (== (norm "ÁRBOL") "árbol"))
+  (let s "MiXeD")
+  (let l (lower s))
+  (let u (upper s))
+  (var v (Vec Str) (vec))
+  (push (mut v) l)
+  (push (mut v) u)
+  (assert (== (join v ",") "mixed,MIXED")))
+
+(test "Str params compare, match and copy"
+  (assert (less "abc" "abd"))
+  (assert (not (less "b" "a")))
+  (assert (== (kind "a") 1))
+  (assert (== (kind (substr "xbbx" 1 3)) 2))
+  (assert (== (kind "zz") 3))
+  (assert (== (pick "x" "y" false) "y"))
+  (assert (== (same "id") "id"))
+  (assert (== (. (wrap "four") n) 4))
+  (assert (== (checked-head "zed" true) "z")))
+
+(test "Vec contains and index-of with views"
+  (let words (vec "alpha" "beta" "gamma"))
+  (let s "xbetax")
+  (assert (contains words (substr s 1 5)))
+  (assert (== (unwrap-or (index-of words (substr s 1 5)) -1) 1))
+  (assert (not (contains words "delta"))))
+
+(test "views inside split loops"
+  (var firsts (Vec Str) (vec))
+  (for tok (split "apple,Banana,,cherry" ",")
+    (let w (lower tok))
+    (if (not (is-empty w)) (push (mut firsts) (substr w 0 1))))
+  (assert (== (join firsts "") "abc"))
+  (var parts (Vec Str) (vec))
+  (for p (split "a::b::c" "::") (push (mut parts) p))
+  (assert (== (len parts) 3))
+  (var chars (Vec Str) (vec))
+  (for c (split "xyz" "") (push (mut chars) c))
+  (assert (== (join chars "-") "x-y-z")))
+
+(test "match with pattern bindings is still correct"
+  (var m (Map I64 Str) (map))
+  (put (mut m) 1 "one")
+  (let w (match (get m 1) (case (some s) s) (case none "")))
+  (put (mut m) 1 "uno")
+  (assert (== w "one")))
+
+(test "map updates look the key up once"
+  (var counts (Map Str I64) (map))
+  (for tok (split "a b a c a b" " ")
+    (put (mut counts) tok (+ 1 (unwrap-or (get counts tok) 0))))
+  (assert (== (unwrap-or (get counts "a") 0) 3))
+  (assert (== (unwrap-or (get counts "b") 0) 2))
+  (assert (== (len counts) 3))
+  (var lists (Map I64 (Vec I64)) (map))
+  (for i (range 0 6)
+    (let k (% i 2))
+    (put (mut lists) k (concat (unwrap-or (get lists k) (vec)) (vec i))))
+  (assert (== (unwrap-or (get lists 1) (vec)) (vec 1 3 5)))
+  (var seen (Map Str Bool) (map))
+  (let key "k")
+  (put (mut seen) key (is-none (get seen key)))
+  (put (mut seen) key (is-none (get seen key)))
+  (assert (== (get seen "k") (some false))))
+
+(test "appending in place keeps every part"
+  (var s "")
+  (set s (str s 1 " " -2 " " 2.5 " " true " " (substr "xyz" 1 2)))
+  (let big (- 0 9223372036854775807))
+  (set s (str s " " (- big 1)))
+  (assert (== s "1 -2 2.5 true y -9223372036854775808"))
+  (let n I32 7)
+  (assert (== (str "n=" n ", m=" 0) "n=7, m=0")))
