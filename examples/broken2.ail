@@ -1,0 +1,23 @@
+(enum Color (Red) (Green) (Blue))
+
+(fn describe (params (c Color)) (returns Str)
+  (body
+    (match c
+      (case Color.Red "red")
+      (case Color.Green "green") (case Color.Blue (fail "TODO: handle Blue")))))
+
+(fn log-sum (params (xs (Vec I64)) (con Console)) (returns I64)
+  (body
+    (var total 0)
+    (for x xs (set total (+ total x)))
+    (println con "sum is " total)
+    total))
+
+(fn my-fill (params (v (mut (Vec I64))))
+  (body (push (mut v) 1)))
+
+(fn main (params (con Console))
+  (body
+    (var data (vec 1 2 3))
+    (my-fill (mut data))
+    (println con (describe Color.Blue) (log-sum data con))))

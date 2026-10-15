@@ -1,0 +1,11 @@
+(fn main (params (con Console))
+  (body
+    (var m (Map I64 I64) (map))
+    (let n 5000000)
+    (for i (range 0 n) (put (mut m) (* i 7919) i))
+    (var hits 0)
+    (for i (range 0 (* 2 n))
+      (match (get m (* i 7919))
+        (case (some v) (set hits (+ hits v)))
+        (case none unit)))
+    (println con (len m) " " hits)))

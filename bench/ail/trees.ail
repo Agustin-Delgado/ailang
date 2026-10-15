@@ -1,0 +1,25 @@
+(enum Tree (Leaf) (Node Tree Tree))
+
+(fn make (params (d I64)) (returns Tree)
+  (body (if (== d 0) (Tree.Node Tree.Leaf Tree.Leaf) (Tree.Node (make (- d 1)) (make (- d 1))))))
+
+(fn check-tree (params (t Tree)) (returns I64)
+  (body
+    (match t
+      (case Tree.Leaf 0)
+      (case (Tree.Node l r) (+ 1 (check-tree l) (check-tree r))))))
+
+(fn main (params (con Console))
+  (body
+    (let max-depth 20)
+    (let stretch (+ max-depth 1))
+    (println con "stretch tree of depth " stretch "\t check: " (check-tree (make stretch)))
+    (let long-lived (make max-depth))
+    (var d 4)
+    (while (<= d max-depth)
+      (let iters (shl 1 (+ (- max-depth d) 4)))
+      (var chk 0)
+      (for _i (range 0 iters) (set chk (+ chk (check-tree (make d)))))
+      (println con iters "\t trees of depth " d "\t check: " chk)
+      (set d (+ d 2)))
+    (println con "long lived tree of depth " max-depth "\t check: " (check-tree long-lived))))

@@ -1,0 +1,168 @@
+# ail language specification (v0.1)
+
+ail is a language written by AI agents. A program is a list of typed s-expressions.
+There is exactly one way to write each thing. Values never alias, effects are explicit
+capabilities, errors are values, and there is no undefined behavior.
+
+Toolchain: `ail check f.ail --json` (instant, JSON diagnostics with fixes), `ail fix f.ail`
+(applies every fix), `ail run f.ail`, `ail test f.ail`, `ail build f.ail -o out`.
+
+## Syntax
+
+- Comments start with `;`. Names: letters, digits, `-`, `_`, `?` (e.g. `max-depth`, `empty?`).
+- Literals: `42`, `-7`, `1_000`, `0xff`, `3.14`, `1e-9`, `"text\n"`, `true`, `false`, `unit`, `none`.
+- Integer literals adapt to the expected type (`I32`, `U8`, `F64`...); otherwise they are `I64`.
+  Float literals are `F64`.
+
+## Types
+
+`I8 I16 I32 I64 U8 U16 U32 U64 F32 F64 Bool Str Unit`, `(Vec T)`, `(Map K V)` (K: integer, Str, Bool),
+`(Option T)`, `(Result T E)`, user structs and enums, and capabilities `Console Fs Clock Rand Env`.
+Indexes and lengths are always `I64`.
+
+## Top-level items
+
+```
+(struct Point (x F64) (y F64))
+(enum Shape (Circle Point F64) (Rect Point Point) (Empty))   ; variants have positional fields
+(const MAX I64 100)                                           ; numeric or Bool only
+(fn name (params (a I64) (v (mut (Vec I64))))                ; params is optional
+  (returns I64)                                               ; optional, default Unit
+  (requires (> a 0))                                          ; optional contracts, checked at runtime
+  (ensures (>= result 0))                                     ; `result` is the return value
+  (body expr...))                                             ; value of the last expression
+(test "name" expr...)                                         ; run with `ail test`
+```
+
+Type and variant names start with an uppercase letter. Enum variants are always qualified:
+`Shape.Circle`. Recursive types are allowed (`(enum Tree (Leaf) (Node Tree Tree))`).
+
+## Expressions
+
+```
+(let x 5)  (let x I32 5)            ; immutable binding (optional type)
+(var n 0)  (var xs (Vec I64) (vec)) ; mutable binding
+(set n (+ n 1))                     ; assign to a var, a field (. p x), or an element (at v i)
+(set (. p x) 1.0)  (set (at v 0) 9)
+(if cond then else)                 ; (if cond then) when then is Unit
+(do e1 e2 ... en)                   ; sequence, value of en
+(while cond body...)
+(for i (range 0 n) body...)         ; 0..n-1, n exclusive
+(for x xs body...)                  ; elements of a Vec (read-only)
+break  continue  (return v)  (return)
+(match v (case pattern body...) ...) ; must be exhaustive
+(new Point (x 1.0) (y 2.0))         ; all fields required
+(with p (x 5.0))                    ; copy of p with fields replaced
+(. p x)  (. a b c)                  ; field access, chained
+(Shape.Circle p 2.0)  Shape.Empty   ; enum construction
+(try e)                             ; unwrap Result/Option or return the err/none early
+(as F64 n)                          ; numeric conversion (traps if the value does not fit)
+(copy x)                            ; explicit copy (see aliasing)
+(f a b)                             ; call; mutated args are marked: (push (mut v) 1)
+```
+
+Patterns: `_`, a name (binds), integer and string literals, `true`, `false`, `none`, `(some p)`,
+`(ok p)`, `(err p)`, `Enum.Variant`, `(Enum.Variant p1 p2 ...)`. Pattern bindings are read-only.
+
+## Values, mutation and aliasing
+
+Every value has one owner; assignment and argument passing behave like copies.
+A function can only change caller data through a `(mut T)` parameter, and the caller must
+write `(mut place)` at the call site. A place that is passed as `(mut ...)` cannot appear in
+any other argument of the same call (no aliasing). Bindings made with `let`, loop variables
+and pattern bindings are read-only; use `var` to mutate. You cannot mutate a Vec while
+iterating it with `for x xs`; iterate by index instead.
+
+## Effects are capabilities
+
+A function without capability parameters is pure: no I/O, no clock, no randomness, no globals.
+`main` receives the capabilities the program needs and passes them down explicitly:
+
+```
+(fn main (params (con Console) (fs Fs) (clock Clock) (rng Rand) (env Env)) ...)  ; any subset
+```
+
+`main` returns `Unit` or `(Result Unit Str)` (an `err` prints the message and exits 1).
+Capabilities cannot be stored in structs, returned, or used in contracts. Tests get none.
+
+## Errors
+
+No exceptions and no null. Fallible operations return `Result`/`Option`; handle them with
+`match`, `try`, `unwrap-or`, or `expect`. Overflow, out-of-bounds, division by zero, failed
+`expect`/`assert`/contracts and `(fail msg)` stop the program with a *trap* that reports the
+source line. Arithmetic is checked: overflow never wraps silently.
+
+## Builtin functions
+
+Arithmetic and logic: `(+ a b ...)` `(- a b)` `(- a)` `(* a b ...)` `(/ a b)` `(% a b)`
+`(== a b)` `(!= a b)` `(< a b)` `(<= a b)` `(> a b)` `(>= a b)` `(and a b ...)` `(or a b ...)` `(not a)`
+`(bit-and a b)` `(bit-or a b)` `(bit-xor a b)` `(shl a n)` `(shr a n)` `(abs x)` `(min a b)` `(max a b)`
+`(pow b e)` (int: e is U32) `(sqrt x)` `(floor x)` `(ceil x)` `(round x)` `(sin x)` `(cos x)` `(tan x)`
+`(atan2 y x)` `(exp x)` `(ln x)`. Operands of one operator must have the same type; convert with `as`.
+
+Text: `(str a b ...)` concatenates numbers, Bool and Str into a Str. `(len s)` (bytes) `(substr s start end)`
+`(split s sep)` -> `(Vec Str)` `(join xs sep)` `(trim s)` `(upper s)` `(lower s)` `(starts-with s p)`
+`(ends-with s p)` `(contains s part)` `(index-of s part)` -> `(Option I64)` `(replace s from to)`
+`(chars s)` -> `(Vec Str)` `(byte-at s i)` -> `I64` `(from-code n)` -> Str of one code point `(repeat s n)`
+`(parse-i64 s)` `(parse-f64 s)` -> Option (surrounding whitespace ignored) `(fmt-float x decimals)` -> Str (`(fmt-float 2.5 2)` is `"2.50"`).
+Floats print in full precision with `str`/`println` (`2.5`, `0.1`, `1.0`).
+
+Vec: `(vec a b ...)` `(fill n x)` `(len v)` `(is-empty v)` `(at v i)` `(push (mut v) x)` `(pop (mut v))` -> Option
+`(last v)` -> Option `(insert-at (mut v) i x)` `(remove-at (mut v) i)` -> T `(swap (mut v) i j)` `(clear (mut v))`
+`(extend (mut v) other)` `(slice v start end)` `(concat a b)` `(contains v x)` `(index-of v x)` -> Option
+`(sort (mut v))` ascending `(reverse (mut v))` `(sum v)`.
+
+Ordering: numbers, Str (bytewise), Bool, and Vec/Option/structs/enums built from them compare with
+`< <= > >= min max` and `sort`. Structs compare field by field in declaration order and enums by variant
+order, so to sort records by a key declare the key as the first field. Maps have no order.
+
+Map: `(map)` empty (needs a type annotation) `(put (mut m) k v)` `(get m k)` -> Option `(has m k)`
+`(del (mut m) k)` -> Option `(keys m)` (sorted) `(values m)` (sorted by key) `(len m)` `(is-empty m)` `(clear (mut m))`.
+
+Option/Result: `(some x)` `none` `(ok x)` `(err e)` `(unwrap-or o default)` `(expect o "msg")`
+`(is-some o)` `(is-none o)` `(is-ok r)` `(is-err r)`.
+
+Effects (first argument is the capability):
+`(print con a b ...)` `(println con a b ...)` `(eprintln con ...)` `(read-line con)` -> `(Option Str)`
+`(read-file fs path max-bytes)` -> `(Result Str Str)` `(write-file fs path text)` -> `(Result Unit Str)`
+`(now-ms clock)` `(now-ns clock)` `(rand-int rng low high)` (high exclusive) `(rand-f64 rng)` `(args env)` -> `(Vec Str)`.
+
+Other: `(fail "msg")` stops the program (type Never, fits anywhere). `(assert cond)` `(assert cond "msg")`.
+
+There are no lambdas, no generics in user code, no globals except `const`, no inheritance,
+no exceptions and no implicit conversions.
+
+## Example
+
+```
+(struct Account (owner Str) (balance I64))
+
+(fn deposit (params (a (mut Account)) (amount I64))
+  (requires (> amount 0))
+  (body (set (. a balance) (+ (. a balance) amount))))
+
+(fn parse-amounts (params (line Str)) (returns (Result (Vec I64) Str))
+  (body
+    (var out (Vec I64) (vec))
+    (for part (split line ",")
+      (match (parse-i64 part)
+        (case (some n) (push (mut out) n))
+        (case none (return (err (str "not a number: " part))))))
+    (ok out)))
+
+(fn main (params (con Console)) (returns (Result Unit Str))
+  (body
+    (var acc (new Account (owner "ana") (balance 0)))
+    (for n (try (parse-amounts "10,20,30")) (deposit (mut acc) n))
+    (println con (. acc owner) " has " (. acc balance))
+    (ok unit)))
+
+(test "parse" (assert (is-err (parse-amounts "1,x"))))
+```
+
+## Diagnostics
+
+`ail check --json` prints `{"ok":bool,"errors":n,"diagnostics":[...]}`. Each diagnostic has a stable
+`code`, `message`, `span` (line/col), `expected`/`found` when relevant, `notes`, and `fixes`: each fix is a
+list of exact text edits. `ail fix` applies them. Missing capabilities, missing `(mut ...)`, `let` that
+should be `var`, non-exhaustive matches and misspelled names are all fixed automatically.
