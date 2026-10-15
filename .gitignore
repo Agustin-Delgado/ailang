@@ -8,3 +8,4 @@ bench/rust/target/
 bench/web/ail-out/
 bench/web/rust/target/
 .playwright-mcp/
+bench/web/arena-web/
