@@ -2,7 +2,9 @@ mod ast;
 mod check;
 mod diag;
 mod emit_rust;
+mod parinfer;
 mod runtime;
+mod runtime_net;
 mod sexpr;
 mod types;
 
@@ -47,8 +49,93 @@ fn fill_sentinels(src: &str, diags: &mut [Diag]) {
     }
 }
 
+/// Types every program can use. Declared in ail itself; never produces diagnostics.
+const PRELUDE: &str = "
+(enum Json (Null) (Bool Bool) (Num F64) (Str Str) (Arr (Vec Json)) (Obj (Map Str Json)))
+(struct Request (id I64) (method Str) (path Str) (query (Map Str Str)) (headers (Map Str Str)) (body Str))
+";
+
 fn frontend(src: &str) -> Result<Front, Vec<Diag>> {
-    let forms = sexpr::read(src).map_err(|d| vec![d])?;
+    match frontend_raw(src) {
+        Ok(f) => Ok(f),
+        Err(mut diags) => {
+            if let Some(d) = paren_fix(src, &diags) {
+                diags.insert(0, d);
+            }
+            Err(diags)
+        }
+    }
+}
+
+/// Like `frontend`, but when the parens are broken and the indentation-implied structure is a
+/// valid program, use that program (with a warning). A valid program never changes meaning:
+/// the repair only applies when the original does not compile.
+fn frontend_lenient(src: &str) -> Result<(Front, String), Vec<Diag>> {
+    match frontend(src) {
+        Ok(f) => Ok((f, src.to_string())),
+        Err(diags) => {
+            if diags.first().is_some_and(|d| d.code == "E0006") {
+                let fixed = parinfer::infer(src);
+                if let Ok(mut f) = frontend_raw(&fixed) {
+                    let mut w = diags[0].clone();
+                    w.severity = "warning";
+                    w.code = "W0004";
+                    w.message = "closing parentheses were repaired from the indentation; run `ail fix` to write the repair into the file".into();
+                    f.warnings.insert(0, w);
+                    return Ok((f, fixed));
+                }
+            }
+            Err(diags)
+        }
+    }
+}
+
+fn error_count(r: &Result<Front, Vec<Diag>>) -> usize {
+    match r {
+        Ok(_) => 0,
+        Err(d) => d.iter().filter(|d| d.severity == "error").count(),
+    }
+}
+
+/// When parens disagree with indentation and the indentation-implied structure is better,
+/// offer it as a fix: one edit per changed line.
+fn paren_fix(src: &str, diags: &[Diag]) -> Option<Diag> {
+    let fixed = parinfer::infer(src);
+    if fixed == src {
+        return None;
+    }
+    let before = diags.iter().filter(|d| d.severity == "error").count();
+    let after = error_count(&frontend_raw(&fixed));
+    if after >= before {
+        return None;
+    }
+    let old: Vec<&str> = src.split('\n').collect();
+    let new: Vec<&str> = fixed.split('\n').collect();
+    if old.len() != new.len() {
+        return None;
+    }
+    let mut edits = Vec::new();
+    let mut offset = 0;
+    let mut first = None;
+    for (o, n) in old.iter().zip(new.iter()) {
+        if o != n {
+            first.get_or_insert(offset);
+            edits.push(diag::Edit { span: diag::Span::new(offset, offset + o.len()), text: n.to_string() });
+        }
+        offset += o.len() + 1;
+    }
+    let at = first.unwrap_or(0);
+    let lines = edits.len();
+    Some(
+        Diag::error("E0006", diag::Span::new(at, at + old.iter().map(|l| l.len()).next().unwrap_or(0).min(1)), "parentheses do not match the indentation")
+            .note(format!("rebuilding the closing parens from the indentation changes {lines} line(s) and fixes {} of {before} error(s)", before - after))
+            .with_fix("rebalance the parentheses according to the indentation", edits),
+    )
+}
+
+fn frontend_raw(src: &str) -> Result<Front, Vec<Diag>> {
+    let mut forms = sexpr::read(PRELUDE).expect("prelude parses");
+    forms.extend(sexpr::read(src).map_err(|d| vec![d])?);
     let (prog, mut diags) = ast::lower(&forms);
     if diags.iter().any(|d| d.severity == "error") {
         return Err(diags);
@@ -126,9 +213,9 @@ fn main() -> ExitCode {
     };
     let fname = Path::new(file).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or(file.clone());
     match cmd {
-        "check" => match frontend(&src) {
-            Ok(f) => {
-                report(&f.warnings, &src, &fname, opts.json);
+        "check" => match frontend_lenient(&src) {
+            Ok((f, eff)) => {
+                report(&f.warnings, &eff, &fname, opts.json);
                 if !opts.json {
                     eprintln!("ok");
                 }
@@ -147,7 +234,8 @@ fn main() -> ExitCode {
                     Ok(f) => f.warnings,
                     Err(d) => d,
                 };
-                let (next, n) = diag::apply_fixes(&cur, &diags);
+                let errors: Vec<Diag> = diags.into_iter().filter(|d| d.severity == "error").collect();
+                let (next, n) = diag::apply_fixes(&cur, &errors);
                 if n == 0 || next == cur {
                     break;
                 }
@@ -170,13 +258,16 @@ fn main() -> ExitCode {
             }
         }
         "emit" | "build" | "run" | "test" => {
-            let f = match frontend(&src) {
-                Ok(f) => f,
+            let (f, src) = match frontend_lenient(&src) {
+                Ok(x) => x,
                 Err(d) => {
                     report(&d, &src, &fname, opts.json);
                     return ExitCode::from(1);
                 }
             };
+            if !opts.json {
+                report(&f.warnings, &src, &fname, false);
+            }
             let mode = if cmd == "test" { emit_rust::Mode::Test } else { emit_rust::Mode::Run };
             if cmd == "test" && !f.prog.items.iter().any(|i| matches!(i, ast::Item::Test(_))) {
                 eprintln!("no (test ...) blocks in {fname}");

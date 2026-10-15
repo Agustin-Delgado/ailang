@@ -1,0 +1,84 @@
+(struct P (cs (Vec Str)) (pos I64))
+
+(fn peek (params (p P)) (returns Str)
+  (body
+    (if (< (. p pos) (len (. p cs))) (at (. p cs) (. p pos)) "")))
+
+(fn skip (params (p (mut P)))
+  (body
+    (while (== (peek p) " ") (set (. p pos) (+ (. p pos) 1)))))
+
+(fn is-digit (params (c Str)) (returns Bool)
+  (body (and (!= c "") (>= c "0") (<= c "9") (== (len c) 1))))
+
+(fn parse-atom (params (p (mut P))) (returns (Result I64 Str))
+  (body
+    (skip (mut p))
+    (let c (peek p))
+    (if (== c "-")
+      (do
+        (set (. p pos) (+ (. p pos) 1))
+        (let v (try (parse-atom (mut p))))
+        (return (ok (- v))))
+      (if (== c "(")
+        (do
+          (set (. p pos) (+ (. p pos) 1))
+          (let v (try (parse-expr (mut p))))
+          (skip (mut p))
+          (if (== (peek p) ")")
+            (do (set (. p pos) (+ (. p pos) 1)) (ok v))
+            (err "paren")))
+        (if (is-digit c)
+          (do
+            (var n 0)
+            (while (is-digit (peek p))
+              (set n (+ (* n 10) (- (byte-at (peek p) 0) 48)))
+              (set (. p pos) (+ (. p pos) 1)))
+            (ok n))
+          (err "operand"))))))
+
+(fn parse-term (params (p (mut P))) (returns (Result I64 Str))
+  (body
+    (var acc (try (parse-atom (mut p))))
+    (skip (mut p))
+    (while (or (== (peek p) "*") (== (peek p) "/"))
+      (let op (peek p))
+      (set (. p pos) (+ (. p pos) 1))
+      (let r (try (parse-atom (mut p))))
+      (if (== op "*")
+        (set acc (* acc r))
+        (do
+          (if (== r 0) (return (err "div0")))
+          (set acc (/ acc r))))
+      (skip (mut p)))
+    (ok acc)))
+
+(fn parse-expr (params (p (mut P))) (returns (Result I64 Str))
+  (body
+    (var acc (try (parse-term (mut p))))
+    (skip (mut p))
+    (while (or (== (peek p) "+") (== (peek p) "-"))
+      (let op (peek p))
+      (set (. p pos) (+ (. p pos) 1))
+      (let r (try (parse-term (mut p))))
+      (if (== op "+") (set acc (+ acc r)) (set acc (- acc r)))
+      (skip (mut p)))
+    (ok acc)))
+
+(fn eval-line (params (s Str)) (returns (Result I64 Str))
+  (body
+    (var p (new P (cs (chars s)) (pos 0)))
+    (let v (try (parse-expr (mut p))))
+    (skip (mut p))
+    (if (< (. p pos) (len (. p cs))) (err "trailing") (ok v))))
+
+(fn main (params (con Console))
+  (body
+    (var line (read-line con))
+    (while (is-some line)
+      (let s (unwrap-or line ""))
+      (if (!= (trim s) "")
+        (match (eval-line s)
+          (case (ok v) (println con v))
+          (case (err _) (println con "error"))))
+      (set line (read-line con)))))

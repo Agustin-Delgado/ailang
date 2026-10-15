@@ -1,0 +1,45 @@
+(struct Stat (count I64) (total I64) (max I64) (who Str))
+
+(fn valid-int (params (s Str)) (returns Bool)
+  (body
+    (if (== (len s) 0) false
+      (do
+        (var ok true)
+        (for ch (chars s)
+          (if (not (and (>= ch "0") (<= ch "9"))) (set ok false)))
+        ok))))
+
+(fn pad2 (params (n I64)) (returns Str)
+  (body (if (< n 10) (str "0" n) (str n))))
+
+(fn main (params (con Console))
+  (body
+    (var depts (Map Str Stat) (map))
+    (var invalid 0)
+    (var line (read-line con))
+    (while (is-some line)
+      (let s (trim (unwrap-or line "")))
+      (if (!= s "")
+        (do
+          (let f (split s ","))
+          (if (and (== (len f) 3) (valid-int (at f 2)))
+            (do
+              (let sal (unwrap-or (parse-i64 (at f 2)) 0))
+              (let d (at f 0))
+              (let nm (at f 1))
+              (match (get depts d)
+                (case none (put (mut depts) d (new Stat (count 1) (total sal) (max sal) (who nm))))
+                (case (some st)
+                  (do
+                    (var ns (with st (count (+ (. st count) 1)) (total (+ (. st total) sal))))
+                    (if (or (> sal (. st max)) (and (== sal (. st max)) (< nm (. st who))))
+                      (set ns (with ns (max sal) (who nm))))
+                    (put (mut depts) d ns)))))
+            (set invalid (+ invalid 1)))))
+      (set line (read-line con)))
+    (for d (keys depts)
+      (let st (expect (get depts d) "dept"))
+      (let cents (/ (+ (* (. st total) 200) (. st count)) (* 2 (. st count))))
+      (println con d " count=" (. st count) " total=" (. st total)
+        " avg=" (/ cents 100) "." (pad2 (% cents 100)) " max=" (. st who)))
+    (println con "invalid " invalid)))

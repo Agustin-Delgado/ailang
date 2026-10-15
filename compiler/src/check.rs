@@ -81,6 +81,7 @@ pub fn check(prog: &Program) -> (Checked, Vec<Diag>) {
         in_test: false,
         iter_roots: Vec::new(),
         clash_uses: HashMap::new(),
+        stmt_ids: std::collections::HashSet::new(),
     };
     c.collect(prog);
     for it in &prog.items {
@@ -104,7 +105,7 @@ pub fn check(prog: &Program) -> (Checked, Vec<Diag>) {
         let new = format!("my-{name}");
         let edits = spans.iter().map(|s| Edit { span: *s, text: new.clone() }).collect();
         c.diags.push(
-            Diag::error("E0105", spans[0], &format!("'{name}' is a builtin function; choose another name"))
+            Diag::warning("W0003", spans[0], &format!("'{name}' shadows the builtin of the same name; calls use your definition"))
                 .with_fix(&format!("rename it to '{new}' everywhere"), edits),
         );
     }
@@ -146,12 +147,15 @@ struct Checker {
     iter_roots: Vec<BindId>,
     /// User fns whose name clashes with a builtin: definition span and call-site spans.
     clash_uses: HashMap<String, Vec<Span>>,
+    /// Expressions whose value is discarded (statement position): their branches may differ in type.
+    stmt_ids: std::collections::HashSet<u32>,
 }
 
+/// Names that cannot be variables or functions. Clause names (params, body...) are not here:
+/// they only mean something in their fixed position inside (fn ...).
 const KEYWORDS: &[&str] = &[
-    "fn", "struct", "enum", "const", "test", "let", "var", "set", "if", "do", "while", "for", "break", "continue", "return",
-    "match", "case", "new", "with", "try", "as", "copy", "mut", "range", "params", "returns", "requires", "ensures", "body",
-    "true", "false", "unit", "none", "result",
+    "let", "var", "set", "if", "do", "while", "for", "break", "continue", "return", "match", "case", "new", "with",
+    "try", "as", "copy", "mut", "range", "true", "false", "unit", "none",
 ];
 
 pub const BUILTINS: &[&str] = &[
@@ -161,7 +165,7 @@ pub const BUILTINS: &[&str] = &[
     "concat", "contains", "index-of", "sort", "reverse", "sum", "map", "put", "get", "has", "del", "keys", "values", "some",
     "ok", "err", "unwrap-or", "expect", "is-some", "is-none", "is-ok", "is-err", "substr", "split", "trim", "starts-with",
     "ends-with", "replace", "upper", "lower", "join", "parse-i64", "parse-f64", "chars", "byte-at", "repeat", "fmt-float", "from-code", "print",
-    "println", "eprintln", "read-line", "read-file", "write-file", "now-ms", "now-ns", "rand-int", "rand-f64", "args", "fail",
+    "println", "eprintln", "read-line", "read-file", "write-file", "now-ms", "now-ns", "rand-int", "rand-f64", "args", "fail", "json-parse", "json-str", "http-next", "http-respond", "read-all", "lines", "is-digit", "is-alpha", "is-alnum", "is-space", "is-upper", "is-lower", "code-of", "sort-desc",
     "assert",
 ];
 
@@ -379,6 +383,7 @@ impl Checker {
             "Clock" => Ty::Cap(Cap::Clock),
             "Rand" => Ty::Cap(Cap::Rand),
             "Env" => Ty::Cap(Cap::Env),
+            "Net" => Ty::Cap(Cap::Net),
             "Vec" => {
                 if !arity(self, 1, "(Vec T)") {
                     return Ty::Err;
@@ -415,7 +420,7 @@ impl Checker {
                 let mut d = Diag::error("E0103", te.span, &format!("unknown type '{n}'"));
                 let fix = known_alias(n).map(|s| s.to_string()).or_else(|| {
                     let mut names: Vec<&str> =
-                        vec!["I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "F32", "F64", "Bool", "Str", "Unit", "Vec", "Map", "Option", "Result", "Console", "Fs", "Clock", "Rand", "Env"];
+                        vec!["I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "F32", "F64", "Bool", "Str", "Unit", "Vec", "Map", "Option", "Result", "Console", "Fs", "Clock", "Rand", "Env", "Net"];
                     names.extend(self.info.structs.keys().map(|s| s.as_str()));
                     names.extend(self.info.enums.keys().map(|s| s.as_str()));
                     closest(n, names.into_iter())
@@ -494,7 +499,7 @@ impl Checker {
                     self.err(Diag::error(
                         "E0306",
                         p.span,
-                        "main only receives capabilities: Console, Fs, Clock, Rand, Env (use (args env) for command-line arguments)",
+                        "main only receives capabilities: Console, Fs, Clock, Rand, Env, Net (use (args env) for command-line arguments)",
                     ));
                 }
             }
@@ -591,6 +596,9 @@ impl Checker {
         let mut t = Ty::Unit;
         for (i, e) in es.iter().enumerate() {
             let last = i + 1 == es.len();
+            if !last || expected == Some(&Ty::Unit) {
+                self.stmt_ids.insert(e.id);
+            }
             t = self.check(e, if last { expected } else { None });
             if !last && matches!(e.kind, ExprKind::Var(_) | ExprKind::Int(_) | ExprKind::Str(_) | ExprKind::Float(_)) {
                 self.err(Diag::warning("W0001", e.span, "this value is computed and discarded").with_fix_replace(
@@ -611,6 +619,9 @@ impl Checker {
 
     fn check_block_expect(&mut self, es: &[Expr], expected: &Ty, span: Span) -> Ty {
         let t = self.check_block(es, Some(expected));
+        if *expected == Ty::Unit {
+            return Ty::Unit;
+        }
         if !Self::compat(&t, expected) {
             match es.last() {
                 Some(last) if !matches!(last.kind, ExprKind::Let { .. }) => self.mismatch(last, expected, &t),
@@ -690,6 +701,16 @@ impl Checker {
             }
             ExprKind::If(c, t, f) => {
                 self.check_expect(c, &Ty::Bool);
+                let discard = self.stmt_ids.contains(&e.id) || exp == Some(&Ty::Unit);
+                if discard {
+                    self.stmt_ids.insert(t.id);
+                    self.check(t, None);
+                    if let Some(f) = f {
+                        self.stmt_ids.insert(f.id);
+                        self.check(f, None);
+                    }
+                    return Ty::Unit;
+                }
                 match f {
                     Some(f) => {
                         let tt = self.check(t, exp);
@@ -716,7 +737,14 @@ impl Checker {
                     }
                 }
             }
-            ExprKind::Do(es) => self.check_block(es, exp),
+            ExprKind::Do(es) => {
+                if self.stmt_ids.contains(&e.id) || exp == Some(&Ty::Unit) {
+                    self.check_block(es, Some(&Ty::Unit));
+                    Ty::Unit
+                } else {
+                    self.check_block(es, exp)
+                }
+            }
             ExprKind::While(c, body) => {
                 self.check_expect(c, &Ty::Bool);
                 self.loop_depth += 1;
@@ -1251,6 +1279,24 @@ impl Checker {
                 }
             }
         }
+        if let Some(a) = &anchor {
+            if a.is_int() && exp.map_or(true, |t| !t.is_numeric()) && es.iter().any(|e| has_float_lit(e)) {
+                if let Some((i, x)) = es.iter().enumerate().find(|(i, x)| done[*i] && !Self::is_literal(x)) {
+                    let _ = i;
+                    self.err(
+                        Diag::error("E0201", x.span, &format!("this is {a} but it is combined with a float literal"))
+                            .with_expected("F64", a.to_string())
+                            .with_fix_replace(x.span, &format!("(as F64 {})", "\u{0}"), "convert it with (as F64 ...)"),
+                    );
+                    for (j, y) in es.iter().enumerate() {
+                        if !done[j] {
+                            self.check(y, None);
+                        }
+                    }
+                    return Ty::Err;
+                }
+            }
+        }
         let anchor = anchor.unwrap_or_else(|| {
             if es.iter().any(|e| has_float_lit(e)) {
                 Ty::F64
@@ -1325,6 +1371,26 @@ impl Checker {
         }
         if self.info.structs.contains_key(name) {
             d = d.note(format!("to build a struct write (new {name} (field value)...)"));
+        } else if d.fixes.is_empty() && !name.contains('.') {
+            // Probably a helper the program forgot to define: show the signature its call implies.
+            let params: Vec<String> = args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let t = self.ty[a.expr().id as usize].clone();
+                    let t = if t.is_err() { "TYPE".to_string() } else { t.to_string() };
+                    match a {
+                        Arg::Mut(..) => format!("(p{} (mut {t}))", i + 1),
+                        Arg::Val(_) => format!("(p{} {t})", i + 1),
+                    }
+                })
+                .collect();
+            let ret = match exp {
+                Some(t) if !t.is_err() => format!(" (returns {t})"),
+                _ => String::new(),
+            };
+            let params = if params.is_empty() { String::new() } else { format!(" (params {})", params.join(" ")) };
+            d = d.note(format!("if it is a helper you meant to write, define it: (fn {name}{params}{ret} (body ...))"));
         }
         if let Some(ei) = self.info.enums.values().find(|ei| ei.variants.iter().any(|v| v.0 == name)) {
             let en = self.info.enums.iter().find(|(_, v)| std::ptr::eq(*v, ei)).map(|(k, _)| k.clone()).unwrap();
@@ -1613,7 +1679,13 @@ impl Checker {
                     let x = self.arg_val(a);
                     let t = self.check(x, None);
                     if !t.is_displayable() {
-                        self.err(Diag::error("E0213", x.span, &format!("cannot turn {t} into text; only numbers, Bool and Str are displayable")).note("format structs field by field"));
+                        let hint = match &t {
+                            Ty::Opt(_) | Ty::Res(..) => "unwrap it first with (unwrap-or x default) or (match x ...)",
+                            Ty::Vec(_) => "join the elements, e.g. (join strings \", \") after converting them with str",
+                            Ty::User(_) => "format the fields one by one: (str (. p x) \",\" (. p y))",
+                            _ => "convert it to text explicitly",
+                        };
+                        self.err(Diag::error("E0213", x.span, &format!("cannot turn {t} into text; only numbers, Bool and Str are displayable")).note(hint));
                     }
                 }
                 if name == "str" { Ty::Str } else { Ty::Unit }
@@ -1805,11 +1877,11 @@ impl Checker {
                 }
                 if name == "contains" { Ty::Bool } else { Ty::Opt(Box::new(Ty::Int(IntK::I64))) }
             }
-            "sort" | "reverse" => {
+            "sort" | "sort-desc" | "reverse" => {
                 ar!(1, "(sort (mut vec))");
                 let (vt, _) = self.arg_mut(&args[0]);
                 let el = self.vec_elem(&vt, args[0].expr().span, name);
-                if name == "sort" && !self.info.orderable(&el) {
+                if name != "reverse" && !self.info.orderable(&el) {
                     self.err(Diag::error("E0214", args[0].expr().span, &format!("sort cannot order elements of type {el} (maps have no order)")));
                 }
                 Ty::Unit
@@ -2102,6 +2174,72 @@ impl Checker {
                 }
                 Ty::Vec(Box::new(Ty::Str))
             }
+            "read-all" => {
+                if self.need_cap(Cap::Console, args, nspan, span).is_some() && n != 1 {
+                    self.err(Diag::error("E0211", span, "(read-all con) takes only the capability"));
+                }
+                Ty::Str
+            }
+            "lines" => {
+                ar!(1, "(lines text)");
+                let x = self.arg_val(&args[0]);
+                self.check_expect(x, &Ty::Str);
+                Ty::Vec(Box::new(Ty::Str))
+            }
+            "is-digit" | "is-alpha" | "is-alnum" | "is-space" | "is-upper" | "is-lower" => {
+                ar!(1, "(is-digit s)");
+                let x = self.arg_val(&args[0]);
+                self.check_expect(x, &Ty::Str);
+                Ty::Bool
+            }
+            "code-of" => {
+                ar!(1, "(code-of s)");
+                let x = self.arg_val(&args[0]);
+                self.check_expect(x, &Ty::Str);
+                Ty::Int(IntK::I64)
+            }
+            "json-parse" => {
+                ar!(1, "(json-parse text)");
+                let x = self.arg_val(&args[0]);
+                self.check_expect(x, &Ty::Str);
+                Ty::Res(Box::new(Ty::User("Json".into())), Box::new(Ty::Str))
+            }
+            "json-str" => {
+                ar!(1, "(json-str json)");
+                let x = self.arg_val(&args[0]);
+                self.check_expect(x, &Ty::User("Json".into()));
+                Ty::Str
+            }
+            "http-next" => {
+                if let Some(rest) = self.need_cap(Cap::Net, args, nspan, span) {
+                    if rest.len() != 2 {
+                        self.err(Diag::error("E0211", span, "(http-next net port max-body-bytes): waits for the next request; the body limit is mandatory"));
+                    } else {
+                        for a in rest {
+                            let x = self.arg_val(a);
+                            self.check_expect(x, &Ty::Int(IntK::I64));
+                        }
+                    }
+                }
+                Ty::Res(Box::new(Ty::User("Request".into())), Box::new(Ty::Str))
+            }
+            "http-respond" => {
+                if let Some(rest) = self.need_cap(Cap::Net, args, nspan, span) {
+                    if rest.len() != 4 {
+                        self.err(Diag::error("E0211", span, "(http-respond net request status content-type body)"));
+                    } else {
+                        let r = self.arg_val(&rest[0]);
+                        self.check_expect(r, &Ty::User("Request".into()));
+                        let st = self.arg_val(&rest[1]);
+                        self.check_expect(st, &Ty::Int(IntK::I64));
+                        for a in &rest[2..] {
+                            let x = self.arg_val(a);
+                            self.check_expect(x, &Ty::Str);
+                        }
+                    }
+                }
+                Ty::Res(Box::new(Ty::Unit), Box::new(Ty::Str))
+            }
             "fail" => {
                 ar!(1, "(fail \"message\")");
                 let x = self.arg_val(&args[0]);
@@ -2151,6 +2289,8 @@ impl Checker {
 
     fn check_match(&mut self, e: &Expr, scrut: &Expr, arms: &[Arm], exp: Option<&Ty>) -> Ty {
         let st = self.check(scrut, None);
+        let discard = self.stmt_ids.contains(&e.id) || exp == Some(&Ty::Unit);
+        let exp = if discard { Some(&Ty::Unit) } else { exp };
         let mut result: Option<Ty> = exp.cloned();
         let mut covered: Vec<String> = Vec::new();
         let mut total = false;
@@ -2169,8 +2309,8 @@ impl Checker {
             let t = match &result {
                 Some(r) => {
                     let r = r.clone();
-                    let t = self.check_block(&arm.body, Some(&r));
-                    if !Self::compat(&t, &r) && !(r == Ty::Unit && exp.is_none()) {
+                    let t = if discard { self.check_block(&arm.body, None) } else { self.check_block(&arm.body, Some(&r)) };
+                    if !discard && !Self::compat(&t, &r) && !(r == Ty::Unit && exp.is_none()) {
                         match arm.body.last() {
                             Some(l) => self.mismatch(l, &r, &t),
                             None => {}
@@ -2225,6 +2365,9 @@ impl Checker {
         }
         if arms.is_empty() {
             return Ty::Never;
+        }
+        if discard {
+            return Ty::Unit;
         }
         result.unwrap_or(first_ty.unwrap_or(Ty::Unit))
     }

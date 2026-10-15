@@ -1,0 +1,52 @@
+(fn count-alive (params (g (Vec (Vec Bool)))) (returns I64)
+  (body
+    (var n 0)
+    (for row g (for c row (if c (set n (+ n 1)))))
+    n))
+
+(fn neighbors (params (g (Vec (Vec Bool))) (r I64) (c I64)) (returns I64)
+  (body
+    (let h (len g))
+    (let w (len (at g 0)))
+    (var n 0)
+    (for dr (range -1 2)
+      (for dc (range -1 2)
+        (if (or (!= dr 0) (!= dc 0))
+          (do
+            (let rr (+ r dr))
+            (let cc (+ c dc))
+            (if (and (>= rr 0) (< rr h) (>= cc 0) (< cc w))
+              (if (at (at g rr) cc) (set n (+ n 1))))))))
+    n))
+
+(fn step (params (g (Vec (Vec Bool)))) (returns (Vec (Vec Bool)))
+  (body
+    (var out (Vec (Vec Bool)) (vec))
+    (for r (range 0 (len g))
+      (var row (Vec Bool) (vec))
+      (for c (range 0 (len (at g 0)))
+        (let n (neighbors g r c))
+        (push (mut row) (if (at (at g r) c) (or (== n 2) (== n 3)) (== n 3))))
+      (push (mut out) row))
+    out))
+
+(fn main (params (con Console))
+  (body
+    (let gens (unwrap-or (parse-i64 (unwrap-or (read-line con) "0")) 0))
+    (var g (Vec (Vec Bool)) (vec))
+    (var line (read-line con))
+    (while (is-some line)
+      (let s (trim (unwrap-or line "")))
+      (if (!= s "")
+        (do
+          (var row (Vec Bool) (vec))
+          (for ch (chars s) (push (mut row) (== ch "#")))
+          (push (mut g) row)))
+      (set line (read-line con)))
+    (for i (range 0 gens)
+      (set g (step g)))
+    (for row g
+      (var s "")
+      (for c row (set s (str s (if c "#" "."))))
+      (println con s))
+    (println con "alive " (count-alive g))))

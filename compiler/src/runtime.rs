@@ -92,6 +92,7 @@ mod ail_rt {
     #[derive(Clone, Copy)] pub struct Clock;
     #[derive(Clone, Copy)] pub struct Rand;
     #[derive(Clone, Copy)] pub struct Env;
+    #[derive(Clone, Copy)] pub struct Net;
 
     // Fast non-cryptographic hasher (word-at-a-time multiply-rotate).
     #[derive(Default, Clone, Copy)]
@@ -263,6 +264,20 @@ mod ail_rt {
         match s.as_bytes().get(i) { Some(b) => *b as i64, None => panic!("byte index {i} out of bounds for string of {} bytes", s.len()) }
     }
 
+    pub fn read_all() -> String {
+        flush();
+        let mut s = String::new();
+        let _ = std::io::stdin().read_to_string(&mut s);
+        s
+    }
+    pub fn lines(s: &String) -> Vec<String> {
+        s.lines().map(|l| l.trim_end_matches('\r').to_string()).collect()
+    }
+    pub fn all_chars(s: &String, f: fn(char) -> bool) -> bool { !s.is_empty() && s.chars().all(f) }
+    #[track_caller]
+    pub fn code_of(s: &String) -> i64 {
+        match s.chars().next() { Some(c) => c as i64, None => panic!("code-of on an empty string") }
+    }
     pub fn read_line() -> Option<String> {
         flush();
         let mut s = String::new();
