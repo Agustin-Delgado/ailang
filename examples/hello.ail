@@ -1,0 +1,57 @@
+; Shapes, enums, structs, match, loops, maps.
+(struct Point (x F64) (y F64))
+(enum Shape
+  (Circle Point F64)
+  (Rect Point Point)
+  (Empty))
+
+(fn area (params (s Shape)) (returns F64)
+  (body
+    (match s
+      (case (Shape.Circle _ r) (* 3.14159 r r))
+      (case (Shape.Rect a b) (abs (* (- (. b x) (. a x)) (- (. b y) (. a y)))))
+      (case Shape.Empty 0.0))))
+
+(fn total-area (params (shapes (Vec Shape))) (returns F64)
+  (body
+    (var sum 0.0)
+    (for s shapes (set sum (+ sum (area s))))
+    sum))
+
+(fn word-counts (params (text Str)) (returns (Map Str I64))
+  (body
+    (var counts (Map Str I64) (map))
+    (for w (split text " ")
+      (if (not (is-empty w))
+        (put (mut counts) w (+ 1 (unwrap-or (get counts w) 0)))))
+    counts))
+
+(fn safe-div (params (a I64) (b I64)) (returns (Result I64 Str))
+  (body
+    (if (== b 0) (err "division by zero") (ok (/ a b)))))
+
+(fn compute (params (a I64) (b I64)) (returns (Result I64 Str))
+  (body
+    (let q (try (safe-div a b)))
+    (ok (* q 2))))
+
+(fn main (params (con Console))
+  (body
+    (let shapes (vec (Shape.Circle (new Point (x 0.0) (y 0.0)) 1.0)
+                     (Shape.Rect (new Point (x 0.0) (y 0.0)) (new Point (x 2.0) (y 3.0)))
+                     Shape.Empty))
+    (println con "total area: " (total-area shapes))
+    (let counts (word-counts "the cat and the dog and the bird"))
+    (for k (keys counts) (println con k " = " (unwrap-or (get counts k) 0)))
+    (match (compute 10 2)
+      (case (ok v) (println con "ok " v))
+      (case (err e) (println con "error " e)))
+    (match (compute 1 0)
+      (case (ok v) (println con "ok " v))
+      (case (err e) (println con "error " e)))))
+
+(test "area of rect"
+  (assert (== (area (Shape.Rect (new Point (x 0.0) (y 0.0)) (new Point (x 2.0) (y 2.0)))) 4.0)))
+(test "safe-div"
+  (assert (is-err (safe-div 1 0)))
+  (assert (== (unwrap-or (safe-div 9 3) 0) 3)))

@@ -1,0 +1,23 @@
+(struct Account (owner Str) (balance I64))
+
+(fn deposit (params (a (mut Account)) (amount I64))
+  (requires (> amount 0))
+  (body (set (. a balance) (+ (. a balance) amount))))
+
+(fn parse-amounts (params (line Str)) (returns (Result (Vec I64) Str))
+  (body
+    (var out (Vec I64) (vec))
+    (for part (split line ",")
+      (match (parse-i64 part)
+        (case (some n) (push (mut out) n))
+        (case none (return (err (str "not a number: " part))))))
+    (ok out)))
+
+(fn main (params (con Console)) (returns (Result Unit Str))
+  (body
+    (var acc (new Account (owner "ana") (balance 0)))
+    (for n (try (parse-amounts "10,20,30")) (deposit (mut acc) n))
+    (println con (. acc owner) " has " (. acc balance))
+    (ok unit)))
+
+(test "parse" (assert (is-err (parse-amounts "1,x"))))

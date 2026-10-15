@@ -1,0 +1,23 @@
+(fn count-primes (params (n I64)) (returns I64)
+  (body
+    (var is-p (fill (+ n 1) true))
+    (set (at is-p 0) false)
+    (set (at is-p 1) false)
+    (var i 2)
+    (while (<= (* i i) n)
+      (if (at is-p i)
+        (do
+          (var j (* i i))
+          (while (<= j n)
+            (set (at is-p j) false)
+            (set j (+ j i)))))
+      (set i (+ i 1)))
+    (var count 0)
+    (for p is-p (if p (set count (+ count 1))))
+    count))
+
+(fn main (params (con Console))
+  (body
+    (var total 0)
+    (for _r (range 0 10) (set total (+ total (count-primes 50000000))))
+    (println con total)))

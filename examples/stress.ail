@@ -1,0 +1,110 @@
+; Exercises the tricky paths of the backend: moves, borrows, mut fields, boxes, contracts.
+(struct Item (name Str) (tags (Vec Str)) (qty I64))
+(struct Store (items (Vec Item)) (index (Map Str I64)) (log (Vec Str)))
+(enum Expr (Num I64) (Add Expr Expr) (Mul Expr Expr) (Neg Expr) (Var Str))
+(struct Rank (score I64) (name Str))
+
+(fn new-store (returns Store)
+  (body (new Store (items (vec)) (index (map)) (log (vec)))))
+
+(fn add-item (params (s (mut Store)) (name Str) (qty I64))
+  (requires (>= qty 0))
+  (body
+    (let id (len (. s items)))
+    (push (mut (. s items)) (new Item (name name) (tags (vec "new")) (qty qty)))
+    (put (mut (. s index)) name id)
+    (push (mut (. s log)) (str "added " name))))
+
+(fn find (params (s Store) (name Str)) (returns (Option Item))
+  (body
+    (match (get (. s index) name)
+      (case (some i) (some (at (. s items) i)))
+      (case none none))))
+
+(fn restock (params (it (mut Item)) (n I64))
+  (body
+    (set (. it qty) (+ (. it qty) n))
+    (push (mut (. it tags)) "restocked")))
+
+(fn eval (params (e Expr) (env (Map Str I64))) (returns (Result I64 Str))
+  (body
+    (match e
+      (case (Expr.Num n) (ok n))
+      (case (Expr.Add a b) (ok (+ (try (eval a env)) (try (eval b env)))))
+      (case (Expr.Mul a b) (ok (* (try (eval a env)) (try (eval b env)))))
+      (case (Expr.Neg a) (ok (- (try (eval a env)))))
+      (case (Expr.Var name)
+        (match (get env name)
+          (case (some v) (ok v))
+          (case none (err (str "unbound " name))))))))
+
+(fn classify (params (word Str)) (returns Str)
+  (body
+    (match word
+      (case "hello" "greeting")
+      (case "bye" "farewell")
+      (case _ (if (starts-with word "x") "x-word" "other")))))
+
+(fn clamp-sum (params (xs (Vec I64)) (limit I64)) (returns I64)
+  (ensures (<= result limit))
+  (body
+    (var total 0)
+    (for x xs
+      (if (> (+ total x) limit) (return limit))
+      (set total (+ total x)))
+    total))
+
+(fn grid (params (w I64) (h I64)) (returns (Vec (Vec I64)))
+  (body
+    (var g (Vec (Vec I64)) (vec))
+    (for y (range 0 h)
+      (var row (Vec I64) (vec))
+      (for x (range 0 w) (push (mut row) (* x y)))
+      (push (mut g) row))
+    g))
+
+(fn take-name (params (it Item)) (returns Str)
+  (body (. it name)))
+
+(fn main (params (con Console))
+  (body
+    (var s (new-store))
+    (add-item (mut s) "apple" 3)
+    (add-item (mut s) "pear" 0)
+    (restock (mut (at (. s items) 1)) 7)
+    (match (find s "pear")
+      (case (some it) (println con (. it name) " " (. it qty) " " (join (. it tags) ",")))
+      (case none (println con "missing")))
+    (println con (len (. s log)) " log entries, first: " (at (. s log) 0))
+    (var env (Map Str I64) (map))
+    (put (mut env) "x" 5)
+    (let e (Expr.Add (Expr.Num 2) (Expr.Mul (Expr.Var "x") (Expr.Neg (Expr.Num 3)))))
+    (match (eval e env)
+      (case (ok v) (println con "eval = " v))
+      (case (err m) (println con "error: " m)))
+    (match (eval (Expr.Var "y") env)
+      (case (ok v) (println con "eval = " v))
+      (case (err m) (println con "error: " m)))
+    (println con (classify "hello") " " (classify "xyz") " " (classify "q"))
+    (println con (clamp-sum (vec 1 2 3) 100) " " (clamp-sum (vec 50 60 70) 100))
+    (let g (grid 4 3))
+    (println con (at (at g 2) 3) " rows=" (len g))
+    (var ranks (vec (new Rank (score 3) (name "c")) (new Rank (score 1) (name "z")) (new Rank (score 3) (name "a"))))
+    (sort (mut ranks))
+    (for r ranks (print con (. r name) (. r score) " "))
+    (println con "")
+    (let first (at (. s items) 0))
+    (let moved (take-name first))
+    (println con moved " " (. first name))
+    (let w (with first (qty 99)))
+    (println con (. w qty) " " (. first qty))
+    (println con (fmt-float 3.14159 2) " " (from-code 65) " " (str 1.0) " " (str 0.1))
+    (var copy-src (vec 1 2 3))
+    (var dst (copy copy-src))
+    (push (mut dst) 4)
+    (println con (len copy-src) " " (len dst))))
+
+(test "eval nested"
+  (var env (Map Str I64) (map))
+  (assert (== (unwrap-or (eval (Expr.Neg (Expr.Num 4)) env) 0) -4)))
+(test "contract holds" (assert (== (clamp-sum (vec 5 5) 7) 7)))
