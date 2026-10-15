@@ -12,7 +12,7 @@ import prompts
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LANGS = ["ail", "rust", "ts"]
-TASKS = sorted(os.listdir(os.path.join(HERE, "tasks")))
+TASKS = sorted(os.listdir(os.path.join(HERE, os.environ.get("EXP_TASKS", "tasks"))))
 
 def pair_dir(run, lang, task):
     return os.path.join(HERE, "runs", run, lang, task)

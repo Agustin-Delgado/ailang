@@ -18,7 +18,7 @@ LANG_NOTES = {
 EXT = {"ail": "ail", "rust": "rs", "ts": "ts"}
 
 def first_attempt_prompt(lang, task, out_path):
-    statement = open(os.path.join(HERE, "tasks", task, "task.md"), encoding="utf8").read()
+    statement = open(os.path.join(HERE, os.environ.get("EXP_TASKS", "tasks"), task, "task.md"), encoding="utf8").read()
     return f"""You are taking part in a programming-language experiment. Solve the task below in the
 requested language and write the complete program to this exact file path:
 

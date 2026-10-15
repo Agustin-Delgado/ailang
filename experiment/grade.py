@@ -40,7 +40,7 @@ def compile_solution(lang, src, work):
 
 def main():
     lang, task, src = sys.argv[1], sys.argv[2], os.path.abspath(sys.argv[3])
-    tdir = os.path.join(HERE, "tasks", task, "tests")
+    tdir = os.path.join(HERE, os.environ.get("EXP_TASKS", "tasks"), task, "tests")
     work = tempfile.mkdtemp(prefix="grade_")
     res = {"lang": lang, "task": task, "compiled": False, "compile_output": "", "passed": 0, "total": 0, "failures": []}
     exe, out = compile_solution(lang, src, work)

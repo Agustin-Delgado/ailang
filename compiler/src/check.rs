@@ -1336,7 +1336,7 @@ impl Checker {
             ExprKind::While(c, body) => {
                 self.check_expect(c, &Ty::Bool);
                 self.loop_depth += 1;
-                self.check_block(body, None);
+                self.check_block(body, Some(&Ty::Unit));
                 self.loop_depth -= 1;
                 Ty::Unit
             }
@@ -1411,7 +1411,7 @@ impl Checker {
                 if let Some(r) = root {
                     self.iter_roots.push(r);
                 }
-                self.check_block(body, None);
+                self.check_block(body, Some(&Ty::Unit));
                 if pushed {
                     self.iter_roots.pop();
                 }
@@ -2981,7 +2981,7 @@ impl Checker {
         let bt = if r.is_err() {
             self.check_block(body, None)
         } else if *r == Ty::Unit {
-            self.check_block(body, None);
+            self.check_block(body, Some(&Ty::Unit));
             Ty::Unit
         } else {
             self.check_block_expect(body, r, e.span)
