@@ -9,15 +9,19 @@ Toolchain: `ail check f.ail --json` (instant, JSON diagnostics with fixes), `ail
 
 ## Syntax
 
+- Indent nested forms. If the closing parens do not compile but the indentation implies a valid
+  program, the compiler uses the indentation (warning W0004) and `ail fix` rewrites the parens.
 - Comments start with `;`. Names: letters, digits, `-`, `_`, `?` (e.g. `max-depth`, `empty?`).
 - Literals: `42`, `-7`, `1_000`, `0xff`, `3.14`, `1e-9`, `"text\n"`, `true`, `false`, `unit`, `none`.
 - Integer literals adapt to the expected type (`I32`, `U8`, `F64`...); otherwise they are `I64`.
-  Float literals are `F64`.
+  Float literals are `F64`. A literal also adapts to the other operand: `(* 2 x)` works for any numeric
+  `x`, but a float literal never converts an integer *variable*: `(+ n 2.0)` with `n : I64` is an error,
+  write `(+ (as F64 n) 2.0)`.
 
 ## Types
 
 `I8 I16 I32 I64 U8 U16 U32 U64 F32 F64 Bool Str Unit`, `(Vec T)`, `(Map K V)` (K: integer, Str, Bool),
-`(Option T)`, `(Result T E)`, user structs and enums, and capabilities `Console Fs Clock Rand Env`.
+`(Option T)`, `(Result T E)`, user structs and enums, and capabilities `Console Fs Clock Rand Env Net`.
 Indexes and lengths are always `I64`.
 
 ## Top-level items
@@ -34,7 +38,9 @@ Indexes and lengths are always `I64`.
 (test "name" expr...)                                         ; run with `ail test`
 ```
 
-Type and variant names start with an uppercase letter. Enum variants are always qualified:
+Functions may call each other in any order (mutual recursion needs no declarations).
+A `let`/`var` may shadow an earlier binding of the same name. Defining a function with the name of a
+builtin replaces the builtin for that program. Type and variant names start with an uppercase letter. Enum variants are always qualified:
 `Shape.Circle`. Recursive types are allowed (`(enum Tree (Leaf) (Node Tree Tree))`).
 
 ## Expressions
@@ -43,13 +49,13 @@ Type and variant names start with an uppercase letter. Enum variants are always 
 (let x 5)  (let x I32 5)            ; immutable binding (optional type)
 (var n 0)  (var xs (Vec I64) (vec)) ; mutable binding
 (set n (+ n 1))                     ; assign to a var, a field (. p x), or an element (at v i)
-(set (. p x) 1.0)  (set (at v 0) 9)
+(set (. p x) 1.0)  (set (at v 0) 9)  (set (at (at grid y) x) 1)  ; places nest
 (if cond then else)                 ; (if cond then) when then is Unit
 (do e1 e2 ... en)                   ; sequence, value of en
 (while cond body...)
 (for i (range 0 n) body...)         ; 0..n-1, n exclusive
 (for x xs body...)                  ; elements of a Vec (read-only)
-break  continue  (return v)  (return)
+break  continue  (return v)  (return)   ; these have type Never: they fit anywhere
 (match v (case pattern body...) ...) ; must be exhaustive
 (new Point (x 1.0) (y 2.0))         ; all fields required
 (with p (x 5.0))                    ; copy of p with fields replaced
@@ -79,11 +85,17 @@ A function without capability parameters is pure: no I/O, no clock, no randomnes
 `main` receives the capabilities the program needs and passes them down explicitly:
 
 ```
-(fn main (params (con Console) (fs Fs) (clock Clock) (rng Rand) (env Env)) ...)  ; any subset
+(fn main (params (con Console) (fs Fs) (clock Clock) (rng Rand) (env Env) (net Net)) ...)  ; any subset
 ```
 
 `main` returns `Unit` or `(Result Unit Str)` (an `err` prints the message and exits 1).
 Capabilities cannot be stored in structs, returned, or used in contracts. Tests get none.
+
+## Discarded values
+
+A value computed in statement position is discarded, so the branches of an `if`/`match` used as a
+statement may have different types, and a function returning Unit may end with any expression
+(e.g. `(if found (del (mut m) k) (put (mut m) k 1))`).
 
 ## Errors
 
@@ -104,13 +116,19 @@ Text: `(str a b ...)` concatenates numbers, Bool and Str into a Str. `(len s)` (
 `(split s sep)` -> `(Vec Str)` `(join xs sep)` `(trim s)` `(upper s)` `(lower s)` `(starts-with s p)`
 `(ends-with s p)` `(contains s part)` `(index-of s part)` -> `(Option I64)` `(replace s from to)`
 `(chars s)` -> `(Vec Str)` `(byte-at s i)` -> `I64` `(from-code n)` -> Str of one code point `(repeat s n)`
-`(parse-i64 s)` `(parse-f64 s)` -> Option (surrounding whitespace ignored) `(fmt-float x decimals)` -> Str (`(fmt-float 2.5 2)` is `"2.50"`).
+`(parse-i64 s)` `(parse-f64 s)` -> Option (surrounding whitespace and a leading `+`/`-` accepted) `(fmt-float x decimals)` -> Str (`(fmt-float 2.5 2)` is `"2.50"`;
+rounds to nearest, ties to even on the exact binary value, so use integer cents for money).
+Characters: `(is-digit s)` `(is-alpha s)` `(is-alnum s)` `(is-space s)` `(is-upper s)` `(is-lower s)`
+(true when s is non-empty and every character qualifies) `(code-of s)` -> code point of the first character.
+`(lines text)` -> `(Vec Str)` splits on `
+` (a trailing newline does not add an empty line; `
+` is removed).
 Floats print in full precision with `str`/`println` (`2.5`, `0.1`, `1.0`).
 
 Vec: `(vec a b ...)` `(fill n x)` `(len v)` `(is-empty v)` `(at v i)` `(push (mut v) x)` `(pop (mut v))` -> Option
 `(last v)` -> Option `(insert-at (mut v) i x)` `(remove-at (mut v) i)` -> T `(swap (mut v) i j)` `(clear (mut v))`
 `(extend (mut v) other)` `(slice v start end)` `(concat a b)` `(contains v x)` `(index-of v x)` -> Option
-`(sort (mut v))` ascending `(reverse (mut v))` `(sum v)`.
+`(sort (mut v))` ascending `(sort-desc (mut v))` descending `(reverse (mut v))` `(sum v)`.
 
 Ordering: numbers, Str (bytewise), Bool, and Vec/Option/structs/enums built from them compare with
 `< <= > >= min max` and `sort`. Structs compare field by field in declaration order and enums by variant
@@ -123,9 +141,30 @@ Option/Result: `(some x)` `none` `(ok x)` `(err e)` `(unwrap-or o default)` `(ex
 `(is-some o)` `(is-none o)` `(is-ok r)` `(is-err r)`.
 
 Effects (first argument is the capability):
-`(print con a b ...)` `(println con a b ...)` `(eprintln con ...)` `(read-line con)` -> `(Option Str)`
+`(print con a b ...)` `(println con a b ...)` `(eprintln con ...)` `(read-line con)` -> `(Option Str)` (none at end of input)
+`(read-all con)` -> Str (all of stdin; the usual way to read input: `(for line (lines (read-all con)) ...)`)
 `(read-file fs path max-bytes)` -> `(Result Str Str)` `(write-file fs path text)` -> `(Result Unit Str)`
 `(now-ms clock)` `(now-ns clock)` `(rand-int rng low high)` (high exclusive) `(rand-f64 rng)` `(args env)` -> `(Vec Str)`.
+`(http-next net port max-body-bytes)` -> `(Result Request Str)` waits for the next HTTP request (larger bodies
+are rejected with 400 automatically). `(http-respond net req status content-type body)` -> `(Result Unit Str)`.
+
+## Prelude types (always available)
+
+```
+(enum Json (Null) (Bool Bool) (Num F64) (Str Str) (Arr (Vec Json)) (Obj (Map Str Json)))
+(struct Request (id I64) (method Str) (path Str) (query (Map Str Str)) (headers (Map Str Str)) (body Str))
+```
+
+`(json-parse text)` -> `(Result Json Str)`, `(json-str j)` -> Str (compact, object keys sorted).
+Request `path` and `query` are URL-decoded; header names are lowercase. A server is a loop:
+
+```
+(while true
+  (let req (try (http-next net 8080 65536)))
+  (match (str (. req method) " " (. req path))
+    (case "GET /health" (try (http-respond net req 200 "text/plain" "ok")))
+    (case _ (try (http-respond net req 404 "text/plain" "not found")))))
+```
 
 Other: `(fail "msg")` stops the program (type Never, fits anywhere). `(assert cond)` `(assert cond "msg")`.
 

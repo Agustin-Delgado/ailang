@@ -61,6 +61,7 @@ pub enum Cap {
     Clock,
     Rand,
     Env,
+    Net,
 }
 
 impl Cap {
@@ -71,6 +72,7 @@ impl Cap {
             Cap::Clock => "Clock",
             Cap::Rand => "Rand",
             Cap::Env => "Env",
+            Cap::Net => "Net",
         }
     }
     pub fn default_param(self) -> &'static str {
@@ -80,10 +82,11 @@ impl Cap {
             Cap::Clock => "clock",
             Cap::Rand => "rng",
             Cap::Env => "env",
+            Cap::Net => "net",
         }
     }
-    pub fn all() -> [Cap; 5] {
-        [Cap::Console, Cap::Fs, Cap::Clock, Cap::Rand, Cap::Env]
+    pub fn all() -> [Cap; 6] {
+        [Cap::Console, Cap::Fs, Cap::Clock, Cap::Rand, Cap::Env, Cap::Net]
     }
 }
 

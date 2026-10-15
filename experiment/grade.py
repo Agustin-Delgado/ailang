@@ -28,7 +28,7 @@ def compile_solution(lang, src, work):
     if lang == "ts":
         tsc = os.path.join(NODE_BIN, "tsc.cmd" if os.name == "nt" else "tsc")
         shutil.copy(src, os.path.join(work, "main.ts"))
-        p = subprocess.run([tsc, "--strict", "--target", "es2022", "--module", "commonjs", "--types", "node",
+        p = subprocess.run([tsc, "--strict", "--target", "es2022", "--lib", "es2022", "--module", "commonjs", "--types", "node",
                             "--typeRoots", os.path.join(HERE, "node_modules", "@types"), "--skipLibCheck",
                             "--outDir", os.path.join(work, "out"), os.path.join(work, "main.ts")],
                            capture_output=True, text=True, shell=False)

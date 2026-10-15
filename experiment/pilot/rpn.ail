@@ -1,0 +1,33 @@
+(fn eval-line (params (s Str)) (returns (Result I64 Str))
+  (body
+    (var st (Vec I64) (vec))
+    (for tok (split s " ")
+      (if (!= tok "")
+        (if (or (== tok "+") (== tok "-") (== tok "*") (== tok "/"))
+          (do
+            (if (< (len st) 2) (return (err "error: stack underflow")))
+            (let b (expect (pop (mut st)) "b"))
+            (let a (expect (pop (mut st)) "a"))
+            (if (== tok "+") (push (mut st) (+ a b))
+              (if (== tok "-") (push (mut st) (- a b))
+                (if (== tok "*") (push (mut st) (* a b))
+                  (do
+                    (if (== b 0) (return (err "error: division by zero")))
+                    (push (mut st) (/ a b)))))))
+          (match (parse-i64 tok)
+            (case (some n) (push (mut st) n))
+            (case none (return (err (str "error: bad token " tok))))))))
+    (if (== (len st) 1)
+      (ok (at st 0))
+      (if (is-empty st) (err "") (err "error: leftover values")))))
+
+(fn main (params (con Console))
+  (body
+    (var line (read-line con))
+    (while (is-some line)
+      (let s (trim (unwrap-or line "")))
+      (if (!= s "")
+        (match (eval-line s)
+          (case (ok v) (println con v))
+          (case (err m) (println con m))))
+      (set line (read-line con)))))

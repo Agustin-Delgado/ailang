@@ -1,0 +1,81 @@
+; A JSON REST API for a todo list. Run: ail run todo_api.ail, then
+;   curl -X POST localhost:8080/todos -d '{"title":"buy milk"}'
+;   curl localhost:8080/todos?limit=10
+(struct Todo (id I64) (title Str) (done Bool))
+(struct Store (todos (Vec Todo)) (next-id I64))
+
+(const MAX-BODY I64 65536)
+(const MAX-PAGE I64 100)
+
+(fn todo-json (params (t Todo)) (returns Json)
+  (body
+    (var m (Map Str Json) (map))
+    (put (mut m) "id" (Json.Num (as F64 (. t id))))
+    (put (mut m) "title" (Json.Str (. t title)))
+    (put (mut m) "done" (Json.Bool (. t done)))
+    (Json.Obj m)))
+
+(fn page-size (params (req Request)) (returns I64)
+  (body
+    (match (get (. req query) "limit")
+      (case (some s) (min MAX-PAGE (max 1 (unwrap-or (parse-i64 s) 20))))
+      (case none 20))))
+
+(fn list-todos (params (s Store) (limit I64)) (returns Str)
+  (body
+    (var items (Vec Json) (vec))
+    (for t (. s todos)
+      (if (< (len items) limit) (push (mut items) (todo-json t))))
+    (json-str (Json.Arr items))))
+
+(fn create-todo (params (s (mut Store)) (body Str)) (returns (Result Todo Str))
+  (body
+    (let parsed (try (json-parse body)))
+    (let title
+      (match parsed
+        (case (Json.Obj m)
+          (match (get m "title")
+            (case (some (Json.Str t)) t)
+            (case _ (return (err "field 'title' must be a string")))))
+        (case _ (return (err "body must be a JSON object")))))
+    (if (is-empty (trim title)) (return (err "title cannot be empty")))
+    (let t (new Todo (id (. s next-id)) (title title) (done false)))
+    (set (. s next-id) (+ (. s next-id) 1))
+    (push (mut (. s todos)) t)
+    (ok t)))
+
+(fn error-json (params (msg Str)) (returns Str)
+  (body
+    (var m (Map Str Json) (map))
+    (put (mut m) "error" (Json.Str msg))
+    (json-str (Json.Obj m))))
+
+(fn handle (params (net Net) (s (mut Store)) (req Request)) (returns (Result Unit Str))
+  (body
+    (let route (str (. req method) " " (. req path)))
+    (match route
+      (case "GET /todos"
+        (http-respond net req 200 "application/json" (list-todos s (page-size req))))
+      (case "POST /todos"
+        (match (create-todo (mut s) (. req body))
+          (case (ok t) (http-respond net req 201 "application/json" (json-str (todo-json t))))
+          (case (err e) (http-respond net req 400 "application/json" (error-json e)))))
+      (case _ (http-respond net req 404 "application/json" (error-json (str "no route " route)))))))
+
+(fn main (params (con Console) (net Net)) (returns (Result Unit Str))
+  (body
+    (var store (new Store (todos (vec)) (next-id 1)))
+    (println con "listening on :8080")
+    (while true
+      (let req (try (http-next net 8080 MAX-BODY)))
+      (match (handle net (mut store) req)
+        (case (ok _) unit)
+        (case (err e) (eprintln con "error: " e))))
+    (ok unit)))
+
+(test "create and list"
+  (var s (new Store (todos (vec)) (next-id 1)))
+  (assert (is-ok (create-todo (mut s) "{\"title\":\"a\"}")))
+  (assert (is-err (create-todo (mut s) "{\"title\":3}")))
+  (assert (is-err (create-todo (mut s) "nope")))
+  (assert (== (list-todos s 10) "[{\"done\":false,\"id\":1,\"title\":\"a\"}]")))

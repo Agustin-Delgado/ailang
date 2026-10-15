@@ -48,7 +48,7 @@ pub enum Mode {
 pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> String {
     let mut em = Emitter { ck, src, moves: HashSet::new(), tmp: 0, fn_name: String::new() };
     let mut out = String::new();
-    out.push_str("#![allow(warnings)]\n#![allow(clippy::all)]\n");
+    out.push_str("#![allow(warnings)]\n#![allow(unconditional_panic, arithmetic_overflow)]\n");
     for it in &prog.items {
         match it {
             Item::Struct(s) => em.emit_struct(s, &mut out),
@@ -93,7 +93,7 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
                 if let Item::Test(t) = it {
                     em.moves = compute_moves(&t.body, ck);
                     em.fn_name = format!("test \"{}\"", t.name);
-                    let body = em.block(&t.body);
+                    let body = em.block_as(&t.body, true);
                     writeln!(out, "fn t_{i}() {{\n    let _: () = {body};\n}}").unwrap();
                     names.push((i, t.name.clone()));
                 }
@@ -110,6 +110,7 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
     writeln!(fin, "static AIL_FILE: &str = {:?};", file).unwrap();
     writeln!(fin, "static AIL_LINES: [(u32, u32, u32); {}] = [{}];", table.len(), table.iter().map(|(a, b, c)| format!("({a},{b},{c})")).collect::<Vec<_>>().join(",")).unwrap();
     fin.push_str(crate::runtime::RUNTIME);
+    fin.push_str(crate::runtime_net::RUNTIME_NET);
     fin
 }
 
@@ -345,7 +346,7 @@ impl<'a> Emitter<'a> {
             let c = self.val(r);
             writeln!(out, "    {}if !({c}) {{ ail_rt::contract(\"requires\", {:?}, {:?}); }}", self.mark(r), f.name, self.src_of(r)).unwrap();
         }
-        let body = self.block(&f.body);
+        let body = self.block_as(&f.body, sig.ret == Ty::Unit);
         if f.ensures.is_empty() {
             writeln!(out, "    let __r: {ret} = {body};\n    __r\n}}").unwrap();
         } else {
@@ -444,6 +445,11 @@ impl<'a> Emitter<'a> {
     }
 
     pub fn block(&mut self, es: &[Expr]) -> String {
+        self.block_as(es, false)
+    }
+
+    /// A block; when `unit` is set, a non-Unit final value is discarded so the block is `()`.
+    pub fn block_as(&mut self, es: &[Expr], unit: bool) -> String {
         let mut o = String::from("{\n");
         for (i, e) in es.iter().enumerate() {
             let last = i + 1 == es.len();
@@ -463,7 +469,10 @@ impl<'a> Emitter<'a> {
                 }
                 _ => {
                     let code = self.rvalue_or_place(e);
-                    if last {
+                    let discard = unit && !matches!(self.ty(e), Ty::Unit | Ty::Never);
+                    if last && discard {
+                        writeln!(o, "{m}let _ = {code};\n()").unwrap();
+                    } else if last {
                         writeln!(o, "{m}{code}").unwrap();
                     } else {
                         writeln!(o, "{m}{code};").unwrap();
@@ -521,16 +530,17 @@ impl<'a> Emitter<'a> {
             }
             ExprKind::If(c, th, el) => {
                 let c = self.val(c);
-                let tb = self.block(std::slice::from_ref(th));
+                let unit = t == Ty::Unit;
+                let tb = self.block_as(std::slice::from_ref(th), unit);
                 match el {
                     Some(el) => {
-                        let eb = self.block(std::slice::from_ref(el));
+                        let eb = self.block_as(std::slice::from_ref(el), unit);
                         format!("if {c} {tb} else {eb}")
                     }
                     None => format!("if {c} {{ let _ = {tb}; }}"),
                 }
             }
-            ExprKind::Do(es) => self.block(es),
+            ExprKind::Do(es) => self.block_as(es, t == Ty::Unit),
             ExprKind::While(c, body) => {
                 let c = self.val(c);
                 let b = self.block(body);
@@ -556,7 +566,7 @@ impl<'a> Emitter<'a> {
                 Some(v) => format!("return {}", self.val(v)),
                 None => "return ()".into(),
             },
-            ExprKind::Match(scrut, arms) => self.emit_match(scrut, arms),
+            ExprKind::Match(scrut, arms) => self.emit_match(scrut, arms, t == Ty::Unit),
             ExprKind::New(name, _, fields) => {
                 let si = self.ck.info.structs[name].clone();
                 let mut parts = Vec::new();
@@ -656,7 +666,7 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn emit_match(&mut self, scrut: &Expr, arms: &[Arm]) -> String {
+    fn emit_match(&mut self, scrut: &Expr, arms: &[Arm], unit: bool) -> String {
         let s = self.rf(scrut);
         let st = self.ty(scrut).clone();
         let mut o = format!("match {s} {{\n");
@@ -664,7 +674,7 @@ impl<'a> Emitter<'a> {
             let mut guards = Vec::new();
             let p = self.pat(&arm.pat, &st, &mut guards);
             let g = if guards.is_empty() { String::new() } else { format!(" if {}", guards.join(" && ")) };
-            let body = self.block(&arm.body);
+            let body = self.block_as(&arm.body, unit);
             writeln!(o, "{p}{g} => {body},").unwrap();
         }
         if arms.is_empty() {
@@ -862,6 +872,18 @@ impl<'a> Emitter<'a> {
                 }
             }
             "reverse" => format!("{}.reverse()", self.mut_place(&args[0])),
+            "sort-desc" => {
+                let el = match at(self, 0) {
+                    Ty::Vec(el) => *el,
+                    _ => Ty::Err,
+                };
+                let p = self.mut_place(&args[0]);
+                if el.is_float() {
+                    format!("{p}.sort_by(|a, b| b.total_cmp(a))")
+                } else {
+                    format!("{p}.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal))")
+                }
+            }
             "sum" => format!("{}.iter().sum::<{}>()", self.pv(a(0)), rty(&t)),
             "map" => "ail_rt::AilMap::default()".into(),
             "put" => {
@@ -925,6 +947,19 @@ impl<'a> Emitter<'a> {
             "rand-int" => format!("ail_rt::rand_int({}, {})", self.val(a(1)), self.val(a(2))),
             "rand-f64" => "ail_rt::rand_f64()".into(),
             "args" => "ail_rt::args()".into(),
+            "read-all" => "ail_rt::read_all()".into(),
+            "lines" => format!("ail_rt::lines({})", self.rf(a(0))),
+            "is-digit" => format!("ail_rt::all_chars({}, |c| c.is_ascii_digit())", self.rf(a(0))),
+            "is-alpha" => format!("ail_rt::all_chars({}, |c| c.is_alphabetic())", self.rf(a(0))),
+            "is-alnum" => format!("ail_rt::all_chars({}, |c| c.is_alphanumeric())", self.rf(a(0))),
+            "is-space" => format!("ail_rt::all_chars({}, |c| c.is_whitespace())", self.rf(a(0))),
+            "is-upper" => format!("ail_rt::all_chars({}, |c| c.is_uppercase())", self.rf(a(0))),
+            "is-lower" => format!("ail_rt::all_chars({}, |c| c.is_lowercase())", self.rf(a(0))),
+            "code-of" => format!("ail_rt::code_of({})", self.rf(a(0))),
+            "json-parse" => format!("ail_json::parse({})", self.rf(a(0))),
+            "json-str" => format!("ail_json::to_string({})", self.rf(a(0))),
+            "http-next" => format!("ail_http::next({}, {})", self.val(a(1)), self.val(a(2))),
+            "http-respond" => format!("ail_http::respond({}, {}, {}, {})", self.rf(a(1)), self.val(a(2)), self.rf(a(3)), self.rf(a(4))),
             "fail" => format!("ail_rt::fail({})", self.rf(a(0))),
             "assert" => {
                 let c = self.val(a(0));
