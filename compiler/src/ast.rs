@@ -22,6 +22,8 @@ pub struct Param {
 pub struct FnDef {
     pub name: String,
     pub name_span: Span,
+    /// `(type-params T U)`: the fn is generic and is checked once per use with concrete types.
+    pub type_params: Vec<(String, Span)>,
     pub params: Vec<Param>,
     /// Byte offset where a new parameter can be inserted (before the closing paren of `params`,
     /// or right after the name if there is no `params` clause).
@@ -37,6 +39,7 @@ pub struct FnDef {
 #[derive(Clone, Debug)]
 pub struct StructDef {
     pub name: String,
+    pub type_params: Vec<(String, Span)>,
     pub fields: Vec<(String, TypeExpr)>,
     pub span: Span,
 }
@@ -44,6 +47,7 @@ pub struct StructDef {
 #[derive(Clone, Debug)]
 pub struct EnumDef {
     pub name: String,
+    pub type_params: Vec<(String, Span)>,
     pub variants: Vec<(String, Vec<TypeExpr>, Span)>,
     pub span: Span,
 }
@@ -288,6 +292,7 @@ impl Lower {
         let mut def = FnDef {
             name,
             name_span: name_s.span,
+            type_params: Vec::new(),
             params: Vec::new(),
             param_insert_at: name_s.span.end,
             has_params_clause: false,
@@ -304,6 +309,7 @@ impl Lower {
                 continue;
             };
             match clause.head().unwrap_or("") {
+                "type-params" => def.type_params = self.type_params(cl),
                 "params" => {
                     def.has_params_clause = true;
                     def.param_insert_at = clause.span.end - 1;
@@ -343,7 +349,7 @@ impl Lower {
                         Diag::error(
                             "E0014",
                             clause.span,
-                            &format!("unknown fn clause '{other}'; valid clauses: params, returns, requires, ensures, body"),
+                            &format!("unknown fn clause '{other}'; valid clauses: type-params, params, returns, requires, ensures, body"),
                         )
                         .note("expressions go inside (body ...)"),
                     );
@@ -419,10 +425,33 @@ impl Lower {
         }
     }
 
+    /// `(type-params T U)`: names of type parameters, written like type names.
+    fn type_params(&mut self, cl: &[SExpr]) -> Vec<(String, Span)> {
+        let mut out = Vec::new();
+        for t in &cl[1..] {
+            match t.sym() {
+                Some(n) if n.starts_with(|c: char| c.is_ascii_uppercase()) && valid_ident(n) => {
+                    out.push((n.to_string(), t.span))
+                }
+                _ => self.err("E0030", t.span, "type parameters are names starting with an uppercase letter: (type-params T U)"),
+            }
+        }
+        out
+    }
+
+    /// The optional `(type-params ...)` right after a struct or enum name.
+    fn def_type_params(&mut self, list: &[SExpr]) -> (Vec<(String, Span)>, usize) {
+        match list.get(2) {
+            Some(x) if x.head() == Some("type-params") => (self.type_params(x.list().unwrap()), 3),
+            _ => (Vec::new(), 2),
+        }
+    }
+
     fn struct_def(&mut self, list: &[SExpr], span: Span) -> Option<StructDef> {
         let name = self.ident(list.get(1)?)?;
+        let (type_params, first) = self.def_type_params(list);
         let mut fields = Vec::new();
-        for f in &list[2..] {
+        for f in &list[first..] {
             match f.list() {
                 Some(fl) if fl.len() == 2 => {
                     let fname = self.ident(&fl[0])?;
@@ -432,13 +461,14 @@ impl Lower {
                 _ => self.err("E0019", f.span, "struct field is (name Type)"),
             }
         }
-        Some(StructDef { name, fields, span })
+        Some(StructDef { name, type_params, fields, span })
     }
 
     fn enum_def(&mut self, list: &[SExpr], span: Span) -> Option<EnumDef> {
         let name = self.ident(list.get(1)?)?;
+        let (type_params, first) = self.def_type_params(list);
         let mut variants = Vec::new();
-        for v in &list[2..] {
+        for v in &list[first..] {
             match v.list() {
                 Some(vl) if !vl.is_empty() => {
                     let vname = self.ident(&vl[0])?;
@@ -463,6 +493,7 @@ impl Lower {
         }
         Some(EnumDef {
             name,
+            type_params,
             variants,
             span,
         })
@@ -848,4 +879,74 @@ pub fn valid_ident(n: &str) -> bool {
     }
     n.chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '?' || c == '.')
+}
+
+/// Give every expression of a copied fn a fresh id (a generic fn is copied once per use).
+pub fn renumber_fn(f: &mut FnDef, next: &mut u32) {
+    for e in f.requires.iter_mut().chain(f.ensures.iter_mut()).chain(f.body.iter_mut()) {
+        renumber(e, next);
+    }
+}
+
+fn renumber(e: &mut Expr, next: &mut u32) {
+    e.id = *next;
+    *next += 1;
+    match &mut e.kind {
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Var(_)
+        | ExprKind::Break
+        | ExprKind::Continue => {}
+        ExprKind::Call(_, _, args) => args.iter_mut().for_each(|a| match a {
+            Arg::Val(x) | Arg::Mut(x, _) => renumber(x, next),
+        }),
+        ExprKind::Let { value, .. } => renumber(value, next),
+        ExprKind::Set(a, b) => {
+            renumber(a, next);
+            renumber(b, next);
+        }
+        ExprKind::If(c, t, f) => {
+            renumber(c, next);
+            renumber(t, next);
+            if let Some(f) = f {
+                renumber(f, next);
+            }
+        }
+        ExprKind::Do(es) => es.iter_mut().for_each(|x| renumber(x, next)),
+        ExprKind::While(c, b) => {
+            renumber(c, next);
+            b.iter_mut().for_each(|x| renumber(x, next));
+        }
+        ExprKind::For(_, _, it, b) => {
+            match it {
+                ForIter::Range(x, y) => {
+                    renumber(x, next);
+                    renumber(y, next);
+                }
+                ForIter::Each(v) => renumber(v, next),
+            }
+            b.iter_mut().for_each(|x| renumber(x, next));
+        }
+        ExprKind::Return(v) => {
+            if let Some(v) = v {
+                renumber(v, next);
+            }
+        }
+        ExprKind::Match(sc, arms) => {
+            renumber(sc, next);
+            for a in arms {
+                a.body.iter_mut().for_each(|x| renumber(x, next));
+            }
+        }
+        ExprKind::New(_, _, fs) => fs.iter_mut().for_each(|f| renumber(&mut f.2, next)),
+        ExprKind::With(b, fs) => {
+            renumber(b, next);
+            fs.iter_mut().for_each(|f| renumber(&mut f.2, next));
+        }
+        ExprKind::Field(x, _, _) | ExprKind::Try(x) | ExprKind::As(_, x) | ExprKind::Copy(x) => {
+            renumber(x, next)
+        }
+        ExprKind::Lambda(_, b) => b.iter_mut().for_each(|x| renumber(x, next)),
+    }
 }

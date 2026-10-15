@@ -17,6 +17,8 @@ the first attempt?
 - **Functions are arguments, never values.** A parameter can be `(Fn A B R)` and the caller
   passes a `lambda`; `map`, `filter`, `fold`, `sort-by` and friends take them. Lambdas only read
   their surroundings and cannot be stored, so there are no capture rules and no allocation.
+- **Generics without bounds.** `(type-params T)` on fns, structs and enums. Each concrete use is
+  checked and compiled as its own copy, so there is no trait syntax and no runtime cost.
 - **Effects are capabilities.** A function can print, read files or open sockets only if it was
   given that capability, and capabilities come down from `main`.
 - **No undefined behavior.** Integer overflow, out-of-bounds access and failed `expect` stop the
@@ -174,5 +176,5 @@ target/release/ail web ../examples/dodge.ail          # build for the browser an
 ## Status
 
 ail is an early research language: v0.3 is released and v0.4 (string views, functions as
-arguments) is in development on `main`. The pieces above work and are measured. Generics for user
-types, concurrency and modules are not built yet.
+arguments, generics) is in development on `main`. The pieces above work and are measured.
+Concurrency and modules are not built yet.

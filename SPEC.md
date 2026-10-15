@@ -38,6 +38,8 @@ Indexes and lengths are always `I64`.
 (test "name" expr...)                                         ; run with `ail test`
 ```
 
+Structs, enums and fns can be generic: `(struct Box (type-params T) (value T))` (see Generics).
+
 Functions may call each other in any order (mutual recursion needs no declarations).
 A `let`/`var` may shadow an earlier binding of the same name. Defining a function with the name of a
 builtin replaces the builtin for that program. Type and variant names start with an uppercase letter. Enum variants are always qualified:
@@ -219,8 +221,25 @@ around it but never changes them, and `return`, `break`, `continue` and `try` ca
 Functions are only passed as arguments (to a `(Fn ...)` parameter or a builtin like `map`): they
 cannot be bound with `let`, stored in data or returned.
 
-There are no generics in user code, no globals except `const`, no inheritance,
-no exceptions and no implicit conversions.
+## Generics
+
+Fns, structs and enums can take type parameters with a `(type-params ...)` clause:
+
+```
+(struct Pair (type-params A B) (first A) (second B))
+(enum Tree (type-params T) (Leaf) (Node (Tree T) T (Tree T)))
+(fn largest (type-params T) (params (xs (Vec T))) (returns (Option T))
+  (body ...))
+```
+
+Write the type with its arguments: `(Pair I64 Str)`, `(Tree Str)`. Type arguments are worked out
+from the call or the values (`(largest (vec 3 9 2))`, `(new Pair (first 1) (second "a"))`); when
+nothing says what they are, put the type on the binding: `(let t (Tree I64) Tree.Leaf)`.
+There are no bounds to declare. Each use with concrete types is checked as if written for them,
+so `(+ a b)` on a `T` works for numbers and is an error, at the line inside the generic fn, when
+`T` is Str. A generic fn that is never called is not checked (warning W0005).
+
+There are no globals except `const`, no inheritance, no exceptions and no implicit conversions.
 
 ## Example
 
