@@ -106,6 +106,10 @@ impl LineIndex {
         }
         LineIndex { starts }
     }
+    /// Byte offset where 1-based `line` starts.
+    pub fn line_start(&self, line: usize) -> usize {
+        self.starts.get(line - 1).copied().unwrap_or(*self.starts.last().unwrap())
+    }
     /// 1-based line and column (column counted in bytes).
     pub fn pos(&self, offset: usize) -> (usize, usize) {
         let line = match self.starts.binary_search(&offset) {
@@ -114,6 +118,22 @@ impl LineIndex {
         };
         (line + 1, offset - self.starts[line] + 1)
     }
+}
+
+/// The diagnostic with every span moved by `-base` (into the coordinates of one file).
+/// Fix edits that fall outside the file are dropped.
+pub fn shifted(d: &Diag, base: usize, len: usize) -> Diag {
+    let mv = |s: Span| Span::new(s.start.saturating_sub(base), s.end.saturating_sub(base));
+    let mut o = d.clone();
+    o.span = mv(d.span);
+    for f in o.fixes.iter_mut() {
+        f.edits.retain(|e| e.span.start >= base && e.span.end <= base + len);
+        for e in f.edits.iter_mut() {
+            e.span = mv(e.span);
+        }
+    }
+    o.fixes.retain(|f| !f.edits.is_empty());
+    o
 }
 
 pub fn json_str(s: &str) -> String {

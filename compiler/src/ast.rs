@@ -204,7 +204,7 @@ pub fn lower(forms: &[SExpr]) -> (Program, Vec<Diag>) {
     )
 }
 
-const ITEM_FORMS: &str = "fn, struct, enum, const, test";
+const ITEM_FORMS: &str = "fn, struct, enum, const, test, use";
 
 impl Lower {
     fn err(&mut self, code: &'static str, span: Span, msg: &str) {
@@ -228,6 +228,13 @@ impl Lower {
         };
         let head = f.head().unwrap_or("");
         match head {
+            "use" => {
+                // The driver loads the file; here only the shape is checked.
+                if list.len() != 2 || list[1].sym().is_none() {
+                    self.err("E0031", f.span, "use form is (use name) for name.ail next to this file, or (use dir/name)");
+                }
+                None
+            }
             "fn" => self.fn_def(list, f.span).map(Item::Fn),
             "struct" => self.struct_def(list, f.span).map(Item::Struct),
             "enum" => self.enum_def(list, f.span).map(Item::Enum),

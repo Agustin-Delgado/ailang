@@ -176,5 +176,5 @@ target/release/ail web ../examples/dodge.ail          # build for the browser an
 ## Status
 
 ail is an early research language: v0.3 is released and v0.4 (string views, functions as
-arguments, generics) is in development on `main`. The pieces above work and are measured.
-Concurrency and modules are not built yet.
+arguments, generics, programs split across files with `(use name)`) is in development on `main`.
+The pieces above work and are measured. Concurrency is not built yet.

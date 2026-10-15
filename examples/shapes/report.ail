@@ -1,0 +1,6 @@
+(use geo/shapes)
+
+(fn summary (params (xs (Vec Shape))) (returns Str)
+  (body
+    (let n (count xs (lambda (s) (> (area s) 1.0))))
+    (str (len xs) " shapes, " n " larger than 1")))

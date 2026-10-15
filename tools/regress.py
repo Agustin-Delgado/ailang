@@ -42,7 +42,10 @@ for d, _, fs in os.walk(ROOT):
         if f == "main.ail" and os.sep + "runs" + os.sep in p:
             sols.append(p)
         elif f.endswith(".ail") and not f.startswith("broken"):
-            progs.append(p)
+            text = open(p, encoding="utf8").read()
+            # Library files (used by another file, no entry point) are built through their user.
+            if "(fn main" in text or "(fn init" in text or "(test " in text:
+                progs.append(p)
 
 with ThreadPoolExecutor(4) as ex:
     res = dict(ex.map(build, progs))

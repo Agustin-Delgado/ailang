@@ -36,6 +36,7 @@ Indexes and lengths are always `I64`.
   (ensures (>= result 0))                                     ; `result` is the return value
   (body expr...))                                             ; value of the last expression
 (test "name" expr...)                                         ; run with `ail test`
+(use geometry)                                                ; load geometry.ail (see Files)
 ```
 
 Structs, enums and fns can be generic: `(struct Box (type-params T) (value T))` (see Generics).
@@ -220,6 +221,13 @@ A parameter can be a function. `(Fn A B R)` lists the argument types, then the r
 around it but never changes them, and `return`, `break`, `continue` and `try` cannot leave it.
 Functions are only passed as arguments (to a `(Fn ...)` parameter or a builtin like `map`): they
 cannot be bound with `let`, stored in data or returned.
+
+## Files
+
+`(use name)` at the top level loads `name.ail` from the same directory as the file that says it
+(`(use lib/geometry)` loads `lib/geometry.ail`). Every file is loaded once, wherever it is used,
+and all files share one namespace: a name defined in two files is an error. Only the file you run
+should define `main`; `ail test main.ail` runs the tests of every file.
 
 ## Generics
 

@@ -1,0 +1,10 @@
+(enum Shape (Circle F64) (Rect F64 F64))
+
+(fn area (params (s Shape)) (returns F64)
+  (body
+    (match s
+      (case (Shape.Circle r) (* 3.141592653589793 r r))
+      (case (Shape.Rect w h) (* w h)))))
+
+(fn max-area (params (xs (Vec Shape))) (returns (Option F64))
+  (body (match (max-by xs (lambda (s) (area s))) (case (some s) (some (area s))) (case none none))))
