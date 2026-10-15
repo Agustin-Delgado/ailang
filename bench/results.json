@@ -42,6 +42,13 @@
   "same_output": true
  },
  {
+  "bench": "mandel",
+  "ail_s": 1.0245,
+  "rust_s": 0.951,
+  "ratio": 1.077,
+  "same_output": true
+ },
+ {
   "bench": "nbody",
   "ail_s": 2.9177,
   "rust_s": 2.851,

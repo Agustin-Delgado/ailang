@@ -101,3 +101,12 @@
                         (for i (range 0 n) (if (== i 2) continue) (set s (+ s i)))
                         s))
               (vec 1 8))))
+
+(test "par-map gives exactly what map gives"
+  (var xs (Vec I64) (vec))
+  (for i (range 0 10000) (push (mut xs) i))
+  (let k 7)
+  (assert (== (par-map xs (lambda (x) (% (* x k) 13))) (map xs (lambda (x) (% (* x k) 13)))))
+  (assert (== (par-map (vec "a" "bb") (lambda (s) (str s "!"))) (vec "a!" "bb!")))
+  (let none-here (Vec I64) (vec))
+  (assert (is-empty (par-map none-here (lambda (x) x)))))

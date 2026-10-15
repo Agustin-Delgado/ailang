@@ -21,6 +21,7 @@ lower ratio is better for ail.
 | api | REST handlers: routing, JSON in/out, store (Rust: serde derive) | 2.78 | 3.00 | **0.93** |
 | nbody | f64 struct math | 2.92 | 2.85 | 1.02 |
 | raytrace | f64 vector math, enum shapes | 0.024 | 0.024 | 1.04 * |
+| mandel | Mandelbrot 2000x2000, rows in parallel (ail par-map, Rust rayon) | 1.02 | 0.95 | 1.08 |
 | sieve | bounds-checked array loops | 4.14 | 3.71 | 1.12 |
 | game | 4000-entity arena, spatial grid collisions | 1.57 | 1.38 | 1.14 |
 
@@ -75,6 +76,10 @@ ail 0.4 (string views):
   without copying each piece. `(str ...)` and appends write strings and integers directly instead
   of going through `format!`.
 - Result: wordfreq went from 1.58 to 0.92, strings from 0.50 to 0.32, the wasm view got 25% faster.
+
+- `par-map` spreads a map over all cores with dynamic block scheduling (threads take small blocks
+  from a shared counter), so uneven rows like Mandelbrot's still keep every core busy. mandel is
+  the parallel benchmark: ail `par-map` against Rust with rayon, 1.08.
 
 ail 0.3:
 
