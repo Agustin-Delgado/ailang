@@ -105,7 +105,11 @@ pub enum Pat {
 impl Pat {
     pub fn span(&self) -> Span {
         match self {
-            Pat::Wild(s) | Pat::Bind(_, s) | Pat::Int(_, s) | Pat::Str(_, s) | Pat::Ctor(_, _, s) => *s,
+            Pat::Wild(s)
+            | Pat::Bind(_, s)
+            | Pat::Int(_, s)
+            | Pat::Str(_, s)
+            | Pat::Ctor(_, _, s) => *s,
         }
     }
 }
@@ -130,7 +134,14 @@ pub enum ExprKind {
     Str(String),
     Var(String),
     Call(String, Span, Vec<Arg>),
-    Let { name: String, name_span: Span, kw_span: Span, mutable: bool, ty: Option<TypeExpr>, value: Box<Expr> },
+    Let {
+        name: String,
+        name_span: Span,
+        kw_span: Span,
+        mutable: bool,
+        ty: Option<TypeExpr>,
+        value: Box<Expr>,
+    },
     Set(Box<Expr>, Box<Expr>),
     If(Box<Expr>, Box<Expr>, Option<Box<Expr>>),
     Do(Vec<Expr>),
@@ -161,14 +172,23 @@ pub struct Lower {
 }
 
 pub fn lower(forms: &[SExpr]) -> (Program, Vec<Diag>) {
-    let mut l = Lower { next_id: 0, diags: Vec::new() };
+    let mut l = Lower {
+        next_id: 0,
+        diags: Vec::new(),
+    };
     let mut items = Vec::new();
     for f in forms {
         if let Some(it) = l.item(f) {
             items.push(it);
         }
     }
-    (Program { items, expr_count: l.next_id }, l.diags)
+    (
+        Program {
+            items,
+            expr_count: l.next_id,
+        },
+        l.diags,
+    )
 }
 
 const ITEM_FORMS: &str = "fn, struct, enum, const, test";
@@ -186,7 +206,11 @@ impl Lower {
 
     fn item(&mut self, f: &SExpr) -> Option<Item> {
         let Some(list) = f.list() else {
-            self.err("E0010", f.span, &format!("top-level forms must be lists: ({ITEM_FORMS} ...)"));
+            self.err(
+                "E0010",
+                f.span,
+                &format!("top-level forms must be lists: ({ITEM_FORMS} ...)"),
+            );
             return None;
         };
         let head = f.head().unwrap_or("");
@@ -202,7 +226,12 @@ impl Lower {
                 let name = self.ident(&list[1])?;
                 let ty = self.type_expr(&list[2])?;
                 let value = self.expr(&list[3])?;
-                Some(Item::Const(ConstDef { name, ty, value, span: f.span }))
+                Some(Item::Const(ConstDef {
+                    name,
+                    ty,
+                    value,
+                    span: f.span,
+                }))
             }
             "test" => {
                 let name = match list.get(1).map(|x| &x.kind) {
@@ -213,10 +242,18 @@ impl Lower {
                     }
                 };
                 let body = self.exprs(&list[2..]);
-                Some(Item::Test(TestDef { name, body, span: f.span }))
+                Some(Item::Test(TestDef {
+                    name,
+                    body,
+                    span: f.span,
+                }))
             }
             _ => {
-                self.err("E0010", f.span, &format!("unknown top-level form '{head}'; expected one of: {ITEM_FORMS}"));
+                self.err(
+                    "E0010",
+                    f.span,
+                    &format!("unknown top-level form '{head}'; expected one of: {ITEM_FORMS}"),
+                );
                 None
             }
         }
@@ -226,7 +263,11 @@ impl Lower {
         match s.sym() {
             Some(n) if valid_ident(n) => Some(n.to_string()),
             _ => {
-                self.err("E0013", s.span, "expected an identifier (letters, digits, '-', '_', '?')");
+                self.err(
+                    "E0013",
+                    s.span,
+                    "expected an identifier (letters, digits, '-', '_', '?')",
+                );
                 None
             }
         }
@@ -302,8 +343,12 @@ impl Lower {
         }
         if !has_body {
             self.diags.push(
-                Diag::error("E0016", span, &format!("fn '{}' has no (body ...) clause", def.name))
-                    .with_fix_insert(span.end - 1, " (body unit)", "add an empty body"),
+                Diag::error(
+                    "E0016",
+                    span,
+                    &format!("fn '{}' has no (body ...) clause", def.name),
+                )
+                .with_fix_insert(span.end - 1, " (body unit)", "add an empty body"),
             );
         }
         Some(def)
@@ -311,7 +356,11 @@ impl Lower {
 
     fn param(&mut self, p: &SExpr) -> Option<Param> {
         let bad = |l: &mut Lower| {
-            l.err("E0017", p.span, "parameter is (name Type) or (name (mut Type))");
+            l.err(
+                "E0017",
+                p.span,
+                "parameter is (name Type) or (name (mut Type))",
+            );
             None
         };
         let Some(pl) = p.list() else { return bad(self) };
@@ -324,21 +373,38 @@ impl Lower {
             _ => (&pl[1], false),
         };
         let ty = self.type_expr(ty_s)?;
-        Some(Param { name, ty, mutable, span: p.span })
+        Some(Param {
+            name,
+            ty,
+            mutable,
+            span: p.span,
+        })
     }
 
     pub fn type_expr(&mut self, s: &SExpr) -> Option<TypeExpr> {
         match &s.kind {
-            SKind::Sym(n) => Some(TypeExpr { name: n.clone(), args: Vec::new(), span: s.span }),
+            SKind::Sym(n) => Some(TypeExpr {
+                name: n.clone(),
+                args: Vec::new(),
+                span: s.span,
+            }),
             SKind::List(l) if !l.is_empty() && l[0].sym().is_some() => {
                 let mut args = Vec::new();
                 for a in &l[1..] {
                     args.push(self.type_expr(a)?);
                 }
-                Some(TypeExpr { name: l[0].sym().unwrap().to_string(), args, span: s.span })
+                Some(TypeExpr {
+                    name: l[0].sym().unwrap().to_string(),
+                    args,
+                    span: s.span,
+                })
             }
             _ => {
-                self.err("E0018", s.span, "expected a type, e.g. I64, Str, (Vec I64), (Option Str), Point");
+                self.err(
+                    "E0018",
+                    s.span,
+                    "expected a type, e.g. I64, Str, (Vec I64), (Option Str), Point",
+                );
                 None
             }
         }
@@ -376,13 +442,21 @@ impl Lower {
                 _ => {
                     let mut d = Diag::error("E0020", v.span, "enum variant is (Name FieldType...)");
                     if let Some(s) = v.sym() {
-                        d = d.with_fix_replace(v.span, &format!("({s})"), "wrap the variant in parens");
+                        d = d.with_fix_replace(
+                            v.span,
+                            &format!("({s})"),
+                            "wrap the variant in parens",
+                        );
                     }
                     self.diags.push(d);
                 }
             }
         }
-        Some(EnumDef { name, variants, span })
+        Some(EnumDef {
+            name,
+            variants,
+            span,
+        })
     }
 
     pub fn exprs(&mut self, xs: &[SExpr]) -> Vec<Expr> {
@@ -424,7 +498,11 @@ impl Lower {
                     return None;
                 }
                 let Some(head) = l[0].sym() else {
-                    self.err("E0023", l[0].span, "the first element of a list form must be a name (function or keyword)");
+                    self.err(
+                        "E0023",
+                        l[0].span,
+                        "the first element of a list form must be a name (function or keyword)",
+                    );
                     return None;
                 };
                 let args = &l[1..];
@@ -436,7 +514,11 @@ impl Lower {
 
     fn arity(&mut self, form: &str, args: &[SExpr], n: usize, span: Span, shape: &str) -> bool {
         if args.len() != n {
-            self.err("E0024", span, &format!("'{form}' takes {n} argument(s): {shape}"));
+            self.err(
+                "E0024",
+                span,
+                &format!("'{form}' takes {n} argument(s): {shape}"),
+            );
             return false;
         }
         true
@@ -452,15 +534,29 @@ impl Lower {
                     return None;
                 }
                 let name = self.ident(&args[0])?;
-                let ty = if args.len() == 3 { Some(self.type_expr(&args[1])?) } else { None };
+                let ty = if args.len() == 3 {
+                    Some(self.type_expr(&args[1])?)
+                } else {
+                    None
+                };
                 let value = self.expr(args.last().unwrap())?;
-                ExprKind::Let { name, name_span: args[0].span, kw_span: head_span, mutable, ty, value: Box::new(value) }
+                ExprKind::Let {
+                    name,
+                    name_span: args[0].span,
+                    kw_span: head_span,
+                    mutable,
+                    ty,
+                    value: Box::new(value),
+                }
             }
             "set" => {
                 if !self.arity("set", args, 2, span, "(set place value)") {
                     return None;
                 }
-                ExprKind::Set(Box::new(self.expr(&args[0])?), Box::new(self.expr(&args[1])?))
+                ExprKind::Set(
+                    Box::new(self.expr(&args[0])?),
+                    Box::new(self.expr(&args[1])?),
+                )
             }
             "if" => {
                 if args.len() != 2 && args.len() != 3 {
@@ -469,7 +565,11 @@ impl Lower {
                 }
                 let c = self.expr(&args[0])?;
                 let t = self.expr(&args[1])?;
-                let e = if args.len() == 3 { Some(Box::new(self.expr(&args[2])?)) } else { None };
+                let e = if args.len() == 3 {
+                    Some(Box::new(self.expr(&args[2])?))
+                } else {
+                    None
+                };
                 ExprKind::If(Box::new(c), Box::new(t), e)
             }
             "do" => ExprKind::Do(self.exprs(args)),
@@ -483,14 +583,22 @@ impl Lower {
             }
             "for" => {
                 if args.len() < 2 {
-                    self.err("E0024", span, "'for' form is (for x (range a b) body...) or (for x vec body...)");
+                    self.err(
+                        "E0024",
+                        span,
+                        "'for' form is (for x (range a b) body...) or (for x vec body...)",
+                    );
                     return None;
                 }
                 let var = self.ident(&args[0])?;
                 let iter = if args[1].head() == Some("range") {
                     let r = args[1].list().unwrap();
                     if r.len() != 3 {
-                        self.err("E0024", args[1].span, "(range start end) takes 2 arguments; end is exclusive");
+                        self.err(
+                            "E0024",
+                            args[1].span,
+                            "(range start end) takes 2 arguments; end is exclusive",
+                        );
                         return None;
                     }
                     ForIter::Range(Box::new(self.expr(&r[1])?), Box::new(self.expr(&r[2])?))
@@ -509,26 +617,41 @@ impl Lower {
             },
             "match" => {
                 if args.is_empty() {
-                    self.err("E0024", span, "'match' form is (match value (case pattern body...)...)");
+                    self.err(
+                        "E0024",
+                        span,
+                        "'match' form is (match value (case pattern body...)...)",
+                    );
                     return None;
                 }
                 let scrut = self.expr(&args[0])?;
                 let mut arms = Vec::new();
                 for a in &args[1..] {
-                    let Some(al) = a.list().filter(|al| a.head() == Some("case") && al.len() >= 3) else {
+                    let Some(al) = a
+                        .list()
+                        .filter(|al| a.head() == Some("case") && al.len() >= 3)
+                    else {
                         self.err("E0025", a.span, "match arm is (case pattern body...)");
                         continue;
                     };
                     if let Some(pat) = self.pat(&al[1]) {
                         let body = self.exprs(&al[2..]);
-                        arms.push(Arm { pat, body, span: a.span });
+                        arms.push(Arm {
+                            pat,
+                            body,
+                            span: a.span,
+                        });
                     }
                 }
                 ExprKind::Match(Box::new(scrut), arms)
             }
             "new" => {
                 if args.is_empty() {
-                    self.err("E0024", span, "'new' form is (new TypeName (field value)...)");
+                    self.err(
+                        "E0024",
+                        span,
+                        "'new' form is (new TypeName (field value)...)",
+                    );
                     return None;
                 }
                 let name = self.ident(&args[0])?;
@@ -536,7 +659,11 @@ impl Lower {
             }
             "with" => {
                 if args.is_empty() {
-                    self.err("E0024", span, "'with' form is (with value (field new-value)...)");
+                    self.err(
+                        "E0024",
+                        span,
+                        "'with' form is (with value (field new-value)...)",
+                    );
                     return None;
                 }
                 let base = self.expr(&args[0])?;
@@ -544,7 +671,11 @@ impl Lower {
             }
             "." => {
                 if args.len() < 2 {
-                    self.err("E0024", span, "field access is (. value field) or (. value field subfield...)");
+                    self.err(
+                        "E0024",
+                        span,
+                        "field access is (. value field) or (. value field subfield...)",
+                    );
                     return None;
                 }
                 let mut e = self.expr(&args[0])?;
@@ -554,7 +685,10 @@ impl Lower {
                         return None;
                     };
                     let fspan = Span::new(span.start, f.span.end);
-                    e = self.mk(ExprKind::Field(Box::new(e), fname.to_string(), f.span), fspan);
+                    e = self.mk(
+                        ExprKind::Field(Box::new(e), fname.to_string(), f.span),
+                        fspan,
+                    );
                 }
                 return Some(e);
             }
@@ -578,15 +712,27 @@ impl Lower {
                 ExprKind::Copy(Box::new(self.expr(&args[0])?))
             }
             "mut" => {
-                self.err("E0026", span, "(mut x) is only allowed as a call argument, e.g. (push (mut v) 1)");
+                self.err(
+                    "E0026",
+                    span,
+                    "(mut x) is only allowed as a call argument, e.g. (push (mut v) 1)",
+                );
                 return None;
             }
             "case" => {
-                self.err("E0025", span, "(case ...) is only allowed inside (match ...)");
+                self.err(
+                    "E0025",
+                    span,
+                    "(case ...) is only allowed inside (match ...)",
+                );
                 return None;
             }
             "range" => {
-                self.err("E0027", span, "(range a b) is only allowed as the iterable of (for ...)");
+                self.err(
+                    "E0027",
+                    span,
+                    "(range a b) is only allowed as the iterable of (for ...)",
+                );
                 return None;
             }
             _ => {
@@ -614,7 +760,11 @@ impl Lower {
             SKind::Int(v) => Some(Pat::Int(*v, s.span)),
             SKind::Str(v) => Some(Pat::Str(v.clone(), s.span)),
             SKind::Float(_) => {
-                self.err("E0028", s.span, "float literals cannot be patterns; use (if (== x 1.5) ...)");
+                self.err(
+                    "E0028",
+                    s.span,
+                    "float literals cannot be patterns; use (if (== x 1.5) ...)",
+                );
                 None
             }
             SKind::Sym(n) => Some(match n.as_str() {
@@ -648,5 +798,6 @@ pub fn valid_ident(n: &str) -> bool {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
         _ => return false,
     }
-    n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '?' || c == '.')
+    n.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '?' || c == '.')
 }

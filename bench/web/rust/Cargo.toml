@@ -1,0 +1,16 @@
+[package]
+name = "arena"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Idiomatic Rust for a canvas game without wasm-bindgen: the game fills a command buffer that the
+# JS host reads from linear memory. Same release profile as the native baselines.
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+panic = "abort"

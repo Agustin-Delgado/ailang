@@ -1,0 +1,85 @@
+; json — build, serialize, parse and aggregate dynamic JSON documents (bench/SPECS.md)
+
+(const ROUNDS I64 8)
+(const RECORDS I64 40000)
+
+(fn next-rand (params (state (mut I64))) (returns I64)
+  (body
+    (set state (% (* state 48271) 2147483647))
+    state))
+
+(fn rand-below (params (state (mut I64)) (n I64)) (returns I64)
+  (body (% (next-rand (mut state)) n)))
+
+(fn make-record (params (i I64) (n I64) (s I64) (t I64)) (returns Json)
+  (body
+    (var tags (Vec Json) (vec))
+    (for k (range 0 (+ t 1))
+      (push (mut tags) (Json.Str (str "tag" k))))
+    (let x (% n 1000))
+    (let y (/ n 1000))
+    (var pos (Map Str Json) (map))
+    (put (mut pos) "x" (Json.Num (as F64 x)))
+    (put (mut pos) "y" (Json.Num (as F64 y)))
+    (var rec (Map Str Json) (map))
+    (put (mut rec) "id" (Json.Num (as F64 i)))
+    (put (mut rec) "name" (Json.Str (str "user" n)))
+    (put (mut rec) "score" (Json.Num (+ (/ (as F64 s) 4.0) 0.125)))
+    (put (mut rec) "active" (Json.Bool (== (% n 2) 0)))
+    (put (mut rec) "tags" (Json.Arr tags))
+    (put (mut rec) "pos" (Json.Obj pos))
+    (Json.Obj rec)))
+
+(fn build (params (state (mut I64))) (returns Json)
+  (body
+    (var records (Vec Json) (vec))
+    (for i (range 0 RECORDS)
+      (let n (rand-below (mut state) 1000000))
+      (let s (rand-below (mut state) 10000))
+      (let t (rand-below (mut state) 5))
+      (push (mut records) (make-record i n s t)))
+    (Json.Arr records)))
+
+(struct Totals (score F64) (actives I64) (tags I64) (pos I64))
+
+(fn num-field (params (m (Map Str Json)) (key Str)) (returns F64)
+  (body
+    (match (get m key)
+      (case (some (Json.Num x)) x)
+      (case _ (fail (str "missing number " key))))))
+
+(fn add-record (params (tot (mut Totals)) (rec Json))
+  (body
+    (match rec
+      (case (Json.Obj m)
+        (set (. tot score) (+ (. tot score) (num-field m "score")))
+        (match (get m "active")
+          (case (some (Json.Bool true)) (set (. tot actives) (+ (. tot actives) 1)))
+          (case _ unit))
+        (match (get m "tags")
+          (case (some (Json.Arr tags)) (set (. tot tags) (+ (. tot tags) (len tags))))
+          (case _ (fail "missing tags")))
+        (match (get m "pos")
+          (case (some (Json.Obj p))
+            (let xy (+ (as I64 (num-field p "x")) (as I64 (num-field p "y"))))
+            (set (. tot pos) (+ (. tot pos) xy)))
+          (case _ (fail "missing pos"))))
+      (case _ (fail "record is not an object")))))
+
+(fn main (params (con Console)) (returns (Result Unit Str))
+  (body
+    (var state 4242)
+    (var total-bytes 0)
+    (var tot (new Totals (score 0.0) (actives 0) (tags 0) (pos 0)))
+    (for round (range 0 ROUNDS)
+      (let text (json-str (build (mut state))))
+      (set total-bytes (+ total-bytes (len text)))
+      (match (try (json-parse text))
+        (case (Json.Arr records)
+          (for rec records (add-record (mut tot) rec)))
+        (case _ (return (err "top level is not an array")))))
+    (println con "bytes " total-bytes)
+    (println con "score " (fmt-float (. tot score) 3))
+    (println con "actives " (. tot actives))
+    (println con "tags " (. tot tags) " pos " (. tot pos))
+    (ok unit)))

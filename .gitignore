@@ -4,3 +4,7 @@ bench/ail/*.exe
 *.exe
 experiment/runs/
 experiment/node_modules/
+bench/rust/target/
+bench/web/ail-out/
+bench/web/rust/target/
+.playwright-mcp/

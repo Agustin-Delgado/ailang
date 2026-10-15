@@ -10,9 +10,24 @@ struct Line {
     comment: String,
 }
 
+/// Candidate repairs, most likely first. The first reads indentation against the column of each
+/// open paren. The second against the indentation of the line the paren was opened on, which is
+/// right for hanging forms such as `(let e (match x` followed by `(case ...)` lines indented
+/// under `let`: those cases belong to `match`, the innermost form still open on that line.
+pub fn candidates(src: &str) -> Vec<String> {
+    let a = infer_with(src, false);
+    let b = infer_with(src, true);
+    if a == b { vec![a] } else { vec![a, b] }
+}
+
 pub fn infer(src: &str) -> String {
+    infer_with(src, false)
+}
+
+fn infer_with(src: &str, by_line: bool) -> String {
     let mut out: Vec<Line> = Vec::new();
-    let mut stack: Vec<usize> = Vec::new();
+    // (column, indentation of the line it was opened on) per open paren.
+    let mut stack: Vec<(usize, usize)> = Vec::new();
     let mut in_str = false;
     let mut last_code: Option<usize> = None;
     for raw in src.split('\n') {
@@ -52,7 +67,10 @@ pub fn infer(src: &str) -> String {
         if is_code {
             let indent = trimmed_start.unwrap();
             let mut closers = 0;
-            while stack.last().is_some_and(|&col| col >= indent) {
+            while stack
+                .last()
+                .is_some_and(|&(col, line)| (if by_line { line } else { col }) >= indent)
+            {
                 stack.pop();
                 closers += 1;
             }
@@ -60,6 +78,29 @@ pub fn infer(src: &str) -> String {
                 if let Some(lc) = last_code {
                     out[lc].code.push_str(&")".repeat(closers));
                 }
+            }
+        }
+        // Parens opened on this line that the original text leaves open at its end.
+        let mut open_at_eol: Vec<usize> = Vec::new();
+        {
+            let mut s = starts_in_str;
+            let mut j = 0;
+            while j < code_chars.len() {
+                let c = code_chars[j];
+                if s {
+                    if c == '\\' {
+                        j += 1;
+                    } else if c == '"' {
+                        s = false;
+                    }
+                } else if c == '"' {
+                    s = true;
+                } else if c == '(' {
+                    open_at_eol.push(j);
+                } else if c == ')' {
+                    open_at_eol.pop();
+                }
+                j += 1;
             }
         }
         // Remove the paren trail (unless the line ends inside a string).
@@ -92,7 +133,8 @@ pub fn infer(src: &str) -> String {
                 s = true;
                 kept_out.push(c);
             } else if c == '(' {
-                stack.push(j);
+                let line = if open_at_eol.contains(&j) { trimmed_start.unwrap_or(0) } else { j };
+                stack.push((j, line));
                 kept_out.push(c);
             } else if c == ')' {
                 if stack.pop().is_some() {
@@ -105,7 +147,10 @@ pub fn infer(src: &str) -> String {
         }
         in_str = ends_in_str;
         let has_code = is_code || (!kept_out.trim().is_empty());
-        out.push(Line { code: kept_out, comment });
+        out.push(Line {
+            code: kept_out,
+            comment,
+        });
         if has_code {
             last_code = Some(out.len() - 1);
         }
@@ -143,8 +188,19 @@ mod tests {
     }
 
     #[test]
+    fn hanging_form_candidate() {
+        let src = "(a\n  (let e (match x\n    (case 1 2)))\n    (case _ 3)))\n  (b))";
+        let c = super::candidates(src);
+        assert_eq!(
+            c.last().unwrap(),
+            "(a\n  (let e (match x\n    (case 1 2)\n    (case _ 3)))\n  (b))"
+        );
+    }
+
+    #[test]
     fn keeps_strings_and_comments() {
         let src = "(a \")(\" ; comment )\n  (b))";
         assert_eq!(infer(src), "(a \")(\" ; comment )\n  (b))");
     }
 }
+

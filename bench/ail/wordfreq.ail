@@ -1,0 +1,75 @@
+; wordfreq: build a 3M-word text from a random vocabulary, then tokenize it,
+; count words in a hash map and print the most frequent ones.
+
+(const VOCAB I64 5000)
+(const WORDS I64 3000000)
+(const TOP I64 15)
+
+(struct Rng (state I64))
+
+(fn next (params (r (mut Rng))) (returns I64)
+  (body
+    (set (. r state) (% (* (. r state) 48271) 2147483647))
+    (. r state)))
+
+(fn rand-below (params (r (mut Rng)) (n I64)) (returns I64)
+  (body (% (next (mut r)) n)))
+
+(fn make-word (params (r (mut Rng)) (cons Str) (vow Str)) (returns Str)
+  (body
+    (let syllables (+ 2 (rand-below (mut r) 3)))
+    (var parts (Vec Str) (vec))
+    (for _s (range 0 syllables)
+      (let c (rand-below (mut r) 16))
+      (let v (rand-below (mut r) 5))
+      (push (mut parts) (substr cons c (+ c 1)))
+      (push (mut parts) (substr vow v (+ v 1))))
+    (let w (join parts ""))
+    (if (== (rand-below (mut r) 4) 0)
+      (str (upper (substr w 0 1)) (substr w 1 (len w)))
+      w)))
+
+(fn punct? (params (b I64)) (returns Bool)
+  (body (or (== b 44) (== b 46))))
+
+; Strip leading and trailing ',' and '.' characters.
+(fn strip-punct (params (t Str)) (returns Str)
+  (body
+    (var start 0)
+    (var end (len t))
+    (while (and (< start end) (punct? (byte-at t start))) (set start (+ start 1)))
+    (while (and (> end start) (punct? (byte-at t (- end 1)))) (set end (- end 1)))
+    (substr t start end)))
+
+; Sort key: count descending (negated), then word ascending.
+(struct Entry (neg-count I64) (word Str))
+
+(fn main (params (con Console))
+  (body
+    (var rng (new Rng (state 99)))
+    (let cons "bcdfghjklmnprstv")
+    (let vow "aeiou")
+    (var vocab (Vec Str) (vec))
+    (for _w (range 0 VOCAB) (push (mut vocab) (make-word (mut rng) cons vow)))
+
+    (var text "")
+    (for _i (range 0 WORDS)
+      (let a (rand-below (mut rng) VOCAB))
+      (let b (rand-below (mut rng) VOCAB))
+      (let s (rand-below (mut rng) 10))
+      (set text (str text (at vocab (min a b)) (if (== s 0) ", " (if (== s 1) ". " " ")))))
+
+    (var counts (Map Str I64) (map))
+    (for tok (split text " ")
+      (let w (lower (strip-punct tok)))
+      (if (not (is-empty w))
+        (put (mut counts) w (+ 1 (unwrap-or (get counts w) 0)))))
+
+    (var entries (Vec Entry) (vec))
+    (for k (keys counts)
+      (push (mut entries) (new Entry (neg-count (- (unwrap-or (get counts k) 0))) (word k))))
+    (sort (mut entries))
+    (println con "distinct " (len counts))
+    (for i (range 0 (min TOP (len entries)))
+      (let e (at entries i))
+      (println con (. e word) " " (- (. e neg-count))))))

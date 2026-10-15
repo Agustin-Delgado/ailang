@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["server_std", "server_axum", "loadgen"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Same release profile as bench/rust: opt-level 3, one codegen unit, fat LTO, abort on panic.
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+panic = "abort"

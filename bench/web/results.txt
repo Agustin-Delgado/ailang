@@ -1,0 +1,3 @@
+ail  update 1.133 ms/frame  view 0.141  host 0.115  total 1.389  checksum 5588360
+rust update 0.949 ms/frame  view 0.041  host 0.078  total 1.068  checksum 5588360
+ail/rust: update 1.19  view+host 2.15  total 1.30  same result: true

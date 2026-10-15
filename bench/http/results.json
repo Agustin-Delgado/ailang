@@ -1,0 +1,92 @@
+{
+ "meta": {
+  "duration_s": 10.0,
+  "warmup_s": 2.0,
+  "mix": "30% POST /todos, 70% GET /todos?limit=20&offset=0",
+  "connection": "new TCP connection per request, Connection: close",
+  "platform": "win32"
+ },
+ "results": [
+  {
+   "concurrency": 1,
+   "rps": 1242.1,
+   "p50_us": 794,
+   "p99_us": 1291,
+   "ok": 12421,
+   "errors": 0,
+   "server": "ail"
+  },
+  {
+   "concurrency": 1,
+   "rps": 1448.1,
+   "p50_us": 676,
+   "p99_us": 1065,
+   "ok": 14481,
+   "errors": 0,
+   "server": "std"
+  },
+  {
+   "concurrency": 1,
+   "rps": 1274.5,
+   "p50_us": 763,
+   "p99_us": 1171,
+   "ok": 12745,
+   "errors": 0,
+   "server": "axum"
+  },
+  {
+   "concurrency": 8,
+   "rps": 5601.9,
+   "p50_us": 1360,
+   "p99_us": 2629,
+   "ok": 56019,
+   "errors": 0,
+   "server": "ail"
+  },
+  {
+   "concurrency": 8,
+   "rps": 4635.3,
+   "p50_us": 1665,
+   "p99_us": 2783,
+   "ok": 46353,
+   "errors": 0,
+   "server": "std"
+  },
+  {
+   "concurrency": 8,
+   "rps": 5864.8,
+   "p50_us": 1315,
+   "p99_us": 2308,
+   "ok": 58648,
+   "errors": 0,
+   "server": "axum"
+  },
+  {
+   "concurrency": 64,
+   "rps": 5324.1,
+   "p50_us": 11804,
+   "p99_us": 18590,
+   "ok": 53241,
+   "errors": 0,
+   "server": "ail"
+  },
+  {
+   "concurrency": 64,
+   "rps": 4595.0,
+   "p50_us": 13442,
+   "p99_us": 20973,
+   "ok": 45950,
+   "errors": 0,
+   "server": "std"
+  },
+  {
+   "concurrency": 64,
+   "rps": 5420.7,
+   "p50_us": 11536,
+   "p99_us": 16808,
+   "ok": 54207,
+   "errors": 0,
+   "server": "axum"
+  }
+ ]
+}

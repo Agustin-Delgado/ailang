@@ -6,7 +6,7 @@
 //! A local whose final use is unambiguous is moved instead of cloned.
 
 use crate::ast::*;
-use crate::check::{pat_key, BindId, BindKind, Checked, Res};
+use crate::check::{BindId, BindKind, Checked, Res, pat_key};
 use crate::diag::LineIndex;
 use crate::types::*;
 use std::collections::{HashMap, HashSet};
@@ -52,8 +52,18 @@ enum ModeKind {
 }
 
 pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> String {
-    let mode_kind = if matches!(mode, Mode::Web) { ModeKind::Web } else { ModeKind::Native };
-    let mut em = Emitter { ck, src, moves: HashSet::new(), tmp: 0, fn_name: String::new() };
+    let mode_kind = if matches!(mode, Mode::Web) {
+        ModeKind::Web
+    } else {
+        ModeKind::Native
+    };
+    let mut em = Emitter {
+        ck,
+        src,
+        moves: HashSet::new(),
+        tmp: 0,
+        fn_name: String::new(),
+    };
     let mut out = String::new();
     out.push_str("#![allow(warnings)]\n#![allow(unconditional_panic, arithmetic_overflow)]\n");
     for it in &prog.items {
@@ -86,7 +96,11 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
                 if sig.ret == Ty::Unit {
                     writeln!(out, "    {call};").unwrap();
                 } else {
-                    writeln!(out, "    if let Err(e) = {call} {{ ail_rt::main_error(&e); }}").unwrap();
+                    writeln!(
+                        out,
+                        "    if let Err(e) = {call} {{ ail_rt::main_error(&e); }}"
+                    )
+                    .unwrap();
                 }
                 out.push_str("    ail_rt::flush();\n}\n");
                 let _ = main;
@@ -98,15 +112,46 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
             let model = rty(&ck.info.fns["init"].ret);
             // Extra capability parameters of the app functions are supplied by the host.
             let caps = |f: &str, skip: usize| -> String {
-                ck.info.fns.get(f).map(|s| s.params.iter().skip(skip).map(|(_, t, _)| format!(", {}", rty(t))).collect::<String>()).unwrap_or_default()
+                ck.info
+                    .fns
+                    .get(f)
+                    .map(|s| {
+                        s.params
+                            .iter()
+                            .skip(skip)
+                            .map(|(_, t, _)| format!(", {}", rty(t)))
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default()
             };
-            let mut ex = crate::runtime_web::exports(&model, ck.info.fns.contains_key("view"), ck.info.fns.contains_key("page"));
-            ex = ex.replace("f_init()", &format!("f_init({})", caps("init", 0).trim_start_matches(", ")));
-            ex = ex.replace("f_update(m, &ev)", &format!("f_update(m, &ev{})", caps("update", 2)));
-            ex = ex.replace("ail_rt::Gfx);", &format!("ail_rt::Gfx{});", caps("view", 2)));
-            ex = ex.replace("f_page(c.as_ref().expect(\"ail_init must run first\"))", &format!("f_page(c.as_ref().expect(\"ail_init must run first\"){})", caps("page", 1)));
+            let mut ex = crate::runtime_web::exports(
+                &model,
+                ck.info.fns.contains_key("view"),
+                ck.info.fns.contains_key("page"),
+            );
+            ex = ex.replace(
+                "f_init()",
+                &format!("f_init({})", caps("init", 0).trim_start_matches(", ")),
+            );
+            ex = ex.replace(
+                "f_update(m, &ev)",
+                &format!("f_update(m, &ev{})", caps("update", 2)),
+            );
+            ex = ex.replace(
+                "ail_rt::Gfx);",
+                &format!("ail_rt::Gfx{});", caps("view", 2)),
+            );
+            ex = ex.replace(
+                "f_page(c.as_ref().expect(\"ail_init must run first\"))",
+                &format!(
+                    "f_page(c.as_ref().expect(\"ail_init must run first\"){})",
+                    caps("page", 1)
+                ),
+            );
             if ck.info.is_copy(&ck.info.fns["init"].ret) {
-                ex = ex.replace("f_view(c.as_ref()", "f_view(*c.as_ref()").replace("f_page(c.as_ref()", "f_page(*c.as_ref()");
+                ex = ex
+                    .replace("f_view(c.as_ref()", "f_view(*c.as_ref()")
+                    .replace("f_page(c.as_ref()", "f_page(*c.as_ref()");
             }
             out.push_str(&ex);
         }
@@ -131,11 +176,24 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, mode: Mode) -> 
     let (body, table) = line_table(&out, src);
     let mut fin = body;
     writeln!(fin, "static AIL_FILE: &str = {:?};", file).unwrap();
-    writeln!(fin, "static AIL_LINES: [(u32, u32, u32); {}] = [{}];", table.len(), table.iter().map(|(a, b, c)| format!("({a},{b},{c})")).collect::<Vec<_>>().join(",")).unwrap();
+    writeln!(
+        fin,
+        "static AIL_LINES: [(u32, u32, u32); {}] = [{}];",
+        table.len(),
+        table
+            .iter()
+            .map(|(a, b, c)| format!("({a},{b},{c})"))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+    .unwrap();
     fin.push_str(crate::runtime::RUNTIME);
     fin.push_str(crate::runtime_net::RUNTIME_NET);
     if matches!(mode_kind, ModeKind::Web) {
         fin.push_str(crate::runtime_web::RUNTIME_WEB);
+    } else {
+        // Native builds of an app (e.g. `ail test` on a game): drawing does nothing.
+        fin.push_str(crate::runtime_web::RUNTIME_WEB_STUB);
     }
     fin
 }
@@ -207,7 +265,14 @@ pub fn compute_moves(body: &[Expr], ck: &Checked) -> HashSet<u32> {
     let mut uses: HashMap<BindId, Vec<UseInfo>> = HashMap::new();
     let mut next_stmt = 0usize;
     let mut path = Vec::new();
-    fn block(es: &[Expr], ck: &Checked, uses: &mut HashMap<BindId, Vec<UseInfo>>, next: &mut usize, path: &mut Vec<usize>, depth: u32) {
+    fn block(
+        es: &[Expr],
+        ck: &Checked,
+        uses: &mut HashMap<BindId, Vec<UseInfo>>,
+        next: &mut usize,
+        path: &mut Vec<usize>,
+        depth: u32,
+    ) {
         for e in es {
             *next += 1;
             path.push(*next);
@@ -215,15 +280,32 @@ pub fn compute_moves(body: &[Expr], ck: &Checked) -> HashSet<u32> {
             path.pop();
         }
     }
-    fn expr(e: &Expr, ck: &Checked, uses: &mut HashMap<BindId, Vec<UseInfo>>, next: &mut usize, path: &mut Vec<usize>, depth: u32) {
+    fn expr(
+        e: &Expr,
+        ck: &Checked,
+        uses: &mut HashMap<BindId, Vec<UseInfo>>,
+        next: &mut usize,
+        path: &mut Vec<usize>,
+        depth: u32,
+    ) {
         match &e.kind {
             ExprKind::Var(_) => {
                 if let Res::Local(b) = ck.res[e.id as usize] {
-                    uses.entry(b).or_default().push(UseInfo { id: e.id, depth, path: path.clone() });
+                    uses.entry(b).or_default().push(UseInfo {
+                        id: e.id,
+                        depth,
+                        path: path.clone(),
+                    });
                 }
             }
-            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Break | ExprKind::Continue => {}
-            ExprKind::Call(_, _, args) => args.iter().for_each(|a| expr(a.expr(), ck, uses, next, path, depth)),
+            ExprKind::Int(_)
+            | ExprKind::Float(_)
+            | ExprKind::Str(_)
+            | ExprKind::Break
+            | ExprKind::Continue => {}
+            ExprKind::Call(_, _, args) => args
+                .iter()
+                .for_each(|a| expr(a.expr(), ck, uses, next, path, depth)),
             ExprKind::Let { value, .. } => expr(value, ck, uses, next, path, depth),
             ExprKind::Set(a, b) => {
                 expr(b, ck, uses, next, path, depth);
@@ -262,13 +344,18 @@ pub fn compute_moves(body: &[Expr], ck: &Checked) -> HashSet<u32> {
                     block(&a.body, ck, uses, next, path, depth);
                 }
             }
-            ExprKind::New(_, _, fs) => fs.iter().for_each(|f| expr(&f.2, ck, uses, next, path, depth)),
+            ExprKind::New(_, _, fs) => fs
+                .iter()
+                .for_each(|f| expr(&f.2, ck, uses, next, path, depth)),
             ExprKind::With(b, fs) => {
                 expr(b, ck, uses, next, path, depth);
-                fs.iter().for_each(|f| expr(&f.2, ck, uses, next, path, depth));
+                fs.iter()
+                    .for_each(|f| expr(&f.2, ck, uses, next, path, depth));
             }
             ExprKind::Field(b, _, _) => expr(b, ck, uses, next, path, depth),
-            ExprKind::Try(x) | ExprKind::As(_, x) | ExprKind::Copy(x) => expr(x, ck, uses, next, path, depth),
+            ExprKind::Try(x) | ExprKind::As(_, x) | ExprKind::Copy(x) => {
+                expr(x, ck, uses, next, path, depth)
+            }
         }
     }
     block(body, ck, &mut uses, &mut next_stmt, &mut path, 0);
@@ -316,11 +403,40 @@ impl<'a> Emitter<'a> {
 
     fn emit_struct(&mut self, s: &StructDef, out: &mut String) {
         let si = &self.ck.info.structs[&s.name];
-        let copy = if self.ck.info.copy_types.contains(&s.name) { ", Copy" } else { "" };
-        let copy = if self.ck.info.ord_types.contains(&s.name) { format!("{copy}, PartialOrd") } else { copy.to_string() };
-        writeln!(out, "#[derive(Clone, Debug, PartialEq{copy})]\npub struct {} {{", ty_name(&s.name)).unwrap();
+        if crate::check::json_encodable(&self.ck.info, &Ty::User(s.name.clone()), &mut Vec::new()) {
+            // (json-str value) writes the struct straight to text, fields in name order.
+            let mut fs: Vec<&String> = si.fields.iter().map(|f| &f.0).collect();
+            fs.sort();
+            let mut body = String::from("o.push('{');");
+            for (i, f) in fs.iter().enumerate() {
+                let key = format!("{}\"{}\":", if i > 0 { "," } else { "" }, f);
+                write!(body, " o.push_str({key:?}); ail_json::Enc::enc(&self.{}, o);", mangle(f)).unwrap();
+            }
+            body.push_str(" o.push('}');");
+            writeln!(out, "impl ail_json::Enc for {} {{ fn enc(&self, o: &mut String) {{ {body} }} }}", ty_name(&s.name)).unwrap();
+        }
+        let copy = if self.ck.info.copy_types.contains(&s.name) {
+            ", Copy"
+        } else {
+            ""
+        };
+        let copy = if self.ck.info.ord_types.contains(&s.name) {
+            format!("{copy}, PartialOrd")
+        } else {
+            copy.to_string()
+        };
+        writeln!(
+            out,
+            "#[derive(Clone, Debug, PartialEq{copy})]\npub struct {} {{",
+            ty_name(&s.name)
+        )
+        .unwrap();
         for (i, (f, t)) in si.fields.iter().enumerate() {
-            let rt = if self.ck.info.is_boxed(&s.name, NO_VARIANT, i) { format!("Box<{}>", rty(t)) } else { rty(t) };
+            let rt = if self.ck.info.is_boxed(&s.name, NO_VARIANT, i) {
+                format!("Box<{}>", rty(t))
+            } else {
+                rty(t)
+            };
             writeln!(out, "    pub {}: {},", mangle(f), rt).unwrap();
         }
         out.push_str("}\n");
@@ -328,9 +444,22 @@ impl<'a> Emitter<'a> {
 
     fn emit_enum(&mut self, e: &EnumDef, out: &mut String) {
         let ei = &self.ck.info.enums[&e.name];
-        let copy = if self.ck.info.copy_types.contains(&e.name) { ", Copy" } else { "" };
-        let copy = if self.ck.info.ord_types.contains(&e.name) { format!("{copy}, PartialOrd") } else { copy.to_string() };
-        writeln!(out, "#[derive(Clone, Debug, PartialEq{copy})]\npub enum {} {{", ty_name(&e.name)).unwrap();
+        let copy = if self.ck.info.copy_types.contains(&e.name) {
+            ", Copy"
+        } else {
+            ""
+        };
+        let copy = if self.ck.info.ord_types.contains(&e.name) {
+            format!("{copy}, PartialOrd")
+        } else {
+            copy.to_string()
+        };
+        writeln!(
+            out,
+            "#[derive(Clone, Debug, PartialEq{copy})]\npub enum {} {{",
+            ty_name(&e.name)
+        )
+        .unwrap();
         for (vi, (v, ts)) in ei.variants.iter().enumerate() {
             if ts.is_empty() {
                 writeln!(out, "    {},", mangle(v)).unwrap();
@@ -338,7 +467,13 @@ impl<'a> Emitter<'a> {
                 let fs: Vec<String> = ts
                     .iter()
                     .enumerate()
-                    .map(|(i, t)| if self.ck.info.is_boxed(&e.name, vi, i) { format!("Box<{}>", rty(t)) } else { rty(t) })
+                    .map(|(i, t)| {
+                        if self.ck.info.is_boxed(&e.name, vi, i) {
+                            format!("Box<{}>", rty(t))
+                        } else {
+                            rty(t)
+                        }
+                    })
                     .collect();
                 writeln!(out, "    {}({}),", mangle(v), fs.join(", ")).unwrap();
             }
@@ -364,23 +499,50 @@ impl<'a> Emitter<'a> {
             .params
             .iter()
             .zip(sig.params.iter())
-            .map(|(p, (_, t, m))| format!("{}: {}", self.local_name(&p.name), self.param_rty(t, *m)))
+            .map(|(p, (_, t, m))| {
+                format!("{}: {}", self.local_name(&p.name), self.param_rty(t, *m))
+            })
             .collect();
         let ret = rty(&sig.ret);
-        writeln!(out, "fn {}({}) -> {} {{", fn_name(&f.name), params.join(", "), ret).unwrap();
+        writeln!(
+            out,
+            "fn {}({}) -> {} {{",
+            fn_name(&f.name),
+            params.join(", "),
+            ret
+        )
+        .unwrap();
         for r in &f.requires {
             let c = self.val(r);
-            writeln!(out, "    {}if !({c}) {{ ail_rt::contract(\"requires\", {:?}, {:?}); }}", self.mark(r), f.name, self.src_of(r)).unwrap();
+            writeln!(
+                out,
+                "    {}if !({c}) {{ ail_rt::contract(\"requires\", {:?}, {:?}); }}",
+                self.mark(r),
+                f.name,
+                self.src_of(r)
+            )
+            .unwrap();
         }
         let body = self.block_as(&f.body, sig.ret == Ty::Unit);
         if f.ensures.is_empty() {
             writeln!(out, "    let __r: {ret} = {body};\n    __r\n}}").unwrap();
         } else {
-            writeln!(out, "    let __ret: {ret} = (|| -> {ret} {{ let __r: {ret} = {body}; __r }})();").unwrap();
+            writeln!(
+                out,
+                "    let __ret: {ret} = (|| -> {ret} {{ let __r: {ret} = {body}; __r }})();"
+            )
+            .unwrap();
             writeln!(out, "    {{ let v_result = &__ret;").unwrap();
             for en in &f.ensures {
                 let c = self.val(en);
-                writeln!(out, "    {}if !({c}) {{ ail_rt::contract(\"ensures\", {:?}, {:?}); }}", self.mark(en), f.name, self.src_of(en)).unwrap();
+                writeln!(
+                    out,
+                    "    {}if !({c}) {{ ail_rt::contract(\"ensures\", {:?}, {:?}); }}",
+                    self.mark(en),
+                    f.name,
+                    self.src_of(en)
+                )
+                .unwrap();
             }
             writeln!(out, "    }}\n    __ret\n}}").unwrap();
         }
@@ -423,7 +585,9 @@ impl<'a> Emitter<'a> {
     }
 
     fn field_access(&self, base_code: &str, base: &Expr, f: &str) -> String {
-        let Ty::User(sn) = self.ty(base) else { unreachable!() };
+        let Ty::User(sn) = self.ty(base) else {
+            unreachable!()
+        };
         let si = &self.ck.info.structs[sn];
         let idx = si.fields.iter().position(|x| x.0 == f).unwrap();
         if self.ck.info.is_boxed(sn, NO_VARIANT, idx) {
@@ -450,6 +614,14 @@ impl<'a> Emitter<'a> {
         self.rvalue(e)
     }
 
+    /// `&str` for a message argument: a literal stays static, so hot paths never allocate it.
+    fn msg(&mut self, e: &Expr) -> String {
+        match &e.kind {
+            ExprKind::Str(s) => format!("{s:?}"),
+            _ => self.rf(e),
+        }
+    }
+
     /// `&T` to the expression's value.
     fn rf(&mut self, e: &Expr) -> String {
         match self.place(e) {
@@ -467,7 +639,8 @@ impl<'a> Emitter<'a> {
     }
 
     fn mut_place(&mut self, a: &Arg) -> String {
-        self.place(a.expr()).expect("checker guarantees mutable places")
+        self.place(a.expr())
+            .expect("checker guarantees mutable places")
     }
 
     pub fn block(&mut self, es: &[Expr]) -> String {
@@ -485,7 +658,11 @@ impl<'a> Emitter<'a> {
                     let b = self.ck.decl[&(e.id as usize)];
                     let bi = &self.ck.bindings[b];
                     let name = self.local_name(&bi.name);
-                    let ann = if bi.ty.is_err() { String::new() } else { format!(": {}", rty(&bi.ty)) };
+                    let ann = if bi.ty.is_err() {
+                        String::new()
+                    } else {
+                        format!(": {}", rty(&bi.ty))
+                    };
                     let v = self.val(value);
                     let mu = if *mutable { "mut " } else { "" };
                     writeln!(o, "{m}let {mu}{name}{ann} = {v};").unwrap();
@@ -550,6 +727,9 @@ impl<'a> Emitter<'a> {
             },
             ExprKind::Let { .. } => format!("{{ {} }}", self.block(std::slice::from_ref(e))),
             ExprKind::Set(place, value) => {
+                if let Some(code) = self.append_in_place(place, value) {
+                    return code;
+                }
                 let v = self.val(value);
                 let p = self.place(place).expect("checked place");
                 format!("{{ let __v = {v}; {p} = __v; }}")
@@ -581,7 +761,23 @@ impl<'a> Emitter<'a> {
                         let z = self.val(z);
                         format!("{a}..{z}")
                     }
-                    ForIter::Each(v) => format!("{}.iter()", self.pv(v)),
+                    // (for w (split text sep) ...) streams the pieces instead of building a Vec.
+                    ForIter::Each(v) => match &v.kind {
+                        ExprKind::Call(n, _, args)
+                            if n == "split"
+                                && args.len() == 2
+                                && !matches!(self.ck.res.get(v.id as usize), Some(Res::UserFn(_)))
+                                && !self.body_mutates(body, args[0].expr()) =>
+                        {
+                            let s = self.rf(args[0].expr());
+                            let sep = self.rf(args[1].expr());
+                            let bd = self.block(body);
+                            return format!(
+                                "{{ let mut __buf = String::new(); for __p in ail_rt::split_iter({s}, {sep}) {{ __buf.clear(); __buf.push_str(__p); let {var} = &__buf; let _ = {bd}; }} }}"
+                            );
+                        }
+                        _ => format!("{}.iter()", self.pv(v)),
+                    },
                 };
                 let bd = self.block(body);
                 format!("for {var} in {head} {{ let _ = {bd}; }}")
@@ -599,19 +795,29 @@ impl<'a> Emitter<'a> {
                 for (f, _, v) in fields {
                     let idx = si.fields.iter().position(|x| &x.0 == f).unwrap();
                     let code = self.val(v);
-                    let code = if self.ck.info.is_boxed(name, NO_VARIANT, idx) { format!("Box::new({code})") } else { code };
+                    let code = if self.ck.info.is_boxed(name, NO_VARIANT, idx) {
+                        format!("Box::new({code})")
+                    } else {
+                        code
+                    };
                     parts.push(format!("{}: {}", mangle(f), code));
                 }
                 format!("{} {{ {} }}", ty_name(name), parts.join(", "))
             }
             ExprKind::With(base, fields) => {
-                let Ty::User(name) = self.ty(base).clone() else { unreachable!() };
+                let Ty::User(name) = self.ty(base).clone() else {
+                    unreachable!()
+                };
                 let si = self.ck.info.structs[&name].clone();
                 let mut parts = Vec::new();
                 for (f, _, v) in fields {
                     let idx = si.fields.iter().position(|x| &x.0 == f).unwrap();
                     let code = self.val(v);
-                    let code = if self.ck.info.is_boxed(&name, NO_VARIANT, idx) { format!("Box::new({code})") } else { code };
+                    let code = if self.ck.info.is_boxed(&name, NO_VARIANT, idx) {
+                        format!("Box::new({code})")
+                    } else {
+                        code
+                    };
                     parts.push(format!("{}: {}", mangle(f), code));
                 }
                 let b = self.val(base);
@@ -639,7 +845,11 @@ impl<'a> Emitter<'a> {
                     let mut parts = Vec::new();
                     for (i, a) in args.iter().enumerate() {
                         let code = self.val(a.expr());
-                        parts.push(if self.ck.info.is_boxed(&en, vi, i) { format!("Box::new({code})") } else { code });
+                        parts.push(if self.ck.info.is_boxed(&en, vi, i) {
+                            format!("Box::new({code})")
+                        } else {
+                            code
+                        });
                     }
                     format!("{}::{}({})", ty_name(&en), mangle(&v), parts.join(", "))
                 }
@@ -692,14 +902,88 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// The local a place-like expression reads from (`x`, `(. x f)`, `(at x i)`, `(get x k)`).
+    fn root_of(&self, e: &Expr) -> Option<BindId> {
+        match &e.kind {
+            ExprKind::Var(_) => match self.ck.res[e.id as usize] {
+                Res::Local(b) => Some(b),
+                _ => None,
+            },
+            ExprKind::Field(b, _, _) => self.root_of(b),
+            ExprKind::Call(n, _, args)
+                if matches!(n.as_str(), "at" | "get" | "last") && !args.is_empty() =>
+            {
+                self.root_of(args[0].expr())
+            }
+            _ => None,
+        }
+    }
+
+    /// True if any arm assigns to `b` or passes it as `(mut ...)`.
+    fn arms_mutate(&self, arms: &[Arm], b: BindId) -> bool {
+        let mut hit = false;
+        for arm in arms {
+            for x in &arm.body {
+                crate::check::walk(x, &mut |e| match &e.kind {
+                    ExprKind::Set(p, _) if self.root_of(p) == Some(b) => hit = true,
+                    ExprKind::Call(_, _, args) => {
+                        for a in args {
+                            if let Arg::Mut(x, _) = a {
+                                if self.root_of(x) == Some(b) {
+                                    hit = true;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                });
+            }
+        }
+        hit
+    }
+
+    /// True if `body` assigns to or passes as `(mut ...)` the variable `e` reads from.
+    fn body_mutates(&self, body: &[Expr], e: &Expr) -> bool {
+        let Some(b) = self.root_of(e) else { return !matches!(e.kind, ExprKind::Str(_)) };
+        let arm = Arm { pat: Pat::Wild(e.span), body: body.to_vec(), span: e.span };
+        self.arms_mutate(std::slice::from_ref(&arm), b)
+    }
+
     fn emit_match(&mut self, scrut: &Expr, arms: &[Arm], unit: bool) -> String {
-        let s = self.rf(scrut);
+        // Pattern bindings are read-only views of the scrutinee. Borrow it unless an arm
+        // mutates the variable it comes from; then the arms see a snapshot (value semantics).
+        let mutated = self
+            .root_of(scrut)
+            .is_some_and(|b| self.arms_mutate(arms, b));
+        let s = match &scrut.kind {
+            ExprKind::Call(n, _, args)
+                if !mutated
+                    && (n == "get" || n == "last")
+                    && self.place(args[0].expr()).is_some() =>
+            {
+                let base = self.pv(args[0].expr());
+                if n == "get" {
+                    format!("{base}.get({})", self.rf(args[1].expr()))
+                } else {
+                    format!("{base}.last()")
+                }
+            }
+            _ if mutated => match self.place(scrut) {
+                Some(p) => format!("&({p}.clone())"),
+                None => self.rf(scrut),
+            },
+            _ => self.rf(scrut),
+        };
         let st = self.ty(scrut).clone();
         let mut o = format!("match {s} {{\n");
         for arm in arms {
             let mut guards = Vec::new();
             let p = self.pat(&arm.pat, &st, &mut guards);
-            let g = if guards.is_empty() { String::new() } else { format!(" if {}", guards.join(" && ")) };
+            let g = if guards.is_empty() {
+                String::new()
+            } else {
+                format!(" if {}", guards.join(" && "))
+            };
             let body = self.block_as(&arm.body, unit);
             writeln!(o, "{p}{g} => {body},").unwrap();
         }
@@ -718,7 +1002,10 @@ impl<'a> Emitter<'a> {
                 let _ = n;
                 self.local_name(&self.ck.bindings[b].name)
             }
-            Pat::Int(v, _) => self.lit_int(*v, t).trim_matches(|c| c == '(' || c == ')').to_string(),
+            Pat::Int(v, _) => self
+                .lit_int(*v, t)
+                .trim_matches(|c| c == '(' || c == ')')
+                .to_string(),
             Pat::Str(s, _) => {
                 let v = self.fresh();
                 guards.push(format!("{v}.as_str() == {s:?}"));
@@ -739,7 +1026,11 @@ impl<'a> Emitter<'a> {
                     if ei.variants[vi].1.is_empty() {
                         path
                     } else {
-                        let ps: Vec<String> = subs.iter().zip(ei.variants[vi].1.iter()).map(|(sp, st)| self.pat(sp, st, guards)).collect();
+                        let ps: Vec<String> = subs
+                            .iter()
+                            .zip(ei.variants[vi].1.iter())
+                            .map(|(sp, st)| self.pat(sp, st, guards))
+                            .collect();
                         format!("{path}({})", ps.join(", "))
                     }
                 }
@@ -761,7 +1052,9 @@ impl<'a> Emitter<'a> {
                 if args.len() == 1 {
                     let v = self.val(a(0));
                     match &t {
-                        Ty::Int(k) if matches!(k, IntK::U8 | IntK::U16 | IntK::U32 | IntK::U64) => format!("(0{} - {v})", k.rust()),
+                        Ty::Int(k) if matches!(k, IntK::U8 | IntK::U16 | IntK::U32 | IntK::U64) => {
+                            format!("(0{} - {v})", k.rust())
+                        }
                         _ => format!("(-{v})"),
                     }
                 } else {
@@ -786,10 +1079,20 @@ impl<'a> Emitter<'a> {
             "bit-and" => format!("({} & {})", self.val(a(0)), self.val(a(1))),
             "bit-or" => format!("({} | {})", self.val(a(0)), self.val(a(1))),
             "bit-xor" => format!("({} ^ {})", self.val(a(0)), self.val(a(1))),
-            "shl" => format!("ail_rt::ShiftAil::checked_shl_ail({}, ail_rt::icast::<_, u32>({}))", self.val(a(0)), self.val(a(1))),
-            "shr" => format!("ail_rt::ShiftAil::checked_shr_ail({}, ail_rt::icast::<_, u32>({}))", self.val(a(0)), self.val(a(1))),
+            "shl" => format!(
+                "ail_rt::ShiftAil::checked_shl_ail({}, ail_rt::icast::<_, u32>({}))",
+                self.val(a(0)),
+                self.val(a(1))
+            ),
+            "shr" => format!(
+                "ail_rt::ShiftAil::checked_shr_ail({}, ail_rt::icast::<_, u32>({}))",
+                self.val(a(0)),
+                self.val(a(1))
+            ),
             "abs" => match &t {
-                Ty::Int(k) if matches!(k, IntK::U8 | IntK::U16 | IntK::U32 | IntK::U64) => self.val(a(0)),
+                Ty::Int(k) if matches!(k, IntK::U8 | IntK::U16 | IntK::U32 | IntK::U64) => {
+                    self.val(a(0))
+                }
                 _ => format!("({}).abs()", self.val(a(0))),
             },
             "min" | "max" => {
@@ -806,7 +1109,9 @@ impl<'a> Emitter<'a> {
                     format!("({}).powf({})", self.val(a(0)), self.val(a(1)))
                 }
             }
-            "sqrt" | "floor" | "ceil" | "round" | "sin" | "cos" | "tan" | "exp" | "ln" => format!("({}).{name}()", self.val(a(0))),
+            "sqrt" | "floor" | "ceil" | "round" | "sin" | "cos" | "tan" | "exp" | "ln" => {
+                format!("({}).{name}()", self.val(a(0)))
+            }
             "atan2" => format!("({}).atan2({})", self.val(a(0)), self.val(a(1))),
             "str" => self.format(args),
             "print" | "println" | "eprintln" => {
@@ -848,7 +1153,9 @@ impl<'a> Emitter<'a> {
                 let i = self.val(a(1));
                 let x = self.val(a(2));
                 let p = self.mut_place(&args[0]);
-                format!("{{ let __i = ail_rt::ix_incl({i}); let __x = {x}; {p}.insert(__i, __x); }}")
+                format!(
+                    "{{ let __i = ail_rt::ix_incl({i}); let __x = {x}; {p}.insert(__i, __x); }}"
+                )
             }
             "remove-at" => {
                 let i = self.val(a(1));
@@ -859,7 +1166,9 @@ impl<'a> Emitter<'a> {
                 let i = self.val(a(1));
                 let j = self.val(a(2));
                 let p = self.mut_place(&args[0]);
-                format!("{{ let __i = ail_rt::ix({i}); let __j = ail_rt::ix({j}); {p}.swap(__i, __j); }}")
+                format!(
+                    "{{ let __i = ail_rt::ix({i}); let __j = ail_rt::ix({j}); {p}.swap(__i, __j); }}"
+                )
             }
             "clear" => format!("{}.clear()", self.mut_place(&args[0])),
             "extend" => {
@@ -867,7 +1176,12 @@ impl<'a> Emitter<'a> {
                 let p = self.mut_place(&args[0]);
                 format!("{{ let __x = {x}; {p}.extend(__x); }}")
             }
-            "slice" => format!("ail_rt::slice({}, {}, {})", self.rf(a(0)), self.val(a(1)), self.val(a(2))),
+            "slice" => format!(
+                "ail_rt::slice({}, {}, {})",
+                self.rf(a(0)),
+                self.val(a(1)),
+                self.val(a(2))
+            ),
             "concat" => format!("ail_rt::concat({}, {})", self.rf(a(0)), self.rf(a(1))),
             "contains" => {
                 if at(self, 0) == Ty::Str {
@@ -878,7 +1192,11 @@ impl<'a> Emitter<'a> {
             }
             "index-of" => {
                 if at(self, 0) == Ty::Str {
-                    format!("{}.find({}.as_str()).map(|i| i as i64)", self.pv(a(0)), self.pv(a(1)))
+                    format!(
+                        "{}.find({}.as_str()).map(|i| i as i64)",
+                        self.pv(a(0)),
+                        self.pv(a(1))
+                    )
                 } else {
                     format!("ail_rt::index_of({}, {})", self.rf(a(0)), self.rf(a(1)))
                 }
@@ -892,7 +1210,9 @@ impl<'a> Emitter<'a> {
                 if el.is_float() {
                     format!("{p}.sort_unstable_by(|a, b| a.total_cmp(b))")
                 } else if !matches!(el, Ty::Int(_) | Ty::Str | Ty::Bool) {
-                    format!("{p}.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))")
+                    format!(
+                        "{p}.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))"
+                    )
                 } else {
                     format!("{p}.sort_unstable()")
                 }
@@ -907,7 +1227,9 @@ impl<'a> Emitter<'a> {
                 if el.is_float() {
                     format!("{p}.sort_by(|a, b| b.total_cmp(a))")
                 } else {
-                    format!("{p}.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal))")
+                    format!(
+                        "{p}.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal))"
+                    )
                 }
             }
             "sum" => format!("{}.iter().sum::<{}>()", self.pv(a(0)), rty(&t)),
@@ -925,7 +1247,9 @@ impl<'a> Emitter<'a> {
                     let kr = self.rf(a(1));
                     let k = self.val(a(1));
                     let p = self.mut_place(&args[0]);
-                    format!("{{ let __v = {v}; match {p}.get_mut({kr}) {{ Some(__s) => *__s = __v, None => {{ {p}.insert({k}, __v); }} }} }}")
+                    format!(
+                        "{{ let __v = {v}; match {p}.get_mut({kr}) {{ Some(__s) => *__s = __v, None => {{ {p}.insert({k}, __v); }} }} }}"
+                    )
                 }
             }
             "get" => format!("{}.get({}).cloned()", self.pv(a(0)), self.rf(a(1))),
@@ -942,29 +1266,53 @@ impl<'a> Emitter<'a> {
             "err" => format!("Err({})", self.val(a(0))),
             "unwrap-or" => format!("({}).unwrap_or({})", self.val(a(0)), self.val(a(1))),
             "expect" => {
-                let f = if matches!(at(self, 0), Ty::Opt(_)) { "expect_opt" } else { "expect_res" };
-                format!("ail_rt::{f}({}, {})", self.val(a(0)), self.rf(a(1)))
+                let f = if matches!(at(self, 0), Ty::Opt(_)) {
+                    "expect_opt"
+                } else {
+                    "expect_res"
+                };
+                format!("ail_rt::{f}({}, {})", self.val(a(0)), self.msg(a(1)))
             }
             "is-some" => format!("{}.is_some()", self.pv(a(0))),
             "is-none" => format!("{}.is_none()", self.pv(a(0))),
             "is-ok" => format!("{}.is_ok()", self.pv(a(0))),
             "is-err" => format!("{}.is_err()", self.pv(a(0))),
-            "substr" => format!("ail_rt::substr({}, {}, {})", self.rf(a(0)), self.val(a(1)), self.val(a(2))),
+            "substr" => format!(
+                "ail_rt::substr({}, {}, {})",
+                self.rf(a(0)),
+                self.val(a(1)),
+                self.val(a(2))
+            ),
             "split" => format!("ail_rt::split({}, {})", self.rf(a(0)), self.rf(a(1))),
             "trim" => format!("{}.trim().to_string()", self.pv(a(0))),
-            "upper" => format!("{}.to_uppercase()", self.pv(a(0))),
-            "lower" => format!("{}.to_lowercase()", self.pv(a(0))),
+            // A temporary argument is converted in place instead of copied.
+            "upper" | "lower" if self.place(a(0)).is_none() => format!("ail_rt::{name}_owned({})", self.val(a(0))),
+            "upper" => format!("ail_rt::upper({})", self.rf(a(0))),
+            "lower" => format!("ail_rt::lower({})", self.rf(a(0))),
             "starts-with" => format!("{}.starts_with({}.as_str())", self.pv(a(0)), self.pv(a(1))),
             "ends-with" => format!("{}.ends_with({}.as_str())", self.pv(a(0)), self.pv(a(1))),
-            "replace" => format!("{}.replace({}.as_str(), {}.as_str())", self.pv(a(0)), self.pv(a(1)), self.pv(a(2))),
+            "replace" => format!(
+                "{}.replace({}.as_str(), {}.as_str())",
+                self.pv(a(0)),
+                self.pv(a(1)),
+                self.pv(a(2))
+            ),
             "join" => format!("{}.join({}.as_str())", self.pv(a(0)), self.pv(a(1))),
             "parse-i64" => format!("{}.trim().parse::<i64>().ok()", self.pv(a(0))),
             "parse-f64" => format!("{}.trim().parse::<f64>().ok()", self.pv(a(0))),
             "chars" => format!("ail_rt::chars({})", self.rf(a(0))),
             "byte-at" => format!("ail_rt::byte_at({}, {})", self.rf(a(0)), self.val(a(1))),
-            "fmt-float" => format!("format!(\"{{:.*}}\", ail_rt::count({}), {})", self.val(a(1)), self.val(a(0))),
+            "fmt-float" => format!(
+                "format!(\"{{:.*}}\", ail_rt::count({}), {})",
+                self.val(a(1)),
+                self.val(a(0))
+            ),
             "from-code" => format!("ail_rt::from_code({})", self.val(a(0))),
-            "repeat" => format!("{}.repeat(ail_rt::count({}))", self.pv(a(0)), self.val(a(1))),
+            "repeat" => format!(
+                "{}.repeat(ail_rt::count({}))",
+                self.pv(a(0)),
+                self.val(a(1))
+            ),
             "read-line" => "ail_rt::read_line()".into(),
             "read-file" => format!("ail_rt::read_file({}, {})", self.rf(a(1)), self.val(a(2))),
             "write-file" => format!("ail_rt::write_file({}, {})", self.rf(a(1)), self.rf(a(2))),
@@ -974,31 +1322,145 @@ impl<'a> Emitter<'a> {
             "rand-f64" => "ail_rt::rand_f64()".into(),
             "args" => "ail_rt::args()".into(),
             "read-all" => "ail_rt::read_all()".into(),
-            "draw-clear" => format!("ail_web::clear({})", self.rf(a(1))),
-            "draw-rect" => format!("ail_web::rect({}, {}, {}, {}, {})", self.val(a(1)), self.val(a(2)), self.val(a(3)), self.val(a(4)), self.rf(a(5))),
-            "draw-circle" => format!("ail_web::circle({}, {}, {}, {})", self.val(a(1)), self.val(a(2)), self.val(a(3)), self.rf(a(4))),
-            "draw-line" => format!("ail_web::line({}, {}, {}, {}, {}, {})", self.val(a(1)), self.val(a(2)), self.val(a(3)), self.val(a(4)), self.val(a(5)), self.rf(a(6))),
-            "draw-text" => format!("ail_web::text({}, {}, {}, {}, {})", self.val(a(1)), self.val(a(2)), self.val(a(3)), self.rf(a(4)), self.rf(a(5))),
+            "draw-clear" => format!("ail_web::clear({})", self.msg(a(1))),
+            "draw-rect" => format!(
+                "ail_web::rect({}, {}, {}, {}, {})",
+                self.val(a(1)),
+                self.val(a(2)),
+                self.val(a(3)),
+                self.val(a(4)),
+                self.msg(a(5))
+            ),
+            "draw-circle" => format!(
+                "ail_web::circle({}, {}, {}, {})",
+                self.val(a(1)),
+                self.val(a(2)),
+                self.val(a(3)),
+                self.msg(a(4))
+            ),
+            "draw-line" => format!(
+                "ail_web::line({}, {}, {}, {}, {}, {})",
+                self.val(a(1)),
+                self.val(a(2)),
+                self.val(a(3)),
+                self.val(a(4)),
+                self.val(a(5)),
+                self.msg(a(6))
+            ),
+            "draw-text" => format!(
+                "ail_web::text({}, {}, {}, {}, {})",
+                self.val(a(1)),
+                self.val(a(2)),
+                self.val(a(3)),
+                self.msg(a(4)),
+                self.msg(a(5))
+            ),
             "lines" => format!("ail_rt::lines({})", self.rf(a(0))),
-            "is-digit" => format!("ail_rt::all_chars({}, |c| c.is_ascii_digit())", self.rf(a(0))),
-            "is-alpha" => format!("ail_rt::all_chars({}, |c| c.is_alphabetic())", self.rf(a(0))),
-            "is-alnum" => format!("ail_rt::all_chars({}, |c| c.is_alphanumeric())", self.rf(a(0))),
-            "is-space" => format!("ail_rt::all_chars({}, |c| c.is_whitespace())", self.rf(a(0))),
+            "is-digit" => format!(
+                "ail_rt::all_chars({}, |c| c.is_ascii_digit())",
+                self.rf(a(0))
+            ),
+            "is-alpha" => format!(
+                "ail_rt::all_chars({}, |c| c.is_alphabetic())",
+                self.rf(a(0))
+            ),
+            "is-alnum" => format!(
+                "ail_rt::all_chars({}, |c| c.is_alphanumeric())",
+                self.rf(a(0))
+            ),
+            "is-space" => format!(
+                "ail_rt::all_chars({}, |c| c.is_whitespace())",
+                self.rf(a(0))
+            ),
             "is-upper" => format!("ail_rt::all_chars({}, |c| c.is_uppercase())", self.rf(a(0))),
             "is-lower" => format!("ail_rt::all_chars({}, |c| c.is_lowercase())", self.rf(a(0))),
             "code-of" => format!("ail_rt::code_of({})", self.rf(a(0))),
             "json-parse" => format!("ail_json::parse({})", self.rf(a(0))),
-            "json-str" => format!("ail_json::to_string({})", self.rf(a(0))),
+            "json-str" if at(self, 0) == Ty::User("Json".into()) => format!("ail_json::to_string({})", self.rf(a(0))),
+            // (json-str (slice v a b)) encodes the range in place, without copying it out.
+            "json-str" if matches!(&a(0).kind, ExprKind::Call(n, _, xs) if n == "slice" && xs.len() == 3) => {
+                let ExprKind::Call(_, _, xs) = &a(0).kind else { unreachable!() };
+                format!("ail_json::encode(ail_rt::slice_ref({}, {}, {}))", self.rf(xs[0].expr()), self.val(xs[1].expr()), self.val(xs[2].expr()))
+            }
+            "json-str" => format!("ail_json::encode({})", self.rf(a(0))),
             "http-next" => format!("ail_http::next({}, {})", self.val(a(1)), self.val(a(2))),
-            "http-respond" => format!("ail_http::respond({}, {}, {}, {})", self.rf(a(1)), self.val(a(2)), self.rf(a(3)), self.rf(a(4))),
-            "fail" => format!("ail_rt::fail({})", self.rf(a(0))),
+            "http-respond" => format!(
+                "ail_http::respond({}, {}, {}, {})",
+                self.rf(a(1)),
+                self.val(a(2)),
+                self.rf(a(3)),
+                self.rf(a(4))
+            ),
+            "fail" => format!("ail_rt::fail({})", self.msg(a(0))),
             "assert" => {
                 let c = self.val(a(0));
-                let msg = if args.len() == 2 { self.rf(a(1)) } else { format!("&String::from({:?})", self.src_of(a(0))) };
+                let msg = if args.len() == 2 {
+                    self.msg(a(1))
+                } else {
+                    format!("{:?}", self.src_of(a(0)))
+                };
                 format!("if !{c} {{ ail_rt::assert_fail({msg}) }}")
             }
             other => unreachable!("builtin {other}"),
         }
+    }
+
+    /// `(set s (str s a b ...))` appends to `s` in place instead of rebuilding it, so building
+    /// a string in a loop is linear. Only when the appended parts don't read `s` itself.
+    fn append_in_place(&mut self, place: &Expr, value: &Expr) -> Option<String> {
+        let ExprKind::Call(n, _, args) = &value.kind else {
+            return None;
+        };
+        if n != "str"
+            || args.len() < 2
+            || self.ty(place) != &Ty::Str
+            || matches!(self.ck.res.get(value.id as usize), Some(Res::UserFn(_)))
+        {
+            return None;
+        }
+        let p = self.place(place)?;
+        if self.place(args[0].expr()).as_deref() != Some(p.as_str()) {
+            return None;
+        }
+        let root = self.root_of(place)?;
+        let mut reads_root = false;
+        for a in &args[1..] {
+            crate::check::walk(a.expr(), &mut |e| {
+                if matches!(e.kind, ExprKind::Var(_))
+                    && matches!(self.ck.res[e.id as usize], Res::Local(b) if b == root)
+                {
+                    reads_root = true;
+                }
+            });
+        }
+        if reads_root {
+            return None;
+        }
+        let (fmt, vals) = self.format_parts(&args[1..]);
+        Some(if vals.is_empty() {
+            format!("{p}.push_str({fmt:?});")
+        } else {
+            format!(
+                "{{ use std::fmt::Write as _; let _ = write!({p}, {fmt:?}, {}); }}",
+                vals.join(", ")
+            )
+        })
+    }
+
+    fn format_parts(&mut self, args: &[Arg]) -> (String, Vec<String>) {
+        let mut fmt = String::new();
+        let mut vals = Vec::new();
+        for x in args {
+            let ex = x.expr();
+            if let ExprKind::Str(s) = &ex.kind {
+                fmt.push_str(&s.replace('{', "{{").replace('}', "}}"));
+                continue;
+            }
+            let t = self.ty(ex).clone();
+            fmt.push_str(if t.is_float() { "{:?}" } else { "{}" });
+            vals.push(self.pv(ex));
+        }
+        (fmt, vals)
     }
 
     fn format(&mut self, args: &[Arg]) -> String {

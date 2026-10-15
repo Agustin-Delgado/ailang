@@ -37,7 +37,11 @@ impl SExpr {
 }
 
 pub fn read(src: &str) -> Result<Vec<SExpr>, Diag> {
-    let mut r = Reader { b: src.as_bytes(), src, pos: 0 };
+    let mut r = Reader {
+        b: src.as_bytes(),
+        src,
+        pos: 0,
+    };
     let mut out = Vec::new();
     loop {
         r.skip_ws();
@@ -89,17 +93,26 @@ impl<'a> Reader<'a> {
                             Span::new(start, start + 1),
                             "unclosed '(': reached end of file",
                         )
-                        .with_fix_insert(self.b.len(), ")", "close the list"));
+                        .with_fix_insert(
+                            self.b.len(),
+                            ")",
+                            "close the list",
+                        ));
                     }
                     if self.b[self.pos] == b')' {
                         self.pos += 1;
-                        return Ok(SExpr { kind: SKind::List(items), span: Span::new(start, self.pos) });
+                        return Ok(SExpr {
+                            kind: SKind::List(items),
+                            span: Span::new(start, self.pos),
+                        });
                     }
                     items.push(self.expr()?);
                 }
             }
-            b')' => Err(Diag::error("E0002", Span::new(start, start + 1), "unexpected ')'")
-                .with_fix_replace(Span::new(start, start + 1), "", "remove the extra ')'")),
+            b')' => Err(
+                Diag::error("E0002", Span::new(start, start + 1), "unexpected ')'")
+                    .with_fix_replace(Span::new(start, start + 1), "", "remove the extra ')'"),
+            ),
             b'"' => self.string(),
             _ => {
                 while self.pos < self.b.len() && !is_delim(self.b[self.pos]) {
@@ -107,7 +120,10 @@ impl<'a> Reader<'a> {
                 }
                 let text = &self.src[start..self.pos];
                 let span = Span::new(start, self.pos);
-                Ok(SExpr { kind: atom(text, span)?, span })
+                Ok(SExpr {
+                    kind: atom(text, span)?,
+                    span,
+                })
             }
         }
     }
@@ -118,8 +134,12 @@ impl<'a> Reader<'a> {
         let mut s = String::new();
         loop {
             if self.pos >= self.b.len() {
-                return Err(Diag::error("E0003", Span::new(start, start + 1), "unterminated string literal")
-                    .with_fix_insert(self.b.len(), "\"", "close the string"));
+                return Err(Diag::error(
+                    "E0003",
+                    Span::new(start, start + 1),
+                    "unterminated string literal",
+                )
+                .with_fix_insert(self.b.len(), "\"", "close the string"));
             }
             let ch = self.src[self.pos..].chars().next().unwrap();
             self.pos += ch.len_utf8();
@@ -143,7 +163,9 @@ impl<'a> Reader<'a> {
                             let close = rest.find('}');
                             let ok = rest.starts_with('{') && close.is_some();
                             let parsed = if ok {
-                                u32::from_str_radix(&rest[1..close.unwrap()], 16).ok().and_then(char::from_u32)
+                                u32::from_str_radix(&rest[1..close.unwrap()], 16)
+                                    .ok()
+                                    .and_then(char::from_u32)
                             } else {
                                 None
                             };
@@ -157,7 +179,7 @@ impl<'a> Reader<'a> {
                                         "E0004",
                                         Span::new(esc_start, self.pos),
                                         "invalid unicode escape; expected \\u{HEX}",
-                                    ))
+                                    ));
                                 }
                             }
                         }
@@ -165,22 +187,29 @@ impl<'a> Reader<'a> {
                             return Err(Diag::error(
                                 "E0004",
                                 Span::new(esc_start, self.pos),
-                                &format!("unknown escape '\\{other}'; valid: \\n \\t \\r \\0 \\\\ \\\" \\u{{HEX}}"),
-                            ))
+                                &format!(
+                                    "unknown escape '\\{other}'; valid: \\n \\t \\r \\0 \\\\ \\\" \\u{{HEX}}"
+                                ),
+                            ));
                         }
                     }
                 }
                 c => s.push(c),
             }
         }
-        Ok(SExpr { kind: SKind::Str(s), span: Span::new(start, self.pos) })
+        Ok(SExpr {
+            kind: SKind::Str(s),
+            span: Span::new(start, self.pos),
+        })
     }
 }
 
 fn atom(text: &str, span: Span) -> Result<SKind, Diag> {
     let first = text.as_bytes()[0];
-    let numeric_start =
-        first.is_ascii_digit() || ((first == b'-' || first == b'+') && text.len() > 1 && text.as_bytes()[1].is_ascii_digit());
+    let numeric_start = first.is_ascii_digit()
+        || ((first == b'-' || first == b'+')
+            && text.len() > 1
+            && text.as_bytes()[1].is_ascii_digit());
     if !numeric_start {
         return Ok(SKind::Sym(text.to_string()));
     }

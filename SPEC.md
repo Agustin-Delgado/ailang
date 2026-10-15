@@ -78,6 +78,9 @@ write `(mut place)` at the call site. A place that is passed as `(mut ...)` cann
 any other argument of the same call (no aliasing). Bindings made with `let`, loop variables
 and pattern bindings are read-only; use `var` to mutate. You cannot mutate a Vec while
 iterating it with `for x xs`; iterate by index instead.
+Reading never copies: `for x xs`, `(match (get m k) ...)`, `(match (at v i) ...)` and passing a
+value to a non-`mut` parameter all look at the data in place. Copies happen only when a value is
+stored somewhere new (`let`/`var`, `push`, `put`, a struct field).
 
 ## Effects are capabilities
 
@@ -111,6 +114,9 @@ Arithmetic and logic: `(+ a b ...)` `(- a b)` `(- a)` `(* a b ...)` `(/ a b)` `(
 `(bit-and a b)` `(bit-or a b)` `(bit-xor a b)` `(shl a n)` `(shr a n)` `(abs x)` `(min a b)` `(max a b)`
 `(pow b e)` (int: e is U32) `(sqrt x)` `(floor x)` `(ceil x)` `(round x)` `(sin x)` `(cos x)` `(tan x)`
 `(atan2 y x)` `(exp x)` `(ln x)`. Operands of one operator must have the same type; convert with `as`.
+`(+ a b c)` evaluates left to right as `((a + b) + c)`. Floats are IEEE-754 and never fused
+(no multiply-add contraction), so float results are the same on every platform.
+`(as T x)` checks `x` with its own type first, then converts: `(as F64 (% n 1000))` is integer `%`.
 
 Text: `(str a b ...)` concatenates numbers, Bool and Str into a Str. `(len s)` (bytes) `(substr s start end)`
 `(split s sep)` -> `(Vec Str)` `(join xs sep)` `(trim s)` `(upper s)` `(lower s)` `(starts-with s p)`
@@ -124,6 +130,8 @@ Characters: `(is-digit s)` `(is-alpha s)` `(is-alnum s)` `(is-space s)` `(is-upp
 ` (a trailing newline does not add an empty line; `
 ` is removed).
 Floats print in full precision with `str`/`println` (`2.5`, `0.1`, `1.0`).
+To build a long string, append in place: `(set s (str s part ...))` grows `s` without copying it
+(linear time), or collect the parts in a `(Vec Str)` and `join` them.
 
 Vec: `(vec a b ...)` `(fill n x)` `(len v)` `(is-empty v)` `(at v i)` `(push (mut v) x)` `(pop (mut v))` -> Option
 `(last v)` -> Option `(insert-at (mut v) i x)` `(remove-at (mut v) i)` -> T `(swap (mut v) i j)` `(clear (mut v))`
@@ -172,7 +180,11 @@ Drawing (pixels as F64, colors as CSS strings): `(draw-clear g color)` `(draw-re
   (Click Str) (Input Str Str) (Resize F64 F64))      ; Tick carries seconds since the last frame
 ```
 
-`(json-parse text)` -> `(Result Json Str)`, `(json-str j)` -> Str (compact, object keys sorted).
+`(json-parse text)` -> `(Result Json Str)`, `(json-str j)` -> Str (compact, object keys sorted;
+numbers in shortest round-trip form, integral values without a fraction: `3`, `2.5`, `-0.0025`).
+`json-str` also encodes typed values directly, which is the fast way to write responses: numbers,
+Bool, Str, Vec, Option (`none` is `null`), `(Map Str V)` and structs of those (an object with the
+fields in name order): `(json-str (new Point (x 1) (y 2)))` is `{"x":1,"y":2}`.
 Request `path` and `query` are URL-decoded; header names are lowercase. A server is a loop:
 
 ```

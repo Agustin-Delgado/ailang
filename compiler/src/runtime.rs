@@ -5,8 +5,9 @@ pub const RUNTIME: &str = r####"
 static AIL_ALLOC: ail_alloc::SizeClassAlloc = ail_alloc::SizeClassAlloc;
 
 /// Size-class allocator: small blocks come from per-class free lists carved out of large chunks,
-/// so allocating and freeing a small value is a couple of instructions. ail programs are
-/// single-threaded (v0.1), which lets the free lists live without locks.
+/// so allocating and freeing a small value is a couple of instructions. Each thread has its own
+/// free lists (no locks); a block freed on another thread joins that thread's list, which is safe
+/// because chunks are never returned and every list holds blocks of one size class.
 #[allow(dead_code)]
 mod ail_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -19,9 +20,11 @@ mod ail_alloc {
     const CHUNK: usize = 1 << 20;
 
     struct State { free: [*mut u8; NCLASSES], bump: *mut u8, end: *mut u8 }
-    struct Cell(UnsafeCell<State>);
-    unsafe impl Sync for Cell {}
-    static STATE: Cell = Cell(UnsafeCell::new(State { free: [null_mut(); NCLASSES], bump: null_mut(), end: null_mut() }));
+    thread_local! {
+        static STATE: UnsafeCell<State> = const { UnsafeCell::new(State { free: [null_mut(); NCLASSES], bump: null_mut(), end: null_mut() }) };
+    }
+    #[inline(always)]
+    fn state() -> *mut State { STATE.with(|s| s.get()) }
 
     pub struct SizeClassAlloc;
 
@@ -41,7 +44,7 @@ mod ail_alloc {
         #[inline(always)]
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
             if l.size() > MAX_SMALL || l.align() > CLASS { return System.alloc(l); }
-            let st = &mut *STATE.0.get();
+            let st = &mut *state();
             let c = class_of(l.size());
             let head = st.free[c];
             if !head.is_null() {
@@ -59,7 +62,7 @@ mod ail_alloc {
         #[inline(always)]
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
             if l.size() > MAX_SMALL || l.align() > CLASS { return System.dealloc(p, l); }
-            let st = &mut *STATE.0.get();
+            let st = &mut *state();
             let c = class_of(l.size());
             *(p as *mut *mut u8) = st.free[c];
             st.free[c] = p;
@@ -199,9 +202,9 @@ mod ail_rt {
     }
 
     #[track_caller] #[cold]
-    pub fn fail(msg: &String) -> ! { panic!("fail: {msg}") }
+    pub fn fail(msg: &str) -> ! { panic!("fail: {msg}") }
     #[track_caller] #[cold]
-    pub fn assert_fail(msg: &String) -> ! { panic!("assertion failed: {msg}") }
+    pub fn assert_fail(msg: &str) -> ! { panic!("assertion failed: {msg}") }
     #[track_caller] #[cold]
     pub fn contract(kind: &str, f: &str, src: &str) -> ! { panic!("contract violated: {kind} {src} (in fn {f})") }
 
@@ -245,6 +248,12 @@ mod ail_rt {
     f2i!(f2i_i8 i8, f2i_i16 i16, f2i_i32 i32, f2i_i64 i64, f2i_u8 u8, f2i_u16 u16, f2i_u32 u32, f2i_u64 u64);
 
     #[track_caller]
+    #[track_caller]
+    pub fn slice_ref<T>(v: &Vec<T>, a: i64, b: i64) -> &[T] {
+        let (a, b) = (ix(a), ix(b));
+        if a > b || b > v.len() { panic!("slice [{a}, {b}) out of bounds for length {}", v.len()) }
+        &v[a..b]
+    }
     pub fn slice<T: Clone>(v: &Vec<T>, a: i64, b: i64) -> Vec<T> {
         let (a, b) = (ix(a), ix(b));
         if a > b || b > v.len() { panic!("slice [{a}, {b}) out of bounds for length {}", v.len()) }
@@ -268,9 +277,9 @@ mod ail_rt {
         kv.into_iter().map(|(_, v)| v.clone()).collect()
     }
     #[track_caller]
-    pub fn expect_opt<T>(o: Option<T>, msg: &String) -> T { match o { Some(v) => v, None => panic!("expect failed: {msg}") } }
+    pub fn expect_opt<T>(o: Option<T>, msg: &str) -> T { match o { Some(v) => v, None => panic!("expect failed: {msg}") } }
     #[track_caller]
-    pub fn expect_res<T, E: std::fmt::Display>(r: Result<T, E>, msg: &String) -> T {
+    pub fn expect_res<T, E: std::fmt::Display>(r: Result<T, E>, msg: &str) -> T {
         match r { Ok(v) => v, Err(e) => panic!("expect failed: {msg}: {e}") }
     }
     #[track_caller]
@@ -278,8 +287,23 @@ mod ail_rt {
         let (a, b) = (ix(a), ix(b));
         match s.get(a..b) { Some(x) => x.to_string(), None => panic!("substr [{a}, {b}) invalid for string of {} bytes", s.len()) }
     }
+    pub fn lower(s: &String) -> String { if s.is_ascii() { s.to_ascii_lowercase() } else { s.to_lowercase() } }
+    pub fn lower_owned(mut s: String) -> String { if s.is_ascii() { s.make_ascii_lowercase(); s } else { s.to_lowercase() } }
+    pub fn upper_owned(mut s: String) -> String { if s.is_ascii() { s.make_ascii_uppercase(); s } else { s.to_uppercase() } }
+    pub fn upper(s: &String) -> String { if s.is_ascii() { s.to_ascii_uppercase() } else { s.to_uppercase() } }
+    /// The pieces of `s` as borrowed slices (for loops over `split` without building a Vec).
+    pub fn split_iter<'a>(s: &'a String, sep: &'a String) -> Box<dyn Iterator<Item = &'a str> + 'a> {
+        if sep.is_empty() {
+            Box::new(s.char_indices().map(move |(i, c)| &s[i..i + c.len_utf8()]))
+        } else if sep.len() == 1 {
+            Box::new(s.split(sep.as_bytes()[0] as char))
+        } else {
+            Box::new(s.split(sep.as_str()))
+        }
+    }
     pub fn split(s: &String, sep: &String) -> Vec<String> {
         if sep.is_empty() { return chars(s); }
+        if sep.len() == 1 { return s.split(sep.as_bytes()[0] as char).map(String::from).collect(); }
         s.split(sep.as_str()).map(String::from).collect()
     }
     #[track_caller]

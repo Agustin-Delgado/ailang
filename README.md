@@ -8,7 +8,7 @@ diagnostics that are data (JSON with exact, machine-applicable fixes).
 - `DESIGN.md`: why each decision was made.
 - `compiler/`: the compiler (Rust). It type-checks, verifies capabilities and aliasing, and emits
   Rust that `rustc` compiles with LLVM.
-- `bench/`: ail vs idiomatic Rust, same algorithms (`python bench/run.py`).
+- `bench/`: ail vs idiomatic Rust on 13 native tasks, a browser game (wasm) and a real HTTP server; see `bench/RESULTS.md`.
 - `experiment/`: AI agents writing ail vs Rust vs TypeScript on the same tasks, first attempt only.
 - `examples/`: programs, including a JSON REST API (`todo_api.ail`).
 
