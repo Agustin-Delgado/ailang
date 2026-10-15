@@ -177,11 +177,11 @@ mod ail_rt {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn flush() { OUT.with(|o| { let _ = o.borrow_mut().flush(); }); }
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn print(s: &String) { OUT.with(|o| { let _ = o.borrow_mut().write_all(s.as_bytes()); }); }
+    pub fn print(s: &str) { OUT.with(|o| { let _ = o.borrow_mut().write_all(s.as_bytes()); }); }
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn println(s: &String) { OUT.with(|o| { let mut o = o.borrow_mut(); let _ = o.write_all(s.as_bytes()); let _ = o.write_all(b"\n"); }); }
+    pub fn println(s: &str) { OUT.with(|o| { let mut o = o.borrow_mut(); let _ = o.write_all(s.as_bytes()); let _ = o.write_all(b"\n"); }); }
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn eprintln(s: &String) { flush(); eprintln!("{s}"); }
+    pub fn eprintln(s: &str) { flush(); eprintln!("{s}"); }
 
     // In the browser, console output goes to the developer console, one message per line.
     #[cfg(target_arch = "wasm32")]
@@ -189,11 +189,11 @@ mod ail_rt {
     #[cfg(target_arch = "wasm32")]
     pub fn flush() { LINE.with(|l| { let mut l = l.borrow_mut(); if !l.is_empty() { super::ail_web::log(&l, false); l.clear(); } }); }
     #[cfg(target_arch = "wasm32")]
-    pub fn print(s: &String) { LINE.with(|l| l.borrow_mut().push_str(s)); }
+    pub fn print(s: &str) { LINE.with(|l| l.borrow_mut().push_str(s)); }
     #[cfg(target_arch = "wasm32")]
-    pub fn println(s: &String) { LINE.with(|l| { let mut l = l.borrow_mut(); l.push_str(s); super::ail_web::log(&l, false); l.clear(); }); }
+    pub fn println(s: &str) { LINE.with(|l| { let mut l = l.borrow_mut(); l.push_str(s); super::ail_web::log(&l, false); l.clear(); }); }
     #[cfg(target_arch = "wasm32")]
-    pub fn eprintln(s: &String) { flush(); super::ail_web::log(s, true); }
+    pub fn eprintln(s: &str) { flush(); super::ail_web::log(s, true); }
 
     pub fn main_error<E: std::fmt::Display>(e: &E) -> ! {
         flush();
@@ -283,36 +283,56 @@ mod ail_rt {
         match r { Ok(v) => v, Err(e) => panic!("expect failed: {msg}: {e}") }
     }
     #[track_caller]
-    pub fn substr(s: &String, a: i64, b: i64) -> String {
+    pub fn substr(s: &str, a: i64, b: i64) -> String {
         let (a, b) = (ix(a), ix(b));
         match s.get(a..b) { Some(x) => x.to_string(), None => panic!("substr [{a}, {b}) invalid for string of {} bytes", s.len()) }
     }
-    pub fn lower(s: &String) -> String { if s.is_ascii() { s.to_ascii_lowercase() } else { s.to_lowercase() } }
+    pub fn lower(s: &str) -> String { if s.is_ascii() { s.to_ascii_lowercase() } else { s.to_lowercase() } }
+    /// A borrowed piece of `s`: no copy (string views).
+    pub fn substr_ref<'a>(s: &'a str, a: i64, b: i64) -> &'a str {
+        let (a, b) = (ix(a), ix(b));
+        match s.get(a..b) { Some(x) => x, None => panic!("substr [{a}, {b}) invalid for string of {} bytes", s.len()) }
+    }
+    /// Lower-cases a view, copying only when some character actually changes.
+    pub fn lower_cow<'a>(s: std::borrow::Cow<'a, str>) -> std::borrow::Cow<'a, str> {
+        if s.bytes().all(|b| b < 128 && !b.is_ascii_uppercase()) { s } else { std::borrow::Cow::Owned(lower_owned(s.into_owned())) }
+    }
+    pub fn upper_cow<'a>(s: std::borrow::Cow<'a, str>) -> std::borrow::Cow<'a, str> {
+        if s.bytes().all(|b| b < 128 && !b.is_ascii_lowercase()) { s } else { std::borrow::Cow::Owned(upper_owned(s.into_owned())) }
+    }
+    pub fn push_i64(s: &mut String, v: i64) {
+        let mut buf = [0u8; 20];
+        let mut i = buf.len();
+        let mut n = v.unsigned_abs();
+        loop { i -= 1; buf[i] = b'0' + (n % 10) as u8; n /= 10; if n == 0 { break; } }
+        if v < 0 { s.push('-'); }
+        s.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
+    }
     pub fn lower_owned(mut s: String) -> String { if s.is_ascii() { s.make_ascii_lowercase(); s } else { s.to_lowercase() } }
     pub fn upper_owned(mut s: String) -> String { if s.is_ascii() { s.make_ascii_uppercase(); s } else { s.to_uppercase() } }
-    pub fn upper(s: &String) -> String { if s.is_ascii() { s.to_ascii_uppercase() } else { s.to_uppercase() } }
+    pub fn upper(s: &str) -> String { if s.is_ascii() { s.to_ascii_uppercase() } else { s.to_uppercase() } }
     /// The pieces of `s` as borrowed slices (for loops over `split` without building a Vec).
-    pub fn split_iter<'a>(s: &'a String, sep: &'a String) -> Box<dyn Iterator<Item = &'a str> + 'a> {
+    pub fn split_iter<'a>(s: &'a str, sep: &'a str) -> Box<dyn Iterator<Item = &'a str> + 'a> {
         if sep.is_empty() {
             Box::new(s.char_indices().map(move |(i, c)| &s[i..i + c.len_utf8()]))
         } else if sep.len() == 1 {
             Box::new(s.split(sep.as_bytes()[0] as char))
         } else {
-            Box::new(s.split(sep.as_str()))
+            Box::new(s.split(sep))
         }
     }
-    pub fn split(s: &String, sep: &String) -> Vec<String> {
+    pub fn split(s: &str, sep: &str) -> Vec<String> {
         if sep.is_empty() { return chars(s); }
         if sep.len() == 1 { return s.split(sep.as_bytes()[0] as char).map(String::from).collect(); }
-        s.split(sep.as_str()).map(String::from).collect()
+        s.split(sep).map(String::from).collect()
     }
     #[track_caller]
     pub fn from_code(n: i64) -> String {
         match u32::try_from(n).ok().and_then(char::from_u32) { Some(c) => c.to_string(), None => panic!("{n} is not a valid code point") }
     }
-    pub fn chars(s: &String) -> Vec<String> { s.chars().map(|c| c.to_string()).collect() }
+    pub fn chars(s: &str) -> Vec<String> { s.chars().map(|c| c.to_string()).collect() }
     #[track_caller]
-    pub fn byte_at(s: &String, i: i64) -> i64 {
+    pub fn byte_at(s: &str, i: i64) -> i64 {
         let i = ix(i);
         match s.as_bytes().get(i) { Some(b) => *b as i64, None => panic!("byte index {i} out of bounds for string of {} bytes", s.len()) }
     }
@@ -323,12 +343,12 @@ mod ail_rt {
         let _ = std::io::stdin().read_to_string(&mut s);
         s
     }
-    pub fn lines(s: &String) -> Vec<String> {
+    pub fn lines(s: &str) -> Vec<String> {
         s.lines().map(|l| l.trim_end_matches('\r').to_string()).collect()
     }
-    pub fn all_chars(s: &String, f: fn(char) -> bool) -> bool { !s.is_empty() && s.chars().all(f) }
+    pub fn all_chars(s: &str, f: fn(char) -> bool) -> bool { !s.is_empty() && s.chars().all(f) }
     #[track_caller]
-    pub fn code_of(s: &String) -> i64 {
+    pub fn code_of(s: &str) -> i64 {
         match s.chars().next() { Some(c) => c as i64, None => panic!("code-of on an empty string") }
     }
     pub fn read_line() -> Option<String> {
@@ -342,7 +362,7 @@ mod ail_rt {
             }
         }
     }
-    pub fn read_file(path: &String, max: i64) -> Result<String, String> {
+    pub fn read_file(path: &str, max: i64) -> Result<String, String> {
         let f = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
         let mut buf = Vec::new();
         let limit = if max < 0 { 0 } else { max as u64 };
@@ -350,7 +370,7 @@ mod ail_rt {
         if buf.len() as u64 > limit { return Err(format!("{path}: larger than the limit of {max} bytes")); }
         String::from_utf8(buf).map_err(|_| format!("{path}: not valid UTF-8"))
     }
-    pub fn write_file(path: &String, content: &String) -> Result<(), String> {
+    pub fn write_file(path: &str, content: &str) -> Result<(), String> {
         std::fs::write(path, content).map_err(|e| format!("{path}: {e}"))
     }
     #[cfg(target_arch = "wasm32")]
