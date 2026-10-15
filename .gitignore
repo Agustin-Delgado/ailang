@@ -9,3 +9,4 @@ bench/web/ail-out/
 bench/web/rust/target/
 .playwright-mcp/
 bench/web/arena-web/
+__pycache__/
