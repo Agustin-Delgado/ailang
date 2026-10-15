@@ -157,6 +157,15 @@ pub enum ExprKind {
     Try(Box<Expr>),
     As(TypeExpr, Box<Expr>),
     Copy(Box<Expr>),
+    /// `(lambda (x (y T)) body...)`: only valid as an argument for a `(Fn ...)` parameter.
+    Lambda(Vec<LambdaParam>, Vec<Expr>),
+}
+
+#[derive(Clone, Debug)]
+pub struct LambdaParam {
+    pub name: String,
+    pub span: Span,
+    pub ty: Option<TypeExpr>,
 }
 
 #[derive(Clone, Debug)]
@@ -710,6 +719,45 @@ impl Lower {
                     return None;
                 }
                 ExprKind::Copy(Box::new(self.expr(&args[0])?))
+            }
+            "lambda" => {
+                let shape = "lambda form is (lambda (x y) body...); a parameter may carry its type: (lambda ((x I64)) ...)";
+                let Some(ps) = args.first().and_then(|a| a.list()) else {
+                    self.err("E0029", span, shape);
+                    return None;
+                };
+                if args.len() < 2 {
+                    self.err("E0029", span, shape);
+                    return None;
+                }
+                let mut params = Vec::new();
+                for p in ps {
+                    match (&p.kind, p.list()) {
+                        (SKind::Sym(_), _) => params.push(LambdaParam {
+                            name: self.ident(p)?,
+                            span: p.span,
+                            ty: None,
+                        }),
+                        (_, Some(pl)) if pl.len() == 2 => params.push(LambdaParam {
+                            name: self.ident(&pl[0])?,
+                            span: pl[0].span,
+                            ty: Some(self.type_expr(&pl[1])?),
+                        }),
+                        _ => {
+                            self.err("E0029", p.span, shape);
+                            return None;
+                        }
+                    }
+                }
+                ExprKind::Lambda(params, self.exprs(&args[1..]))
+            }
+            "fn" => {
+                // An anonymous function written the way other languages spell it.
+                self.diags.push(
+                    Diag::error("E0029", head_span, "an anonymous function is written (lambda (x) body...)")
+                        .with_fix_replace(head_span, "lambda", "use lambda"),
+                );
+                return None;
             }
             "mut" => {
                 self.err(

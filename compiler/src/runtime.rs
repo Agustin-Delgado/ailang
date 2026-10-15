@@ -300,6 +300,13 @@ mod ail_rt {
     pub fn upper_cow<'a>(s: std::borrow::Cow<'a, str>) -> std::borrow::Cow<'a, str> {
         if s.bytes().all(|b| b < 128 && !b.is_ascii_lowercase()) { s } else { std::borrow::Cow::Owned(upper_owned(s.into_owned())) }
     }
+    /// Stable sort of `v` by precomputed keys (one per element): elements are moved, not copied.
+    pub fn sort_by_keys<T, K>(v: &mut Vec<T>, keys: Vec<K>, cmp: impl Fn(&K, &K) -> std::cmp::Ordering) {
+        let mut idx: Vec<usize> = (0..v.len()).collect();
+        idx.sort_by(|&a, &b| cmp(&keys[a], &keys[b]));
+        let mut old: Vec<Option<T>> = std::mem::take(v).into_iter().map(Some).collect();
+        *v = idx.into_iter().map(|i| old[i].take().unwrap()).collect();
+    }
     pub fn push_i64(s: &mut String, v: i64) {
         let mut buf = [0u8; 20];
         let mut i = buf.len();

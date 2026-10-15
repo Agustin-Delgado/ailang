@@ -116,6 +116,8 @@ pub enum Ty {
     Res(Box<Ty>, Box<Ty>),
     User(String),
     Cap(Cap),
+    /// A function passed as a parameter: argument types and result.
+    Fn(Vec<Ty>, Box<Ty>),
     /// Poison type after an error; compatible with everything to avoid cascades.
     Err,
 }
@@ -145,6 +147,14 @@ impl Ty {
     pub fn is_hashable(&self) -> bool {
         matches!(self, Ty::Int(_) | Ty::Str | Ty::Bool | Ty::Err)
     }
+    pub fn contains_fn(&self) -> bool {
+        match self {
+            Ty::Fn(..) => true,
+            Ty::Vec(a) | Ty::Opt(a) => a.contains_fn(),
+            Ty::Map(a, b) | Ty::Res(a, b) => a.contains_fn() || b.contains_fn(),
+            _ => false,
+        }
+    }
     pub fn contains_cap(&self) -> bool {
         match self {
             Ty::Cap(_) => true,
@@ -171,6 +181,13 @@ impl fmt::Display for Ty {
             Ty::Res(t, e) => write!(f, "(Result {t} {e})"),
             Ty::User(n) => write!(f, "{n}"),
             Ty::Cap(c) => write!(f, "{}", c.name()),
+            Ty::Fn(ps, r) => {
+                write!(f, "(Fn")?;
+                for p in ps {
+                    write!(f, " {p}")?;
+                }
+                write!(f, " {r})")
+            }
             Ty::Err => write!(f, "?"),
         }
     }
