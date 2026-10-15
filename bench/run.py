@@ -1,5 +1,5 @@
 """Benchmark ail against idiomatic Rust: same task (bench/SPECS.md for the application ones),
-same machine, best of N runs, outputs must be identical.
+same machine, best of N runs (ail and Rust runs interleaved), outputs must be identical.
 
 Rust baseline: cargo release profile in bench/rust (opt-level 3, codegen-units 1, fat LTO, panic=abort,
 overflow checks OFF, serde_json where idiomatic).
@@ -30,25 +30,28 @@ def build_ail(name):
     subprocess.run([AIL, "build", os.path.join(HERE, "ail", name + ".ail"), "-o", exe] + flags, check=True, capture_output=True)
     return exe
 
-def timeit(exe):
-    best, out = None, None
+def once(exe):
+    t = time.perf_counter()
+    p = subprocess.run([exe], capture_output=True, text=True)
+    dt = time.perf_counter() - t
+    if p.returncode != 0:
+        raise SystemExit(f"{exe} failed: {p.stderr}")
+    return dt, p.stdout
+
+def timeit2(a, b):
+    # Runs alternate between the two programs, so load from the rest of the machine hits both.
+    ta, tb, oa, ob = [], [], None, None
     for _ in range(RUNS):
-        t = time.perf_counter()
-        p = subprocess.run([exe], capture_output=True, text=True)
-        dt = time.perf_counter() - t
-        if p.returncode != 0:
-            raise SystemExit(f"{exe} failed: {p.stderr}")
-        out = p.stdout
-        best = dt if best is None else min(best, dt)
-    return best, out
+        t, oa = once(a); ta.append(t)
+        t, ob = once(b); tb.append(t)
+    return min(ta), oa, min(tb), ob
 
 path = os.path.join(HERE, "results.json")
 results = {r["bench"]: r for r in json.load(open(path))} if os.path.exists(path) else {}
 for n in names:
     a = build_ail(n)
     r = os.path.join(RUST, "target", "release", n + ".exe")
-    ta, oa = timeit(a)
-    tr, orr = timeit(r)
+    ta, oa, tr, orr = timeit2(a, r)
     same = oa.strip() == orr.strip()
     results[n] = {"bench": n, "ail_s": round(ta, 4), "rust_s": round(tr, 4), "ratio": round(ta / tr, 3), "same_output": same}
     print(f"{n:10s} ail {ta:7.3f}s  rust {tr:7.3f}s  ail/rust {ta/tr:5.2f}  output {'OK' if same else 'DIFFERENT'}", flush=True)

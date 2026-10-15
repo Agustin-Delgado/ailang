@@ -1,93 +1,93 @@
 [
  {
   "bench": "api",
-  "ail_s": 2.14,
-  "rust_s": 2.3287,
-  "ratio": 0.919,
+  "ail_s": 2.7761,
+  "rust_s": 3.002,
+  "ratio": 0.925,
   "same_output": true
  },
  {
   "bench": "fannkuch",
-  "ail_s": 2.605,
-  "rust_s": 3.161,
-  "ratio": 0.82,
+  "ail_s": 2.6861,
+  "rust_s": 3.4534,
+  "ratio": 0.778,
   "same_output": true
  },
  {
   "bench": "game",
-  "ail_s": 1.382,
-  "rust_s": 1.281,
-  "ratio": 1.08,
+  "ail_s": 1.5681,
+  "rust_s": 1.3754,
+  "ratio": 1.14,
   "same_output": true
  },
  {
   "bench": "hashmap",
-  "ail_s": 1.281,
-  "rust_s": 2.511,
-  "ratio": 0.51,
+  "ail_s": 1.5448,
+  "rust_s": 2.7214,
+  "ratio": 0.568,
   "same_output": true
  },
  {
   "bench": "interp",
-  "ail_s": 3.737,
-  "rust_s": 3.249,
-  "ratio": 1.15,
+  "ail_s": 2.2956,
+  "rust_s": 2.8726,
+  "ratio": 0.799,
   "same_output": true
  },
  {
   "bench": "json",
-  "ail_s": 2.3624,
-  "rust_s": 2.7595,
-  "ratio": 0.856,
+  "ail_s": 2.0643,
+  "rust_s": 3.0615,
+  "ratio": 0.674,
   "same_output": true
  },
  {
   "bench": "nbody",
-  "ail_s": 3.354,
-  "rust_s": 3.126,
-  "ratio": 1.07,
+  "ail_s": 2.9177,
+  "rust_s": 2.851,
+  "ratio": 1.023,
   "same_output": true
  },
  {
   "bench": "pathfind",
-  "ail_s": 0.063,
-  "rust_s": 0.089,
-  "ratio": 0.7,
+  "ail_s": 0.0513,
+  "rust_s": 0.0685,
+  "ratio": 0.748,
   "same_output": true
  },
  {
   "bench": "raytrace",
-  "ail_s": 0.034,
-  "rust_s": 0.034,
-  "ratio": 1.0,
+  "ail_s": 0.0244,
+  "rust_s": 0.0235,
+  "ratio": 1.036,
   "same_output": true
  },
  {
   "bench": "sieve",
-  "ail_s": 5.563,
-  "rust_s": 5.258,
-  "ratio": 1.06,
+  "ail_s": 4.1407,
+  "rust_s": 3.7058,
+  "ratio": 1.117,
   "same_output": true
  },
  {
   "bench": "strings",
-  "ail_s": 0.2575,
-  "rust_s": 0.7384,
-  "ratio": 0.349,
+  "ail_s": 0.1782,
+  "rust_s": 0.5626,
+  "ratio": 0.317,
   "same_output": true
  },
  {
   "bench": "trees",
-  "ail_s": 6.9574,
-  "rust_s": 41.8532,
-  "ratio": 0.166,
+  "ail_s": 7.7945,
+  "rust_s": 50.4773,
+  "ratio": 0.154,
   "same_output": true
  },
  {
   "bench": "wordfreq",
-  "ail_s": 0.6305,
-  "rust_s": 0.4989,
-  "ratio": 1.264,
+  "ail_s": 0.3091,
+  "rust_s": 0.3372,
+  "ratio": 0.917,
   "same_output": true
  }
 ]

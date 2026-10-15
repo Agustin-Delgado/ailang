@@ -1,31 +1,33 @@
-# ail vs Rust: results (2026-10-15)
+# ail vs Rust: results (2026-10-15, ail 0.4 dev)
 
 Machine: Ryzen 5 2600, Windows 11. Each task is specified in `SPECS.md` and was written twice by
 independent agents: idiomatic Rust (serde where natural; cargo release profile with fat LTO and
 overflow checks off) and idiomatic ail (overflow and bounds checks always on). Outputs are
-byte-identical in every row. Times are best of 5 whole-process runs; lower ratio is better for ail.
+byte-identical in every row. Times are best of 5 whole-process runs (ail and Rust interleaved);
+lower ratio is better for ail.
 
 ## Native
 
 | benchmark | what it exercises | ail s | Rust s | ail/Rust |
 |---|---|---|---|---|
-| trees | allocation-heavy binary trees | 6.96 | 41.85 | **0.17** |
-| strings | string building and search | 0.32 | 0.63 | **0.50** |
-| hashmap | integer hash map | 1.28 | 2.51 | **0.51** |
-| json | build, serialize, parse 40k-record docs (Rust: serde_json::Value) | 1.90 | 3.22 | **0.59** |
-| pathfind | A* with a hand-written heap vs BinaryHeap | 0.063 | 0.089 | 0.70 * |
-| fannkuch | permutations, array indexing | 2.61 | 3.16 | 0.82 |
-| api | REST handlers: routing, JSON in/out, store (Rust: serde derive) | 2.09 | 2.32 | 0.90 |
-| raytrace | f64 vector math, enum shapes | 0.034 | 0.034 | 1.00 * |
-| sieve | bounds-checked array loops | 5.56 | 5.26 | 1.06 |
-| nbody | f64 struct math | 3.35 | 3.13 | 1.07 |
-| game | 4000-entity arena, spatial grid collisions | 1.38 | 1.28 | 1.08 |
-| interp | bytecode VM, enum dispatch | 3.74 | 3.25 | 1.15 |
-| wordfreq | tokenize 3M words, count, sort | 0.52 | 0.33 | 1.58 |
+| trees | allocation-heavy binary trees | 7.79 | 50.48 | **0.15** |
+| strings | string building and search | 0.18 | 0.56 | **0.32** |
+| hashmap | integer hash map | 1.54 | 2.72 | **0.57** |
+| json | build, serialize, parse 40k-record docs (Rust: serde_json::Value) | 2.06 | 3.06 | **0.67** |
+| pathfind | A* with a hand-written heap vs BinaryHeap | 0.051 | 0.069 | **0.75** * |
+| fannkuch | permutations, array indexing | 2.69 | 3.45 | **0.78** |
+| interp | bytecode VM, enum dispatch | 2.30 | 2.87 | **0.80** |
+| wordfreq | tokenize 3M words, count, sort | 0.31 | 0.34 | **0.92** |
+| api | REST handlers: routing, JSON in/out, store (Rust: serde derive) | 2.78 | 3.00 | **0.93** |
+| nbody | f64 struct math | 2.92 | 2.85 | 1.02 |
+| raytrace | f64 vector math, enum shapes | 0.024 | 0.024 | 1.04 * |
+| sieve | bounds-checked array loops | 4.14 | 3.71 | 1.12 |
+| game | 4000-entity arena, spatial grid collisions | 1.57 | 1.38 | 1.14 |
 
 \* runs under 0.1 s are dominated by process start-up.
-`trees` and `wordfreq` were measured in a second run with the same compiler: the system stopped the
-first full run for lack of memory after the other 11 rows.
+The machine had other heavy programs running during this run (about 80% CPU load before the
+benchmarks started), so ail and Rust runs alternate and each number is the best of 5 to 9 runs.
+Ratios within about ±0.06 of 1.0 are noise at this load.
 
 ## Browser game (WebAssembly, `web/`)
 
@@ -36,11 +38,12 @@ the native `game` checksum).
 
 | | update ms/frame | view ms/frame | host ms/frame | total | wasm size |
 |---|---|---|---|---|---|
-| ail | 1.13 | 0.14 | 0.12 | 1.39 | 78 KB |
-| Rust | 0.95 | 0.04 | 0.08 | 1.07 | 36 KB |
+| ail | 0.91 | 0.11 | 0.09 | 1.11 | 78 KB |
+| Rust | 0.82 | 0.04 | 0.05 | 0.90 | 36 KB |
 
-ail/Rust 1.30. Before this round it was 2.57 with a 1.6 MB module. Interning draw strings,
-decoding each once per frame on the host, and building with LTO and strip closed most of the gap.
+ail/Rust 1.22 (1.30 in ail 0.3, 2.57 before that with a 1.6 MB module). Interning draw strings,
+decoding each once per frame on the host, building with LTO and strip, and string views (the color
+of each entity is no longer a fresh String) closed most of the gap.
 
 ## Real HTTP server (`http/`)
 
@@ -58,6 +61,22 @@ runtime now accepts and parses requests on a pool of I/O threads, so ail beats a
 Rust std server and matches axum without the program having to deal with concurrency.
 
 ## What changed in the compiler because of these benchmarks
+
+ail 0.4 (string views):
+
+- Read-only Str parameters are passed as `&str`. An immutable local bound to a piece of another
+  string (`substr`, `trim`, a literal, `if`/`match` picking one) is a borrowed view when its source
+  is not changed or moved while the view is used; `lower`/`upper` copy only if a character changes.
+- A fn whose Str result is always a piece of one parameter returns a view (`strip-punct` in
+  wordfreq returns `&str`).
+- `(put (mut m) k (+ 1 (unwrap-or (get m k) 0)))` does one lookup, and a view key is copied only
+  when it is new.
+- `for` over `split` with a one-character literal separator iterates without dynamic dispatch and
+  without copying each piece. `(str ...)` and appends write strings and integers directly instead
+  of going through `format!`.
+- Result: wordfreq went from 1.58 to 0.92, strings from 0.50 to 0.32, the wasm view got 25% faster.
+
+ail 0.3:
 
 - `(set s (str s ...))` appends in place. Building a string in a loop used to be quadratic.
 - `for` over `split` streams the pieces, without a Vec or an allocation per piece.
@@ -79,9 +98,9 @@ Rust std server and matches axum without the program having to deal with concurr
 
 ## Where ail still loses, and why
 
-- **wordfreq (1.58)**: every substring is an owned `Str` (`substr` and `lower` allocate). Rust
-  borrows slices. Borrowed string views are the next step.
-- **interp / game (~1.1)**: always-on overflow checks in the hot loop. The ail game also uses a
-  `Vec` of `Vec`s as its grid, while the Rust agent used a flat counting-sort grid.
-- **Browser view (3.4x on 0.1 ms)**: `(let color (match ... "literal"))` allocates a String per
-  entity, because string literals are owned values.
+- **game / sieve (~1.1)**: bounds checks in the inner loops, and the ail game uses a `Vec` of
+  `Vec`s as its grid while the Rust agent used a flat counting-sort grid.
+- **Overflow checks are not the cost.** Building interp and game with overflow checks off changes
+  their time by 0 to 4%, within noise, so proving ranges to remove them is not worth it yet.
+- **Browser view (about 3x on 0.1 ms)**: the Rust version sends palette indices; ail sends interned
+  color strings.
