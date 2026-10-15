@@ -57,7 +57,7 @@ def native():
     for y, s in enumerate(speedup):
         ax.text(max(s, 1.0) * 1.04, y, f"{s:.2f}x", va="center", fontsize=10)
     ax.set_xlabel("speed of ail relative to Rust (Rust time / ail time, log scale)")
-    ax.set_title("ail vs idiomatic Rust, 13 native tasks\n"
+    ax.set_title(f"ail vs idiomatic Rust, {len(rows)} native tasks\n"
                  "right of the line = ail is faster; identical output in every task",
                  fontsize=12, loc="left")
     save(fig, "native.svg")

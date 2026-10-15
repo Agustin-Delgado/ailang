@@ -332,6 +332,7 @@ pub const BUILTINS: &[&str] = &[
     "reverse",
     "sum",
     "map",
+    "par-map",
     "filter",
     "any",
     "all",
@@ -3481,6 +3482,31 @@ impl Checker {
                     ));
                 }
                 el
+            }
+            "par-map" => {
+                ar!(2, "(par-map vec (lambda (x) ...))");
+                let (el, f) = self.hof_head(name, args);
+                let want_r = match exp {
+                    Some(Ty::Vec(r)) => (**r).clone(),
+                    _ => Ty::Err,
+                };
+                let ft = self.check_fn_arg(f, &Ty::Fn(vec![el], Box::new(want_r)));
+                // Parallel work must not depend on timing: no effects inside.
+                let mut caps = Vec::new();
+                walk(f, &mut |x| {
+                    if let (ExprKind::Var(_), Res::Local(b)) = (&x.kind, &self.res[x.id as usize]) {
+                        if let Ty::Cap(c) = self.bindings[*b].ty {
+                            caps.push((x.span, c));
+                        }
+                    }
+                });
+                for (sp, c) in caps {
+                    self.err(
+                        Diag::error("E0327", sp, &format!("par-map runs its function on several threads at once, so it cannot use {}", c.name()))
+                            .note("compute the values with par-map, then print or store them after it returns"),
+                    );
+                }
+                Ty::Vec(Box::new(fn_result(&ft)))
             }
             "map" if n == 2 => {
                 let (el, f) = self.hof_head(name, args);

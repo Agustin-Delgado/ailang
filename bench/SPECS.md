@@ -15,7 +15,7 @@ Shared rules:
 - Floating point: use f64 and evaluate formulas in the order written (left to right, as parenthesized).
   Do not use fused multiply-add. `floor` means floor toward negative infinity.
 - Rust: idiomatic, the way an experienced Rust developer writes production code. Safe Rust only (no `unsafe`).
-  Use std; crates already in `bench/rust/Cargo.toml` (serde, serde_json) where a Rust developer would.
+  Use std; crates already in `bench/rust/Cargo.toml` (serde, serde_json, rayon) where a Rust developer would.
   Don't hand-tune for this benchmark beyond what is normal good practice; don't write deliberately slow code either.
 - ail: idiomatic ail per `SPEC.md`.
 
@@ -228,3 +228,25 @@ The program, exactly (index: instruction):
 38 Halt
 ```
 After `Halt`, print `total <slot 2>` and `executed <number of instructions executed, including Halt>`.
+
+---
+
+## mandel — Mandelbrot set, parallel over rows (the parallel benchmark)
+
+Image `W = 2000` by `H = 2000` pixels, `MAX_ITER = 1000`. Rows are independent: **compute them in
+parallel on all cores** (ail: `par-map`; Rust: rayon, the idiomatic choice), then combine in row order.
+
+For pixel `(x, y)` with `0 <= x < W`, `0 <= y < H`:
+`cr = 3.0 * x / W - 2.2` and `ci = 2.4 * y / H - 1.2` (f64; `x`, `W`, `y`, `H` converted to f64, and
+evaluated exactly as written: `((3.0 * x) / W) - 2.2`).
+Iterate from `zr = 0.0, zi = 0.0, i = 0`: while `i < MAX_ITER` and `zr*zr + zi*zi <= 4.0`:
+`t = zr*zr - zi*zi + cr` (as `((zr*zr) - (zi*zi)) + cr`), `zi = 2.0*zr*zi + ci` (as `((2.0*zr)*zi) + ci`),
+`zr = t`, `i += 1`. The pixel's value is the final `i`.
+
+For each row compute `row_sum` = sum of the row's pixel values (64-bit integer) and `row_inside` = number
+of pixels whose value is `MAX_ITER`. Print:
+```
+total <sum of all row_sum>
+inside <sum of all row_inside>
+checksum <sum over rows y of (row_sum * (y + 1)) mod 1000000007, computed as a running value: c = (c + row_sum * (y + 1)) % 1000000007>
+```

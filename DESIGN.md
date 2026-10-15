@@ -99,7 +99,15 @@ is reported at the line inside the generic body, naming the copy (`while checkin
 The copies are also what is compiled, so generic code is exactly as fast as code written for
 one type. The price is that a generic fn nobody calls is not checked; the compiler says so.
 
-## 10. Toolchain
+## 10. Parallelism that cannot race
+
+Values are never shared and lambdas only read, so running a lambda on many threads at once is
+safe by construction: `(par-map xs f)` splits the Vec across the cores and returns the same Vec,
+in the same order, as `map`. The checker also forbids capabilities inside it, so parallel code is
+deterministic: no interleaved output, no timing-dependent results. There are no locks, atomics or
+threads in the language to get wrong.
+
+## 11. Toolchain
 
 `ail check` (instant), `ail fix`, `ail run`, `ail test`, `ail build`, `ail emit` (generated Rust),
 `ail spec` (the specification an agent should read, embedded in the binary).

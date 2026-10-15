@@ -305,6 +305,47 @@ mod ail_rt {
     pub fn upper_cow<'a>(s: std::borrow::Cow<'a, str>) -> std::borrow::Cow<'a, str> {
         if s.bytes().all(|b| b < 128 && !b.is_ascii_lowercase()) { s } else { std::borrow::Cow::Owned(upper_owned(s.into_owned())) }
     }
+    /// `f` over `xs` on all cores; the result is in order, the same as a sequential map. Threads
+    /// take small blocks from a shared counter, so uneven work still keeps every core busy. `f`
+    /// cannot have effects (the checker forbids capabilities): the result never depends on timing.
+    pub fn par_map<T: Sync, R: Send, F: Fn(&T) -> R + Sync>(xs: &[T], f: &F) -> Vec<R> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let n = xs.len();
+        let threads = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1).min(n);
+        if threads <= 1 {
+            return xs.iter().map(f).collect();
+        }
+        // A trap in a worker exits the process: make sure what main printed is out first.
+        flush();
+        let block = (n / (threads * 16)).max(1);
+        let blocks = n.div_ceil(block);
+        let next = AtomicUsize::new(0);
+        let mut parts: Vec<(usize, Vec<R>)> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..threads)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut mine = Vec::new();
+                        loop {
+                            let b = next.fetch_add(1, Ordering::Relaxed);
+                            if b >= blocks {
+                                break;
+                            }
+                            let lo = b * block;
+                            mine.push((b, xs[lo..(lo + block).min(n)].iter().map(f).collect::<Vec<R>>()));
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            hs.into_iter().flat_map(|h| h.join().unwrap_or_else(|_| std::process::exit(101))).collect()
+        });
+        parts.sort_unstable_by_key(|p| p.0);
+        let mut out = Vec::with_capacity(n);
+        for (_, p) in parts {
+            out.extend(p);
+        }
+        out
+    }
     /// Stable sort of `v` by precomputed keys (one per element): elements are moved, not copied.
     pub fn sort_by_keys<T, K>(v: &mut Vec<T>, keys: Vec<K>, cmp: impl Fn(&K, &K) -> std::cmp::Ordering) {
         let mut idx: Vec<usize> = (0..v.len()).collect();

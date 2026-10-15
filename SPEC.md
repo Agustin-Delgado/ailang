@@ -153,6 +153,9 @@ Vec with a function (see below): `(map v f)` -> Vec of the results `(filter v f)
 `(fold v init (lambda (acc x) new-acc))` `(sort-by (mut v) (lambda (x) key))` (stable, ascending; negate a
 number key for descending) `(min-by v key-fn)` `(max-by v key-fn)` -> Option (first element with the
 smallest/largest key). The Vec always comes first: `(map xs (lambda (x) (* x 2)))`.
+`(par-map v f)` is `map` spread over all CPU cores, with the same result in the same order. Its
+function cannot use capabilities (no printing, clock or randomness inside), so the result never
+depends on timing; lambdas cannot change variables, so there are no data races to write.
 
 Option/Result: `(some x)` `none` `(ok x)` `(err e)` `(unwrap-or o default)` `(expect o "msg")`
 `(is-some o)` `(is-none o)` `(is-ok r)` `(is-err r)`.

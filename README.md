@@ -19,6 +19,8 @@ the first attempt?
   their surroundings and cannot be stored, so there are no capture rules and no allocation.
 - **Generics without bounds.** `(type-params T)` on fns, structs and enums. Each concrete use is
   checked and compiled as its own copy, so there is no trait syntax and no runtime cost.
+- **Parallelism that cannot race.** `(par-map xs f)` runs on every core and returns exactly what
+  `map` would: values are never shared, lambdas only read, and no effects are allowed inside.
 - **Effects are capabilities.** A function can print, read files or open sockets only if it was
   given that capability, and capabilities come down from `main`.
 - **No undefined behavior.** Integer overflow, out-of-bounds access and failed `expect` stop the
@@ -37,9 +39,9 @@ written by its own AI agent, working without seeing the other: one idiomatic Rus
 the best of 5 to 9 whole-process runs on a Ryzen 5 2600 under Windows 11, with ail and Rust runs
 interleaved so that load from other programs hits both equally.
 
-### Native: 13 tasks
+### Native: 14 tasks
 
-![ail vs Rust on 13 native tasks](docs/charts/native.svg)
+![ail vs Rust on 14 native tasks](docs/charts/native.svg)
 
 | task | what it exercises | ail | Rust | ail/Rust time |
 |---|---|---|---|---|
@@ -54,6 +56,7 @@ interleaved so that load from other programs hits both equally.
 | api | REST handlers: routing, JSON in and out, store | 2.78 s | 3.00 s | **0.93** |
 | nbody | f64 struct math | 2.92 s | 2.85 s | 1.02 |
 | raytrace | f64 vector math, enum shapes | 0.024 s | 0.024 s | 1.04 * |
+| mandel | Mandelbrot, rows in parallel (`par-map` vs rayon) | 1.02 s | 0.95 s | 1.08 |
 | sieve | bounds-checked array loops | 4.14 s | 3.71 s | 1.12 |
 | game | 4,000-entity arena with a spatial grid | 1.57 s | 1.38 s | 1.14 |
 
@@ -176,5 +179,6 @@ target/release/ail web ../examples/dodge.ail          # build for the browser an
 ## Status
 
 ail is an early research language: v0.3 is released and v0.4 (string views, functions as
-arguments, generics, programs split across files with `(use name)`) is in development on `main`.
-The pieces above work and are measured. Concurrency is not built yet.
+arguments, generics, programs split across files with `(use name)`, `par-map`) is in development
+on `main`. The pieces above work and are measured. Concurrency beyond `par-map` (tasks, channels,
+parallel request handling in user code) is not built yet.

@@ -1424,6 +1424,12 @@ impl<'a> Emitter<'a> {
                 let c = self.conv_ref("__e", &self.elem_ty(a(0)));
                 format!("{{ let __f = {f}; {xs}.iter().map(|__e| __f({c})).collect::<Vec<_>>() }}")
             }
+            "par-map" => {
+                let (f, xs) = (self.closure(a(1)), self.pv(a(0)));
+                let el = self.elem_ty(a(0));
+                let c = self.conv_ref("__e", &el);
+                format!("{{ let __f = {f}; ail_rt::par_map(&{xs}[..], &|__e: &{}| __f({c})) }}", rty(&el))
+            }
             "filter" | "any" | "all" | "count" | "find" | "find-index" => {
                 let (f, xs) = (self.closure(a(1)), self.pv(a(0)));
                 let el = self.elem_ty(a(0));

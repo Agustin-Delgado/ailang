@@ -1,0 +1,43 @@
+; mandel: Mandelbrot set, rows computed in parallel with par-map (see bench/SPECS.md).
+
+(const W I64 2000)
+(const H I64 2000)
+(const MAX-ITER I64 1000)
+
+(struct Row (sum I64) (inside I64))
+
+(fn row (params (y I64)) (returns Row)
+  (body
+    (let ci (- (/ (* 2.4 (as F64 y)) (as F64 H)) 1.2))
+    (var sum 0)
+    (var inside 0)
+    (for x (range 0 W)
+      (let cr (- (/ (* 3.0 (as F64 x)) (as F64 W)) 2.2))
+      (var zr 0.0)
+      (var zi 0.0)
+      (var i 0)
+      (while (and (< i MAX-ITER) (<= (+ (* zr zr) (* zi zi)) 4.0))
+        (let t (+ (- (* zr zr) (* zi zi)) cr))
+        (set zi (+ (* (* 2.0 zr) zi) ci))
+        (set zr t)
+        (set i (+ i 1)))
+      (set sum (+ sum i))
+      (if (== i MAX-ITER) (set inside (+ inside 1))))
+    (new Row (sum sum) (inside inside))))
+
+(fn main (params (con Console))
+  (body
+    (var ys (Vec I64) (vec))
+    (for y (range 0 H) (push (mut ys) y))
+    (let rows (par-map ys (lambda (y) (row y))))
+    (var total 0)
+    (var inside 0)
+    (var checksum 0)
+    (for y (range 0 H)
+      (let r (at rows y))
+      (set total (+ total (. r sum)))
+      (set inside (+ inside (. r inside)))
+      (set checksum (% (+ checksum (* (. r sum) (+ y 1))) 1000000007)))
+    (println con "total " total)
+    (println con "inside " inside)
+    (println con "checksum " checksum)))
