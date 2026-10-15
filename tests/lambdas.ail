@@ -120,3 +120,10 @@
   (for k (range 0 1)
     (if (> k 5) (pop (mut v)) (push (mut v) 9)))
   (assert (== v (vec 6 7 9))))
+
+(test "the last statement of a match arm in statement position is a statement"
+  (var v (vec 1 2 3))
+  (match (len v)
+    (case 3 (if (> (len v) 5) (push (mut v) 0) (remove-at (mut v) 0)))
+    (case _ unit))
+  (assert (== v (vec 2 3))))

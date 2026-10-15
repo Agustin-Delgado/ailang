@@ -112,25 +112,27 @@ def web():
 
 
 def experiment():
-    # From experiment/RESULTS.md: correct programs on the first attempt, 16 hidden-test tasks.
-    groups = ["Sonnet", "Haiku"]
-    langs = [("ail", AIL, [15, 15]), ("Rust", RUST, [16, 16]), ("TypeScript", "#3a9d9d", [16, 16])]
-    fig, ax = plt.subplots(figsize=(8.5, 3.4))
+    # From experiment/RESULTS.md: share of programs correct on the first attempt (hidden tests).
+    groups = ["r2 Sonnet\n16 tasks", "r2 Haiku\n16 tasks", "r3 Sonnet\n8 harder tasks",
+              "r3 Haiku\n8 harder tasks"]
+    langs = [("ail", AIL, [15 / 16, 15 / 16, 7 / 8, 7 / 8]), ("Rust", RUST, [1, 1, 1, 1]),
+             ("TypeScript", "#3a9d9d", [1, 1, 1, 7 / 8])]
+    fig, ax = plt.subplots(figsize=(8.5, 3.6))
     width = 0.26
     for i, (lang, color, vals) in enumerate(langs):
         xs = [g + (i - 1) * width for g in range(len(groups))]
-        bars = ax.bar(xs, vals, width, color=color, label=lang)
+        bars = ax.bar(xs, [v * 100 for v in vals], width, color=color, label=lang)
         for b, v in zip(bars, vals):
-            ax.text(b.get_x() + b.get_width() / 2, v + 0.2, f"{v}/16", ha="center", fontsize=9)
+            ax.text(b.get_x() + b.get_width() / 2, v * 100 + 1.5, f"{v * 100:.0f}", ha="center", fontsize=8.5)
     ax.set_xticks(range(len(groups)))
-    ax.set_xticklabels(["Sonnet", "Haiku (ail v0.1.1)"])
-    ax.set_ylim(0, 17.5)
-    ax.set_yticks([0, 4, 8, 12, 16])
-    ax.set_ylabel("correct on first attempt")
+    ax.set_xticklabels(groups, fontsize=9.5)
+    ax.set_ylim(0, 112)
+    ax.set_yticks([0, 25, 50, 75, 100])
+    ax.set_ylabel("% correct on first attempt")
     ax.set_title("A language no model has seen: correct programs on the first try\n"
-                 "(only SPEC.md in context; every ail program correct after one repair)",
+                 "(only SPEC.md in context; both ail misses in r3 were compiler bugs, fixed since)",
                  fontsize=12, loc="left")
-    ax.legend(frameon=False, ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.14))
+    ax.legend(frameon=False, ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.2))
     save(fig, "experiment.svg")
 
 

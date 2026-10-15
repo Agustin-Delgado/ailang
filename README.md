@@ -87,12 +87,13 @@ native run. ail takes 1.11 ms per frame and Rust 0.90 (1.22x); the ail module is
 
 ![first-attempt correctness](docs/charts/experiment.svg)
 
-Fresh agents got 16 console tasks with hidden tests: 10 seen while the spec was being tuned and
-6 held out. Each agent had nothing but the task and `SPEC.md`, and wrote the program once, with
-no compiling and no testing. ail compiled as often as Rust and TypeScript. Its one remaining
-miss with each model was a logic slip or an undefined helper, and one repair round fixed it.
-These tasks are too easy to separate the three languages; a harder run is next. Details are in
-[`experiment/RESULTS.md`](experiment/RESULTS.md).
+Fresh agents got console tasks with hidden tests and nothing but the task and `SPEC.md`, and
+wrote each program once, with no compiling and no testing. In r2 (16 tasks) ail compiled as often
+as Rust and TypeScript. r3 has 8 harder tasks: an order book, 64-bit road lengths past 2^53, an
+interpreter that must detect overflow, a CPU scheduler, JSON queries, hashing. Each language missed
+at most one per model there. Both ail misses were compiler bugs (the checker was stricter than
+the spec), fixed since, after which those unchanged programs pass. TypeScript's miss was a real
+logic bug. Details are in [`experiment/RESULTS.md`](experiment/RESULTS.md).
 
 ### Where ail still loses, and what comes next
 

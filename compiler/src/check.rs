@@ -4156,7 +4156,7 @@ impl Checker {
                 Some(r) => {
                     let r = r.clone();
                     let t = if discard {
-                        self.check_block(&arm.body, None)
+                        self.check_block(&arm.body, Some(&Ty::Unit))
                     } else {
                         self.check_block(&arm.body, Some(&r))
                     };
