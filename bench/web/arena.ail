@@ -1,0 +1,113 @@
+; arena: the `game` benchmark as a browser app (WebAssembly). Same world, same rules; each frame
+; is one update (Tick) plus one view that draws every entity. Play it with: ail web arena.ail
+
+(struct Entity (x F64) (y F64) (vx F64) (vy F64) (r F64) (hp I64))
+
+(struct World
+  (es (Vec Entity))
+  (grid (Vec (Vec I64)))
+  (cxs (Vec I64)) (cys (Vec I64))
+  (state I64)
+  (collisions I64) (respawns I64) (frames I64))
+
+(const W F64 1600.0)
+(const H F64 1200.0)
+(const N I64 4000)
+(const CELL F64 32.0)
+(const COLS I64 50)
+(const ROWS I64 37)
+(const SEED I64 12345)
+
+(fn next-rand (params (state (mut I64))) (returns I64)
+  (body
+    (set state (% (* state 48271) 2147483647))
+    state))
+
+(fn next-unit (params (state (mut I64))) (returns F64)
+  (body (/ (as F64 (next-rand (mut state))) 2147483647.0)))
+
+(fn spawn (params (state (mut I64))) (returns Entity)
+  (body
+    (let r (+ 3.0 (* (next-unit (mut state)) 9.0)))
+    (let x (+ r (* (next-unit (mut state)) (- W (* 2.0 r)))))
+    (let y (+ r (* (next-unit (mut state)) (- H (* 2.0 r)))))
+    (let angle (* (next-unit (mut state)) 6.283185307179586))
+    (let speed (+ 40.0 (* (next-unit (mut state)) 160.0)))
+    (new Entity (x x) (y y) (vx (* (cos angle) speed)) (vy (* (sin angle) speed)) (r r) (hp 3))))
+
+(fn init (returns World)
+  (body
+    (var state SEED)
+    (var es (Vec Entity) (vec))
+    (for _i (range 0 N) (push (mut es) (spawn (mut state))))
+    (new World (es es) (grid (fill (* COLS ROWS) (vec))) (cxs (fill N 0)) (cys (fill N 0))
+      (state state) (collisions 0) (respawns 0) (frames 0))))
+
+(fn move-all (params (es (mut (Vec Entity))) (dt F64))
+  (body
+    (for i (range 0 (len es))
+      (var e (at es i))
+      (set (. e x) (+ (. e x) (* (. e vx) dt)))
+      (set (. e y) (+ (. e y) (* (. e vy) dt)))
+      (if (< (. e x) (. e r))
+        (do (set (. e x) (. e r)) (set (. e vx) (- (. e vx))))
+        (if (> (. e x) (- W (. e r)))
+          (do (set (. e x) (- W (. e r))) (set (. e vx) (- (. e vx))))))
+      (if (< (. e y) (. e r))
+        (do (set (. e y) (. e r)) (set (. e vy) (- (. e vy))))
+        (if (> (. e y) (- H (. e r)))
+          (do (set (. e y) (- H (. e r))) (set (. e vy) (- (. e vy))))))
+      (set (at es i) e))))
+
+(fn cell-of (params (v F64) (limit I64)) (returns I64)
+  (body (min (as I64 (floor (/ v CELL))) (- limit 1))))
+
+(fn step (params (w (mut World)) (dt F64))
+  (body
+    (move-all (mut (. w es)) dt)
+    (for c (range 0 (* COLS ROWS)) (clear (mut (at (. w grid) c))))
+    (for i (range 0 N)
+      (let cx (cell-of (. (at (. w es) i) x) COLS))
+      (let cy (cell-of (. (at (. w es) i) y) ROWS))
+      (set (at (. w cxs) i) cx)
+      (set (at (. w cys) i) cy)
+      (push (mut (at (. w grid) (+ (* cy COLS) cx))) i))
+    (for i (range 0 N)
+      (let a (at (. w es) i))
+      (let cx (at (. w cxs) i))
+      (let cy (at (. w cys) i))
+      (for ny (range (max 0 (- cy 1)) (min ROWS (+ cy 2)))
+        (for nx (range (max 0 (- cx 1)) (min COLS (+ cx 2)))
+          (for j (at (. w grid) (+ (* ny COLS) nx))
+            (if (> j i)
+              (do
+                (let b (at (. w es) j))
+                (let ddx (- (. b x) (. a x)))
+                (let ddy (- (. b y) (. a y)))
+                (let rr (+ (. a r) (. b r)))
+                (if (< (+ (* ddx ddx) (* ddy ddy)) (* rr rr))
+                  (do
+                    (set (. w collisions) (+ (. w collisions) 1))
+                    (set (. (at (. w es) i) hp) (- (. (at (. w es) i) hp) 1))
+                    (set (. (at (. w es) j) hp) (- (. (at (. w es) j) hp) 1))))))))))
+    (for i (range 0 N)
+      (if (<= (. (at (. w es) i) hp) 0)
+        (do
+          (set (at (. w es) i) (spawn (mut (. w state))))
+          (set (. w respawns) (+ (. w respawns) 1)))))
+    (set (. w frames) (+ (. w frames) 1))))
+
+(fn update (params (w (mut World)) (e Event))
+  (body
+    (match e
+      (case (Event.Tick dt) (step (mut w) dt))
+      (case _ unit))))
+
+(fn view (params (w World) (g Gfx))
+  (body
+    (draw-clear g "#10131a")
+    (for e (. w es)
+      (let color (match (. e hp) (case 3 "#4dd0e1") (case 2 "#ffd54f") (case _ "#ff5d73")))
+      (draw-circle g (. e x) (. e y) (. e r) color))
+    (draw-text g 16.0 14.0 22.0 "#e6e6e6"
+      (str "frame " (. w frames) "  collisions " (. w collisions) "  respawns " (. w respawns)))))

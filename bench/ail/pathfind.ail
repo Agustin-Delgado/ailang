@@ -1,0 +1,117 @@
+; pathfind: A* on a 640x640 grid with a binary min-heap on a Vec.
+
+(const SIZE I64 640)
+(const QUERIES I64 40)
+
+; Park-Miller RNG
+(fn rand-below (params (state (mut I64)) (n I64)) (returns I64)
+  (body
+    (set state (% (* state 48271) 2147483647))
+    (% state n)))
+
+; Min-heap ordered by f = g + heuristic. Ties are irrelevant: any order yields the optimal length.
+(struct Entry (f I64) (g I64) (cell I64))
+
+(fn heap-push (params (h (mut (Vec Entry))) (e Entry))
+  (body
+    (push (mut h) e)
+    (var i (- (len h) 1))
+    (while (> i 0)
+      (let parent (/ (- i 1) 2))
+      (if (< (. (at h i) f) (. (at h parent) f))
+        (do
+          (swap (mut h) i parent)
+          (set i parent))
+        break))))
+
+(fn heap-pop (params (h (mut (Vec Entry)))) (returns (Option Entry))
+  (body
+    (let n (len h))
+    (if (== n 0) (return none))
+    (swap (mut h) 0 (- n 1))
+    (let top (expect (pop (mut h)) "heap is non-empty"))
+    (let m (- n 1))
+    (var i 0)
+    (while true
+      (let l (+ (* 2 i) 1))
+      (if (>= l m) break)
+      (let r (+ l 1))
+      (var c l)
+      (if (and (< r m) (< (. (at h r) f) (. (at h l) f))) (set c r))
+      (if (< (. (at h c) f) (. (at h i) f))
+        (do
+          (swap (mut h) i c)
+          (set i c))
+        break))
+    (some top)))
+
+(fn manhattan (params (a I64) (b I64)) (returns I64)
+  (body
+    (+ (abs (- (% a SIZE) (% b SIZE))) (abs (- (/ a SIZE) (/ b SIZE))))))
+
+; Length of the shortest path from start to goal, or -1 if unreachable.
+(fn astar (params (wall (Vec Bool)) (dist (mut (Vec I64))) (heap (mut (Vec Entry)))
+                  (start I64) (goal I64))
+  (returns I64)
+  (body
+    (for i (range 0 (len dist)) (set (at dist i) -1))
+    (clear (mut heap))
+    (set (at dist start) 0)
+    (heap-push (mut heap) (new Entry (f (manhattan start goal)) (g 0) (cell start)))
+    (while true
+      (let e (match (heap-pop (mut heap))
+        (case (some e) e)
+        (case none (return -1))))
+      (let cell (. e cell))
+      (let g (. e g))
+      (if (== cell goal) (return g))
+      (if (== g (at dist cell))
+        (do
+          (let x (% cell SIZE))
+          (let y (/ cell SIZE))
+          (let ng (+ g 1))
+          (for k (range 0 4)
+            (var nx x)
+            (var ny y)
+            (match k
+              (case 0 (set nx (- x 1)))
+              (case 1 (set nx (+ x 1)))
+              (case 2 (set ny (- y 1)))
+              (case _ (set ny (+ y 1))))
+            (if (and (>= nx 0) (< nx SIZE) (>= ny 0) (< ny SIZE))
+              (do
+                (let nb (+ (* ny SIZE) nx))
+                (if (and (not (at wall nb))
+                         (or (< (at dist nb) 0) (< ng (at dist nb))))
+                  (do
+                    (set (at dist nb) ng)
+                    (heap-push (mut heap)
+                      (new Entry (f (+ ng (manhattan nb goal))) (g ng) (cell nb)))))))))))
+    -1))
+
+(fn main (params (con Console))
+  (body
+    (var rng 2024)
+    (let cells (* SIZE SIZE))
+    (var wall (fill cells false))
+    (for i (range 0 cells)
+      (set (at wall i) (< (rand-below (mut rng) 100) 28)))
+    (set (at wall 0) false)
+    (set (at wall (- cells 1)) false)
+    (var dist (fill cells -1))
+    (var heap (Vec Entry) (vec))
+    (var total 0)
+    (for q (range 0 QUERIES)
+      (let sx (rand-below (mut rng) SIZE))
+      (let sy (rand-below (mut rng) SIZE))
+      (let gx (rand-below (mut rng) SIZE))
+      (let gy (rand-below (mut rng) SIZE))
+      (let start (+ (* sy SIZE) sx))
+      (let goal (+ (* gy SIZE) gx))
+      (let result
+        (if (or (at wall start) (at wall goal))
+          -2
+          (astar wall (mut dist) (mut heap) start goal)))
+      (if (>= result 0) (set total (+ total result)))
+      (println con "q" q " " result))
+    (println con "total " total)))

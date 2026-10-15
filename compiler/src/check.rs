@@ -93,7 +93,11 @@ pub fn check(prog: &Program) -> (Checked, Vec<Diag>) {
                 c.scopes = vec![HashMap::new()];
                 c.check_expect(&k.value, &t);
                 if !(t.is_numeric() || t == Ty::Bool || t.is_err()) {
-                    c.diags.push(Diag::error("E0110", k.ty.span, "const types must be numeric or Bool; use a fn for other values"));
+                    c.diags.push(Diag::error(
+                        "E0110",
+                        k.ty.span,
+                        "const types must be numeric or Bool; use a fn for other values",
+                    ));
                 }
             }
             _ => {}
@@ -103,10 +107,22 @@ pub fn check(prog: &Program) -> (Checked, Vec<Diag>) {
     clashes.sort_by_key(|x| x.1[0].start);
     for (name, spans) in clashes {
         let new = format!("my-{name}");
-        let edits = spans.iter().map(|s| Edit { span: *s, text: new.clone() }).collect();
+        let edits = spans
+            .iter()
+            .map(|s| Edit {
+                span: *s,
+                text: new.clone(),
+            })
+            .collect();
         c.diags.push(
-            Diag::warning("W0003", spans[0], &format!("'{name}' shadows the builtin of the same name; calls use your definition"))
-                .with_fix(&format!("rename it to '{new}' everywhere"), edits),
+            Diag::warning(
+                "W0003",
+                spans[0],
+                &format!(
+                    "'{name}' shadows the builtin of the same name; calls use your definition"
+                ),
+            )
+            .with_fix(&format!("rename it to '{new}' everywhere"), edits),
         );
     }
     let checked = Checked {
@@ -154,18 +170,128 @@ struct Checker {
 /// Names that cannot be variables or functions. Clause names (params, body...) are not here:
 /// they only mean something in their fixed position inside (fn ...).
 const KEYWORDS: &[&str] = &[
-    "let", "var", "set", "if", "do", "while", "for", "break", "continue", "return", "match", "case", "new", "with",
-    "try", "as", "copy", "mut", "range", "true", "false", "unit", "none",
+    "let", "var", "set", "if", "do", "while", "for", "break", "continue", "return", "match",
+    "case", "new", "with", "try", "as", "copy", "mut", "range", "true", "false", "unit", "none",
 ];
 
 pub const BUILTINS: &[&str] = &[
-    "+", "-", "*", "/", "%", "==", "!=", "<", "<=", ">", ">=", "and", "or", "not", "bit-and", "bit-or", "bit-xor", "shl", "shr",
-    "abs", "min", "max", "pow", "sqrt", "floor", "ceil", "round", "sin", "cos", "tan", "atan2", "exp", "ln", "str", "len",
-    "is-empty", "at", "vec", "fill", "push", "pop", "last", "insert-at", "remove-at", "swap", "clear", "extend", "slice",
-    "concat", "contains", "index-of", "sort", "reverse", "sum", "map", "put", "get", "has", "del", "keys", "values", "some",
-    "ok", "err", "unwrap-or", "expect", "is-some", "is-none", "is-ok", "is-err", "substr", "split", "trim", "starts-with",
-    "ends-with", "replace", "upper", "lower", "join", "parse-i64", "parse-f64", "chars", "byte-at", "repeat", "fmt-float", "from-code", "print",
-    "println", "eprintln", "read-line", "read-file", "write-file", "now-ms", "now-ns", "rand-int", "rand-f64", "args", "fail", "json-parse", "json-str", "http-next", "http-respond", "read-all", "lines", "is-digit", "is-alpha", "is-alnum", "is-space", "is-upper", "is-lower", "code-of", "sort-desc", "draw-clear", "draw-rect", "draw-circle", "draw-line", "draw-text",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "==",
+    "!=",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "and",
+    "or",
+    "not",
+    "bit-and",
+    "bit-or",
+    "bit-xor",
+    "shl",
+    "shr",
+    "abs",
+    "min",
+    "max",
+    "pow",
+    "sqrt",
+    "floor",
+    "ceil",
+    "round",
+    "sin",
+    "cos",
+    "tan",
+    "atan2",
+    "exp",
+    "ln",
+    "str",
+    "len",
+    "is-empty",
+    "at",
+    "vec",
+    "fill",
+    "push",
+    "pop",
+    "last",
+    "insert-at",
+    "remove-at",
+    "swap",
+    "clear",
+    "extend",
+    "slice",
+    "concat",
+    "contains",
+    "index-of",
+    "sort",
+    "reverse",
+    "sum",
+    "map",
+    "put",
+    "get",
+    "has",
+    "del",
+    "keys",
+    "values",
+    "some",
+    "ok",
+    "err",
+    "unwrap-or",
+    "expect",
+    "is-some",
+    "is-none",
+    "is-ok",
+    "is-err",
+    "substr",
+    "split",
+    "trim",
+    "starts-with",
+    "ends-with",
+    "replace",
+    "upper",
+    "lower",
+    "join",
+    "parse-i64",
+    "parse-f64",
+    "chars",
+    "byte-at",
+    "repeat",
+    "fmt-float",
+    "from-code",
+    "print",
+    "println",
+    "eprintln",
+    "read-line",
+    "read-file",
+    "write-file",
+    "now-ms",
+    "now-ns",
+    "rand-int",
+    "rand-f64",
+    "args",
+    "fail",
+    "json-parse",
+    "json-str",
+    "http-next",
+    "http-respond",
+    "read-all",
+    "lines",
+    "is-digit",
+    "is-alpha",
+    "is-alnum",
+    "is-space",
+    "is-upper",
+    "is-lower",
+    "code-of",
+    "sort-desc",
+    "draw-clear",
+    "draw-rect",
+    "draw-circle",
+    "draw-line",
+    "draw-text",
     "assert",
 ];
 
@@ -176,7 +302,11 @@ fn lev(a: &str, b: &str) -> usize {
     for i in 1..=a.len() {
         let mut cur = vec![i; b.len() + 1];
         for j in 1..=b.len() {
-            let cost = if a[i - 1].eq_ignore_ascii_case(&b[j - 1]) { 0 } else { 1 };
+            let cost = if a[i - 1].eq_ignore_ascii_case(&b[j - 1]) {
+                0
+            } else {
+                1
+            };
             cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
         }
         prev = cur;
@@ -261,11 +391,19 @@ impl Checker {
                 Item::Test(_) => continue,
             };
             if let Some(_prev) = seen.get(name) {
-                self.err(Diag::error("E0104", span, &format!("'{name}' is defined more than once")));
+                self.err(Diag::error(
+                    "E0104",
+                    span,
+                    &format!("'{name}' is defined more than once"),
+                ));
             }
             seen.insert(name.clone(), span);
             if KEYWORDS.contains(&name.as_str()) {
-                self.err(Diag::error("E0105", span, &format!("'{name}' is a keyword")));
+                self.err(Diag::error(
+                    "E0105",
+                    span,
+                    &format!("'{name}' is a keyword"),
+                ));
             } else if BUILTINS.contains(&name.as_str()) {
                 self.clash_uses.entry(name.clone()).or_default().push(span);
             }
@@ -278,15 +416,30 @@ impl Checker {
             match it {
                 Item::Struct(s) => {
                     if !s.name.starts_with(|c: char| c.is_ascii_uppercase()) {
-                        self.err(Diag::error("E0106", s.span, "type names start with an uppercase letter"));
+                        self.err(Diag::error(
+                            "E0106",
+                            s.span,
+                            "type names start with an uppercase letter",
+                        ));
                     }
-                    self.info.structs.insert(s.name.clone(), StructInfo { fields: Vec::new() });
+                    self.info
+                        .structs
+                        .insert(s.name.clone(), StructInfo { fields: Vec::new() });
                 }
                 Item::Enum(e) => {
                     if !e.name.starts_with(|c: char| c.is_ascii_uppercase()) {
-                        self.err(Diag::error("E0106", e.span, "type names start with an uppercase letter"));
+                        self.err(Diag::error(
+                            "E0106",
+                            e.span,
+                            "type names start with an uppercase letter",
+                        ));
                     }
-                    self.info.enums.insert(e.name.clone(), EnumInfo { variants: Vec::new() });
+                    self.info.enums.insert(
+                        e.name.clone(),
+                        EnumInfo {
+                            variants: Vec::new(),
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -297,29 +450,49 @@ impl Checker {
                     let mut fields = Vec::new();
                     for (fname, te) in &s.fields {
                         if fields.iter().any(|(n, _): &(String, Ty)| n == fname) {
-                            self.err(Diag::error("E0104", te.span, &format!("duplicate field '{fname}'")));
+                            self.err(Diag::error(
+                                "E0104",
+                                te.span,
+                                &format!("duplicate field '{fname}'"),
+                            ));
                         }
                         let t = self.resolve_type(te);
                         if t.contains_cap() {
-                            self.err(Diag::error("E0304", te.span, "capabilities cannot be stored in data; pass them as parameters"));
+                            self.err(Diag::error(
+                                "E0304",
+                                te.span,
+                                "capabilities cannot be stored in data; pass them as parameters",
+                            ));
                         }
                         fields.push((fname.clone(), t));
                     }
-                    self.info.structs.insert(s.name.clone(), StructInfo { fields });
+                    self.info
+                        .structs
+                        .insert(s.name.clone(), StructInfo { fields });
                 }
                 Item::Enum(e) => {
                     let mut variants = Vec::new();
                     for (vname, tys, vspan) in &e.variants {
                         if !vname.starts_with(|c: char| c.is_ascii_uppercase()) {
-                            self.err(Diag::error("E0106", *vspan, "variant names start with an uppercase letter"));
+                            self.err(Diag::error(
+                                "E0106",
+                                *vspan,
+                                "variant names start with an uppercase letter",
+                            ));
                         }
                         let ts: Vec<Ty> = tys.iter().map(|t| self.resolve_type(t)).collect();
                         if ts.iter().any(|t| t.contains_cap()) {
-                            self.err(Diag::error("E0304", *vspan, "capabilities cannot be stored in data; pass them as parameters"));
+                            self.err(Diag::error(
+                                "E0304",
+                                *vspan,
+                                "capabilities cannot be stored in data; pass them as parameters",
+                            ));
                         }
                         variants.push((vname.clone(), ts));
                     }
-                    self.info.enums.insert(e.name.clone(), EnumInfo { variants });
+                    self.info
+                        .enums
+                        .insert(e.name.clone(), EnumInfo { variants });
                 }
                 _ => {}
             }
@@ -332,9 +505,17 @@ impl Checker {
                         .iter()
                         .map(|p| (p.name.clone(), self.resolve_type(&p.ty), p.mutable))
                         .collect::<Vec<_>>();
-                    let ret = f.ret.as_ref().map(|t| self.resolve_type(t)).unwrap_or(Ty::Unit);
+                    let ret = f
+                        .ret
+                        .as_ref()
+                        .map(|t| self.resolve_type(t))
+                        .unwrap_or(Ty::Unit);
                     if ret.contains_cap() {
-                        self.err(Diag::error("E0304", f.ret.as_ref().unwrap().span, "functions cannot return capabilities"));
+                        self.err(Diag::error(
+                            "E0304",
+                            f.ret.as_ref().unwrap().span,
+                            "functions cannot return capabilities",
+                        ));
                     }
                     self.info.fns.insert(f.name.clone(), FnSig { params, ret });
                 }
@@ -350,10 +531,19 @@ impl Checker {
         if is_app {
             self.check_app_signatures(prog);
         }
-        if !is_app && !self.info.fns.contains_key("main") && !prog.items.iter().any(|i| matches!(i, Item::Test(_))) {
+        if !is_app
+            && !self.info.fns.contains_key("main")
+            && !prog.items.iter().any(|i| matches!(i, Item::Test(_)))
+        {
             self.err(
-                Diag::error("E0107", Span::new(0, 0), "program has no (fn main ...) and no tests")
-                    .note("entry point: (fn main (params (con Console)) (body (println con \"hello\")))"),
+                Diag::error(
+                    "E0107",
+                    Span::new(0, 0),
+                    "program has no (fn main ...) and no tests",
+                )
+                .note(
+                    "entry point: (fn main (params (con Console)) (body (println con \"hello\")))",
+                ),
             );
         }
     }
@@ -367,7 +557,8 @@ impl Checker {
             })
         };
         let model = self.info.fns["init"].ret.clone();
-        let only_caps = |ps: &[(String, Ty, bool)]| ps.iter().all(|p| matches!(p.1, Ty::Cap(_)) && !p.2);
+        let only_caps =
+            |ps: &[(String, Ty, bool)]| ps.iter().all(|p| matches!(p.1, Ty::Cap(_)) && !p.2);
         let bad = |c: &mut Checker, f: &str, want: String| {
             let sp = span_of(f).unwrap_or_default();
             c.err(Diag::error("E0308", sp, &format!("app function '{f}' must have the signature {want}")).note("an app is (fn init (returns Model)), (fn update (params (m (mut Model)) (e Event))) and (fn view (params (m Model) (g Gfx))) for a canvas or (fn page (params (m Model)) (returns Str)) for HTML; extra capability parameters may follow"));
@@ -384,23 +575,46 @@ impl Checker {
             && only_caps(&u.params[2..])
             && u.ret == Ty::Unit;
         if !ok_u {
-            bad(self, "update", format!("(fn update (params (m (mut {model})) (e Event)) ...)"));
+            bad(
+                self,
+                "update",
+                format!("(fn update (params (m (mut {model})) (e Event)) ...)"),
+            );
         }
-        match (self.info.fns.get("view").cloned(), self.info.fns.get("page").cloned()) {
+        match (
+            self.info.fns.get("view").cloned(),
+            self.info.fns.get("page").cloned(),
+        ) {
             (None, None) => {
                 let sp = span_of("init").unwrap_or_default();
                 self.err(Diag::error("E0308", sp, "an app needs (fn view (params (m Model) (g Gfx)) ...) to draw on a canvas or (fn page (params (m Model)) (returns Str) ...) for an HTML page"));
             }
             (Some(v), _) => {
-                let ok = v.params.len() >= 2 && v.params[0].1 == model && !v.params[0].2 && v.params[1].1 == Ty::Cap(Cap::Gfx) && only_caps(&v.params[2..]);
+                let ok = v.params.len() >= 2
+                    && v.params[0].1 == model
+                    && !v.params[0].2
+                    && v.params[1].1 == Ty::Cap(Cap::Gfx)
+                    && only_caps(&v.params[2..]);
                 if !ok {
-                    bad(self, "view", format!("(fn view (params (m {model}) (g Gfx)) ...)"));
+                    bad(
+                        self,
+                        "view",
+                        format!("(fn view (params (m {model}) (g Gfx)) ...)"),
+                    );
                 }
             }
             (None, Some(p)) => {
-                let ok = !p.params.is_empty() && p.params[0].1 == model && !p.params[0].2 && only_caps(&p.params[1..]) && p.ret == Ty::Str;
+                let ok = !p.params.is_empty()
+                    && p.params[0].1 == model
+                    && !p.params[0].2
+                    && only_caps(&p.params[1..])
+                    && p.ret == Ty::Str;
                 if !ok {
-                    bad(self, "page", format!("(fn page (params (m {model})) (returns Str) ...)"));
+                    bad(
+                        self,
+                        "page",
+                        format!("(fn page (params (m {model})) (returns Str) ...)"),
+                    );
                 }
             }
         }
@@ -409,7 +623,11 @@ impl Checker {
     fn resolve_type(&mut self, te: &TypeExpr) -> Ty {
         let arity = |c: &mut Checker, n: usize, shape: &str| -> bool {
             if te.args.len() != n {
-                c.err(Diag::error("E0108", te.span, &format!("type {} takes {n} argument(s): {shape}", te.name)));
+                c.err(Diag::error(
+                    "E0108",
+                    te.span,
+                    &format!("type {} takes {n} argument(s): {shape}", te.name),
+                ));
                 false
             } else {
                 true
@@ -456,7 +674,11 @@ impl Checker {
                 let k = self.resolve_type(&te.args[0]);
                 let v = self.resolve_type(&te.args[1]);
                 if !k.is_hashable() {
-                    self.err(Diag::error("E0109", te.args[0].span, "map keys must be an integer type, Str or Bool"));
+                    self.err(Diag::error(
+                        "E0109",
+                        te.args[0].span,
+                        "map keys must be an integer type, Str or Bool",
+                    ));
                 }
                 return Ty::Map(Box::new(k), Box::new(v));
             }
@@ -468,18 +690,27 @@ impl Checker {
                 let b = self.resolve_type(&te.args[1]);
                 return Ty::Res(Box::new(a), Box::new(b));
             }
-            n if self.info.structs.contains_key(n) || self.info.enums.contains_key(n) => Ty::User(n.to_string()),
+            n if self.info.structs.contains_key(n) || self.info.enums.contains_key(n) => {
+                Ty::User(n.to_string())
+            }
             n => {
                 let mut d = Diag::error("E0103", te.span, &format!("unknown type '{n}'"));
                 let fix = known_alias(n).map(|s| s.to_string()).or_else(|| {
-                    let mut names: Vec<&str> =
-                        vec!["I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "F32", "F64", "Bool", "Str", "Unit", "Vec", "Map", "Option", "Result", "Console", "Fs", "Clock", "Rand", "Env", "Net", "Gfx"];
+                    let mut names: Vec<&str> = vec![
+                        "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "F32", "F64", "Bool",
+                        "Str", "Unit", "Vec", "Map", "Option", "Result", "Console", "Fs", "Clock",
+                        "Rand", "Env", "Net", "Gfx",
+                    ];
                     names.extend(self.info.structs.keys().map(|s| s.as_str()));
                     names.extend(self.info.enums.keys().map(|s| s.as_str()));
                     closest(n, names.into_iter())
                 });
                 if let Some(f) = fix {
-                    let name_span = if simple { te.span } else { Span::new(te.span.start + 1, te.span.start + 1 + n.len()) };
+                    let name_span = if simple {
+                        te.span
+                    } else {
+                        Span::new(te.span.start + 1, te.span.start + 1 + n.len())
+                    };
                     d = d.with_fix_replace(name_span, &f, &format!("use '{f}'"));
                 }
                 self.err(d);
@@ -487,7 +718,11 @@ impl Checker {
             }
         };
         if !simple {
-            self.err(Diag::error("E0108", te.span, &format!("type {} takes no arguments", te.name)));
+            self.err(Diag::error(
+                "E0108",
+                te.span,
+                &format!("type {} takes no arguments", te.name),
+            ));
         }
         t
     }
@@ -513,7 +748,14 @@ impl Checker {
     }
 
     fn local(&self, name: &str, ty: Ty, kind: BindKind) -> Binding {
-        Binding { name: name.to_string(), ty, kind, loop_depth: self.loop_depth, decl_kw: None, param_ty_span: None }
+        Binding {
+            name: name.to_string(),
+            ty,
+            kind,
+            loop_depth: self.loop_depth,
+            decl_kw: None,
+            param_ty_span: None,
+        }
     }
 
     // ---------- fns ----------
@@ -533,13 +775,25 @@ impl Checker {
         let mut ids = Vec::new();
         for (p, (pname, pty, pmut)) in f.params.iter().zip(sig.params.iter()) {
             if self.lookup(pname).is_some() {
-                self.err(Diag::error("E0104", p.span, &format!("duplicate parameter '{pname}'")));
+                self.err(Diag::error(
+                    "E0104",
+                    p.span,
+                    &format!("duplicate parameter '{pname}'"),
+                ));
             }
             if KEYWORDS.contains(&pname.as_str()) {
-                self.err(Diag::error("E0105", p.span, &format!("'{pname}' is a keyword")));
+                self.err(Diag::error(
+                    "E0105",
+                    p.span,
+                    &format!("'{pname}' is a keyword"),
+                ));
             }
             if *pmut && matches!(pty, Ty::Cap(_)) {
-                self.err(Diag::error("E0305", p.span, "capabilities are never mutable parameters"));
+                self.err(Diag::error(
+                    "E0305",
+                    p.span,
+                    "capabilities are never mutable parameters",
+                ));
             }
             let mut b = self.local(pname, pty.clone(), BindKind::Param { mutable: *pmut });
             b.param_ty_span = Some(p.ty.span);
@@ -559,7 +813,11 @@ impl Checker {
             let ok_ret = matches!(&sig.ret, Ty::Unit | Ty::Err)
                 || sig.ret == Ty::Res(Box::new(Ty::Unit), Box::new(Ty::Str));
             if !ok_ret {
-                self.err(Diag::error("E0307", f.ret.as_ref().map(|t| t.span).unwrap_or(f.name_span), "main returns Unit or (Result Unit Str)"));
+                self.err(Diag::error(
+                    "E0307",
+                    f.ret.as_ref().map(|t| t.span).unwrap_or(f.name_span),
+                    "main returns Unit or (Result Unit Str)",
+                ));
             }
         }
         self.in_contract = true;
@@ -600,13 +858,18 @@ impl Checker {
     }
 
     fn compat(found: &Ty, expected: &Ty) -> bool {
-        found == expected || matches!(found, Ty::Never | Ty::Err) || expected.is_err() || Self::compat_inner(found, expected)
+        found == expected
+            || matches!(found, Ty::Never | Ty::Err)
+            || expected.is_err()
+            || Self::compat_inner(found, expected)
     }
 
     fn compat_inner(a: &Ty, b: &Ty) -> bool {
         match (a, b) {
             (Ty::Vec(x), Ty::Vec(y)) | (Ty::Opt(x), Ty::Opt(y)) => Self::compat(x, y),
-            (Ty::Map(x1, x2), Ty::Map(y1, y2)) | (Ty::Res(x1, x2), Ty::Res(y1, y2)) => Self::compat(x1, y1) && Self::compat(x2, y2),
+            (Ty::Map(x1, x2), Ty::Map(y1, y2)) | (Ty::Res(x1, x2), Ty::Res(y1, y2)) => {
+                Self::compat(x1, y1) && Self::compat(x2, y2)
+            }
             _ => false,
         }
     }
@@ -620,16 +883,32 @@ impl Checker {
     }
 
     fn mismatch(&mut self, e: &Expr, expected: &Ty, found: &Ty) {
-        let mut d = Diag::error("E0201", e.span, &format!("type mismatch: expected {expected}, found {found}"))
-            .with_expected(expected.to_string(), found.to_string());
+        let mut d = Diag::error(
+            "E0201",
+            e.span,
+            &format!("type mismatch: expected {expected}, found {found}"),
+        )
+        .with_expected(expected.to_string(), found.to_string());
         if found.is_numeric() && expected.is_numeric() {
-            d = d.with_fix_replace(e.span, &format!("(as {expected} {})", "\u{0}"), "convert with (as ...)");
+            d = d.with_fix_replace(
+                e.span,
+                &format!("(as {expected} {})", "\u{0}"),
+                "convert with (as ...)",
+            );
             // Fill in the original source text later in apply: we cannot see the source here, so use a sentinel.
         } else if *expected == Ty::Str && found.is_displayable() {
-            d = d.with_fix_replace(e.span, &format!("(str {})", "\u{0}"), "convert to Str with (str ...)");
+            d = d.with_fix_replace(
+                e.span,
+                &format!("(str {})", "\u{0}"),
+                "convert to Str with (str ...)",
+            );
         } else if let Ty::Opt(inner) = expected {
             if Self::compat(found, inner) {
-                d = d.with_fix_replace(e.span, &format!("(some {})", "\u{0}"), "wrap in (some ...)");
+                d = d.with_fix_replace(
+                    e.span,
+                    &format!("(some {})", "\u{0}"),
+                    "wrap in (some ...)",
+                );
             }
         } else if let Ty::Res(ok, _) = expected {
             if Self::compat(found, ok) {
@@ -638,7 +917,11 @@ impl Checker {
         }
         if let (Ty::Res(ok, _), true) = (found, !matches!(expected, Ty::Res(..))) {
             if Self::compat(ok, expected) && matches!(self.ret, Ty::Res(..)) {
-                d = d.with_fix_replace(e.span, &format!("(try {})", "\u{0}"), "propagate the error with (try ...)");
+                d = d.with_fix_replace(
+                    e.span,
+                    &format!("(try {})", "\u{0}"),
+                    "propagate the error with (try ...)",
+                );
             }
         }
         self.err(d);
@@ -653,12 +936,16 @@ impl Checker {
                 self.stmt_ids.insert(e.id);
             }
             t = self.check(e, if last { expected } else { None });
-            if !last && matches!(e.kind, ExprKind::Var(_) | ExprKind::Int(_) | ExprKind::Str(_) | ExprKind::Float(_)) {
-                self.err(Diag::warning("W0001", e.span, "this value is computed and discarded").with_fix_replace(
-                    e.span,
-                    "",
-                    "remove it",
-                ));
+            if !last
+                && matches!(
+                    e.kind,
+                    ExprKind::Var(_) | ExprKind::Int(_) | ExprKind::Str(_) | ExprKind::Float(_)
+                )
+            {
+                self.err(
+                    Diag::warning("W0001", e.span, "this value is computed and discarded")
+                        .with_fix_replace(e.span, "", "remove it"),
+                );
             }
         }
         if let Some(last) = es.last() {
@@ -677,12 +964,18 @@ impl Checker {
         }
         if !Self::compat(&t, expected) {
             match es.last() {
-                Some(last) if !matches!(last.kind, ExprKind::Let { .. }) => self.mismatch(last, expected, &t),
+                Some(last) if !matches!(last.kind, ExprKind::Let { .. }) => {
+                    self.mismatch(last, expected, &t)
+                }
                 _ => {
                     let at = es.last().map(|l| l.span).unwrap_or(span);
                     self.err(
-                        Diag::error("E0202", at, &format!("block must end with a value of type {expected}"))
-                            .with_expected(expected.to_string(), t.to_string()),
+                        Diag::error(
+                            "E0202",
+                            at,
+                            &format!("block must end with a value of type {expected}"),
+                        )
+                        .with_expected(expected.to_string(), t.to_string()),
                     )
                 }
             }
@@ -705,7 +998,11 @@ impl Checker {
         if let Ty::Int(k) = t {
             let (lo, hi) = k.range();
             if v < lo || v > hi {
-                self.err(Diag::error("E0203", e.span, &format!("literal {v} is out of range for {}", k.name())));
+                self.err(Diag::error(
+                    "E0203",
+                    e.span,
+                    &format!("literal {v} is out of range for {}", k.name()),
+                ));
             }
         }
         t
@@ -721,7 +1018,14 @@ impl Checker {
             },
             ExprKind::Str(_) => Ty::Str,
             ExprKind::Var(name) => self.check_var(e, name, exp),
-            ExprKind::Let { name, name_span, kw_span, mutable, ty, value } => {
+            ExprKind::Let {
+                name,
+                name_span,
+                kw_span,
+                mutable,
+                ty,
+                value,
+            } => {
                 let declared = ty.as_ref().map(|t| self.resolve_type(t));
                 let vt = match &declared {
                     Some(d) => {
@@ -731,13 +1035,25 @@ impl Checker {
                     None => self.check(value, None),
                 };
                 if KEYWORDS.contains(&name.as_str()) {
-                    self.err(Diag::error("E0105", *name_span, &format!("'{name}' is a keyword and cannot be a variable name")));
+                    self.err(Diag::error(
+                        "E0105",
+                        *name_span,
+                        &format!("'{name}' is a keyword and cannot be a variable name"),
+                    ));
                 }
                 if name.contains('.') {
-                    self.err(Diag::error("E0105", *name_span, "variable names cannot contain '.'"));
+                    self.err(Diag::error(
+                        "E0105",
+                        *name_span,
+                        "variable names cannot contain '.'",
+                    ));
                 }
                 if matches!(vt, Ty::Cap(_)) {
-                    self.err(Diag::error("E0304", e.span, "capabilities cannot be rebound; use the parameter directly"));
+                    self.err(Diag::error(
+                        "E0304",
+                        e.span,
+                        "capabilities cannot be rebound; use the parameter directly",
+                    ));
                 }
                 let vt = if vt == Ty::Never { Ty::Err } else { vt };
                 let mut b = self.local(name, vt, BindKind::Local { mutable: *mutable });
@@ -767,20 +1083,22 @@ impl Checker {
                 match f {
                     Some(f) => {
                         let tt = self.check(t, exp);
-                        let want = if tt == Ty::Never || tt.is_err() { exp.cloned() } else { Some(tt.clone()) };
+                        let want = if tt == Ty::Never || tt.is_err() {
+                            exp.cloned()
+                        } else {
+                            Some(tt.clone())
+                        };
                         let ft = match &want {
                             Some(w) => self.check_expect(f, w),
                             None => self.check(f, None),
                         };
-                        if tt == Ty::Never {
-                            ft
-                        } else {
-                            tt
-                        }
+                        if tt == Ty::Never { ft } else { tt }
                     }
                     None => {
                         let tt = self.check(t, None);
-                        if !matches!(tt, Ty::Unit | Ty::Never | Ty::Err) && exp.is_some_and(|x| *x != Ty::Unit) {
+                        if !matches!(tt, Ty::Unit | Ty::Never | Ty::Err)
+                            && exp.is_some_and(|x| *x != Ty::Unit)
+                        {
                             self.err(
                                 Diag::error("E0204", e.span, "(if c then) without else has type Unit; add an else branch to produce a value")
                                     .with_fix_insert(e.span.end - 1, " ELSE-VALUE", "add an else branch"),
@@ -811,7 +1129,11 @@ impl Checker {
                     ForIter::Range(a, b) => {
                         let at = self.check_same(&[&**a, &**b], Some(&Ty::Int(IntK::I64)));
                         if !at.is_int() && !at.is_err() {
-                            self.err(Diag::error("E0205", a.span, &format!("range bounds must be integers, found {at}")));
+                            self.err(Diag::error(
+                                "E0205",
+                                a.span,
+                                &format!("range bounds must be integers, found {at}"),
+                            ));
                         }
                         (at, BindKind::Local { mutable: false }, None)
                     }
@@ -821,23 +1143,43 @@ impl Checker {
                             Ty::Vec(t) => (**t).clone(),
                             Ty::Err => Ty::Err,
                             Ty::Map(..) => {
-                                self.err(Diag::error("E0206", v.span, "iterate a map with (for k (keys m) ...)").with_fix_replace(
-                                    v.span,
-                                    &format!("(keys {})", "\u{0}"),
-                                    "iterate the sorted keys",
-                                ));
+                                self.err(
+                                    Diag::error(
+                                        "E0206",
+                                        v.span,
+                                        "iterate a map with (for k (keys m) ...)",
+                                    )
+                                    .with_fix_replace(
+                                        v.span,
+                                        &format!("(keys {})", "\u{0}"),
+                                        "iterate the sorted keys",
+                                    ),
+                                );
                                 Ty::Err
                             }
                             Ty::Str => {
-                                self.err(Diag::error("E0206", v.span, "iterate a string with (for c (chars s) ...)").with_fix_replace(
-                                    v.span,
-                                    &format!("(chars {})", "\u{0}"),
-                                    "iterate characters",
-                                ));
+                                self.err(
+                                    Diag::error(
+                                        "E0206",
+                                        v.span,
+                                        "iterate a string with (for c (chars s) ...)",
+                                    )
+                                    .with_fix_replace(
+                                        v.span,
+                                        &format!("(chars {})", "\u{0}"),
+                                        "iterate characters",
+                                    ),
+                                );
                                 Ty::Err
                             }
                             other => {
-                                self.err(Diag::error("E0206", v.span, &format!("cannot iterate over {other}; expected a Vec or (range a b)")));
+                                self.err(Diag::error(
+                                    "E0206",
+                                    v.span,
+                                    &format!(
+                                        "cannot iterate over {other}; expected a Vec or (range a b)"
+                                    ),
+                                ));
                                 Ty::Err
                             }
                         };
@@ -862,13 +1204,21 @@ impl Checker {
             }
             ExprKind::Break | ExprKind::Continue => {
                 if self.loop_depth == 0 {
-                    self.err(Diag::error("E0207", e.span, "break/continue outside of a loop"));
+                    self.err(Diag::error(
+                        "E0207",
+                        e.span,
+                        "break/continue outside of a loop",
+                    ));
                 }
                 Ty::Never
             }
             ExprKind::Return(v) => {
                 if self.in_contract {
-                    self.err(Diag::error("E0601", e.span, "return is not allowed in contracts"));
+                    self.err(Diag::error(
+                        "E0601",
+                        e.span,
+                        "return is not allowed in contracts",
+                    ));
                 }
                 let ret = self.ret.clone();
                 match v {
@@ -877,7 +1227,11 @@ impl Checker {
                     }
                     None => {
                         if !matches!(ret, Ty::Unit | Ty::Err) {
-                            self.err(Diag::error("E0201", e.span, &format!("return needs a value of type {ret}")));
+                            self.err(Diag::error(
+                                "E0201",
+                                e.span,
+                                &format!("return needs a value of type {ret}"),
+                            ));
                         }
                     }
                 }
@@ -891,7 +1245,9 @@ impl Checker {
                         d = d.with_fix_replace(*nspan, &c, &format!("use '{c}'"));
                     }
                     if self.info.enums.contains_key(name) {
-                        d = d.note(format!("'{name}' is an enum; build it with (EnumName.Variant args...)"));
+                        d = d.note(format!(
+                            "'{name}' is an enum; build it with (EnumName.Variant args...)"
+                        ));
                     }
                     self.err(d);
                     for (_, _, v) in fields {
@@ -906,12 +1262,20 @@ impl Checker {
                 let bt = self.check(base, exp);
                 let Ty::User(name) = &bt else {
                     if !bt.is_err() {
-                        self.err(Diag::error("E0111", base.span, &format!("(with ...) needs a struct value, found {bt}")));
+                        self.err(Diag::error(
+                            "E0111",
+                            base.span,
+                            &format!("(with ...) needs a struct value, found {bt}"),
+                        ));
                     }
                     return Ty::Err;
                 };
                 let Some(si) = self.info.structs.get(name).cloned() else {
-                    self.err(Diag::error("E0111", base.span, &format!("(with ...) needs a struct value, found enum {bt}")));
+                    self.err(Diag::error(
+                        "E0111",
+                        base.span,
+                        &format!("(with ...) needs a struct value, found enum {bt}"),
+                    ));
                     return Ty::Err;
                 };
                 self.check_fields(e, name, &si, fields, false);
@@ -925,8 +1289,13 @@ impl Checker {
                         match si.fields.iter().find(|f| &f.0 == fname) {
                             Some((_, t)) => t.clone(),
                             None => {
-                                let mut d = Diag::error("E0112", *fspan, &format!("struct {n} has no field '{fname}'"));
-                                let names: Vec<&str> = si.fields.iter().map(|f| f.0.as_str()).collect();
+                                let mut d = Diag::error(
+                                    "E0112",
+                                    *fspan,
+                                    &format!("struct {n} has no field '{fname}'"),
+                                );
+                                let names: Vec<&str> =
+                                    si.fields.iter().map(|f| f.0.as_str()).collect();
                                 if let Some(c) = closest(fname, names.iter().copied()) {
                                     d = d.with_fix_replace(*fspan, &c, &format!("use '{c}'"));
                                 }
@@ -938,7 +1307,11 @@ impl Checker {
                     }
                     Ty::Err => Ty::Err,
                     other => {
-                        self.err(Diag::error("E0112", e.span, &format!("field access on {other}, which is not a struct")));
+                        self.err(Diag::error(
+                            "E0112",
+                            e.span,
+                            &format!("field access on {other}, which is not a struct"),
+                        ));
                         Ty::Err
                     }
                 }
@@ -967,19 +1340,34 @@ impl Checker {
                         Ty::Err
                     }
                     (other, _) => {
-                        self.err(Diag::error("E0208", e.span, &format!("try needs a Result or Option, found {other}")));
+                        self.err(Diag::error(
+                            "E0208",
+                            e.span,
+                            &format!("try needs a Result or Option, found {other}"),
+                        ));
                         Ty::Err
                     }
                 }
             }
             ExprKind::As(te, inner) => {
                 let target = self.resolve_type(te);
-                let it = self.check(inner, Some(&target));
+                // The operand keeps its own type: (as F64 (% n 1000)) is integer % then a conversion.
+                let it = self.check(inner, None);
                 if !(it.is_numeric() || it.is_err()) || !(target.is_numeric() || target.is_err()) {
                     if !(it.is_err() || target.is_err()) {
-                        let mut d = Diag::error("E0209", e.span, &format!("(as ...) converts between numeric types; cannot convert {it} to {target}"));
+                        let mut d = Diag::error(
+                            "E0209",
+                            e.span,
+                            &format!(
+                                "(as ...) converts between numeric types; cannot convert {it} to {target}"
+                            ),
+                        );
                         if target == Ty::Str {
-                            d = d.with_fix_replace(e.span, "(str VALUE)", "use (str x) to make a string");
+                            d = d.with_fix_replace(
+                                e.span,
+                                "(str VALUE)",
+                                "use (str x) to make a string",
+                            );
                         }
                         if it == Ty::Str && target.is_numeric() {
                             d = d.note("parse strings with (parse-i64 s) or (parse-f64 s), which return Option");
@@ -994,11 +1382,22 @@ impl Checker {
         }
     }
 
-    fn check_fields(&mut self, e: &Expr, name: &str, si: &StructInfo, fields: &[(String, Span, Expr)], all_required: bool) {
+    fn check_fields(
+        &mut self,
+        e: &Expr,
+        name: &str,
+        si: &StructInfo,
+        fields: &[(String, Span, Expr)],
+        all_required: bool,
+    ) {
         let mut seen = Vec::new();
         for (fname, fspan, v) in fields {
             if seen.contains(fname) {
-                self.err(Diag::error("E0113", *fspan, &format!("field '{fname}' given twice")));
+                self.err(Diag::error(
+                    "E0113",
+                    *fspan,
+                    &format!("field '{fname}' given twice"),
+                ));
             }
             seen.push(fname.clone());
             match si.fields.iter().find(|f| &f.0 == fname) {
@@ -1007,7 +1406,11 @@ impl Checker {
                     self.check_expect(v, &t);
                 }
                 None => {
-                    let mut d = Diag::error("E0112", *fspan, &format!("struct {name} has no field '{fname}'"));
+                    let mut d = Diag::error(
+                        "E0112",
+                        *fspan,
+                        &format!("struct {name} has no field '{fname}'"),
+                    );
                     if let Some(c) = closest(fname, si.fields.iter().map(|f| f.0.as_str())) {
                         d = d.with_fix_replace(*fspan, &c, &format!("use '{c}'"));
                     }
@@ -1017,13 +1420,26 @@ impl Checker {
             }
         }
         if all_required {
-            let missing: Vec<&(String, Ty)> = si.fields.iter().filter(|f| !seen.contains(&f.0)).collect();
+            let missing: Vec<&(String, Ty)> =
+                si.fields.iter().filter(|f| !seen.contains(&f.0)).collect();
             if !missing.is_empty() {
-                let names: Vec<String> = missing.iter().map(|f| format!("{} {}", f.0, f.1)).collect();
-                let ins: String = missing.iter().map(|f| format!(" ({} {})", f.0, placeholder(&f.1))).collect();
+                let names: Vec<String> =
+                    missing.iter().map(|f| format!("{} {}", f.0, f.1)).collect();
+                let ins: String = missing
+                    .iter()
+                    .map(|f| format!(" ({} {})", f.0, placeholder(&f.1)))
+                    .collect();
                 self.err(
-                    Diag::error("E0114", e.span, &format!("missing fields of {name}: {}", names.join(", ")))
-                        .with_fix_insert(e.span.end - 1, &ins, "add the missing fields with placeholder values"),
+                    Diag::error(
+                        "E0114",
+                        e.span,
+                        &format!("missing fields of {name}: {}", names.join(", ")),
+                    )
+                    .with_fix_insert(
+                        e.span.end - 1,
+                        &ins,
+                        "add the missing fields with placeholder values",
+                    ),
                 );
             }
         }
@@ -1035,7 +1451,11 @@ impl Checker {
             self.res[id] = Res::Local(b);
             let t = self.bindings[b].ty.clone();
             if self.in_contract && matches!(t, Ty::Cap(_)) {
-                self.err(Diag::error("E0303", e.span, "contracts must be pure: capabilities cannot be used here"));
+                self.err(Diag::error(
+                    "E0303",
+                    e.span,
+                    "contracts must be pure: capabilities cannot be used here",
+                ));
             }
             return t;
         }
@@ -1060,7 +1480,14 @@ impl Checker {
                         Ty::Err
                     }
                     Some(other) => {
-                        self.err(Diag::error("E0201", e.span, &format!("'none' is an Option, but {other} is expected")).with_expected(other.to_string(), "(Option ?)"));
+                        self.err(
+                            Diag::error(
+                                "E0201",
+                                e.span,
+                                &format!("'none' is an Option, but {other} is expected"),
+                            )
+                            .with_expected(other.to_string(), "(Option ?)"),
+                        );
                         Ty::Err
                     }
                 };
@@ -1078,7 +1505,10 @@ impl Checker {
                         self.err(Diag::error(
                             "E0115",
                             e.span,
-                            &format!("variant {name} has {} field(s); construct it as ({name} ...)", ei.variants[vi].1.len()),
+                            &format!(
+                                "variant {name} has {} field(s); construct it as ({name} ...)",
+                                ei.variants[vi].1.len()
+                            ),
                         ));
                         return Ty::Err;
                     }
@@ -1089,20 +1519,37 @@ impl Checker {
             }
         }
         if self.info.fns.contains_key(name) || BUILTINS.contains(&name) {
-            self.err(Diag::error("E0116", e.span, &format!("'{name}' is a function; call it as ({name} ...)")).note("functions are not values"));
+            self.err(
+                Diag::error(
+                    "E0116",
+                    e.span,
+                    &format!("'{name}' is a function; call it as ({name} ...)"),
+                )
+                .note("functions are not values"),
+            );
             return Ty::Err;
         }
         let mut d = Diag::error("E0101", e.span, &format!("unknown name '{name}'"));
         let visible = self.visible_names();
-        let fix = known_alias(name).map(|s| s.to_string()).or_else(|| closest(name, visible.iter().map(|s| s.as_str())));
+        let fix = known_alias(name)
+            .map(|s| s.to_string())
+            .or_else(|| closest(name, visible.iter().map(|s| s.as_str())));
         if let Some(f) = fix {
             d = d.with_fix_replace(e.span, &f, &format!("use '{f}'"));
         }
         if let Some(Ty::User(en)) = exp {
             if let Some(ei) = self.info.enums.get(en) {
                 if let Some(v) = ei.variants.iter().find(|v| v.0 == name) {
-                    d = Diag::error("E0101", e.span, &format!("unknown name '{name}'; enum variants are qualified"))
-                        .with_fix_replace(e.span, &format!("{en}.{}", v.0), &format!("use '{en}.{}'", v.0));
+                    d = Diag::error(
+                        "E0101",
+                        e.span,
+                        &format!("unknown name '{name}'; enum variants are qualified"),
+                    )
+                    .with_fix_replace(
+                        e.span,
+                        &format!("{en}.{}", v.0),
+                        &format!("use '{en}.{}'", v.0),
+                    );
                 }
             }
         }
@@ -1113,7 +1560,8 @@ impl Checker {
     fn unknown_variant(&mut self, span: Span, en: &str, vn: &str) -> Ty {
         let ei = &self.info.enums[en];
         let names: Vec<&str> = ei.variants.iter().map(|v| v.0.as_str()).collect();
-        let mut d = Diag::error("E0117", span, &format!("enum {en} has no variant '{vn}'")).note(format!("variants of {en}: {}", names.join(", ")));
+        let mut d = Diag::error("E0117", span, &format!("enum {en} has no variant '{vn}'"))
+            .note(format!("variants of {en}: {}", names.join(", ")));
         if let Some(c) = closest(vn, names.iter().copied()) {
             d = d.with_fix_replace(span, &format!("{en}.{c}"), &format!("use '{en}.{c}'"));
         }
@@ -1131,7 +1579,9 @@ impl Checker {
                 _ => None,
             },
             ExprKind::Field(b, _, _) => self.place_root(b),
-            ExprKind::Call(n, _, args) if n == "at" && args.len() == 2 => self.place_root(args[0].expr()),
+            ExprKind::Call(n, _, args) if n == "at" && args.len() == 2 => {
+                self.place_root(args[0].expr())
+            }
             _ => None,
         }
     }
@@ -1172,38 +1622,68 @@ impl Checker {
         match b.kind {
             BindKind::Local { mutable: true } | BindKind::Param { mutable: true } => {}
             BindKind::Local { mutable: false } => {
-                let mut d = Diag::error("E0401", place.span, &format!("cannot {what} '{}': it was declared with let", b.name));
+                let mut d = Diag::error(
+                    "E0401",
+                    place.span,
+                    &format!("cannot {what} '{}': it was declared with let", b.name),
+                );
                 if let Some(kw) = b.decl_kw {
                     d = d.with_fix_replace(kw, "var", "declare it with var");
                 }
                 self.err(d);
             }
             BindKind::Param { mutable: false } => {
-                let mut d = Diag::error("E0401", place.span, &format!("cannot {what} parameter '{}': it is read-only", b.name));
+                let mut d = Diag::error(
+                    "E0401",
+                    place.span,
+                    &format!("cannot {what} parameter '{}': it is read-only", b.name),
+                );
                 if let Some(ts) = b.param_ty_span {
                     d = d.with_fix(
                         "make the parameter mutable (callers must then pass (mut x))",
-                        vec![Edit { span: Span::new(ts.start, ts.start), text: "(mut ".into() }, Edit { span: Span::new(ts.end, ts.end), text: ")".into() }],
+                        vec![
+                            Edit {
+                                span: Span::new(ts.start, ts.start),
+                                text: "(mut ".into(),
+                            },
+                            Edit {
+                                span: Span::new(ts.end, ts.end),
+                                text: ")".into(),
+                            },
+                        ],
                     );
                 }
                 d = d.note("or work on a local copy: (var tmp (copy x))");
                 self.err(d);
             }
             BindKind::Borrow | BindKind::BoxBorrow => {
-                self.err(Diag::error(
-                    "E0401",
-                    place.span,
-                    &format!("cannot {what} '{}': loop and pattern bindings are read-only", b.name),
-                ).note("copy it into a var first: (var tmp (copy x))"));
+                self.err(
+                    Diag::error(
+                        "E0401",
+                        place.span,
+                        &format!(
+                            "cannot {what} '{}': loop and pattern bindings are read-only",
+                            b.name
+                        ),
+                    )
+                    .note("copy it into a var first: (var tmp (copy x))"),
+                );
             }
         }
         let path = self.place_path(place).map(|p| p.1).unwrap_or_default();
-        if self.iter_roots.iter().any(|(r, p)| *r == root && paths_overlap(p, &path)) {
-            self.err(Diag::error(
-                "E0403",
-                place.span,
-                &format!("cannot {what} '{}' while iterating over it", b.name),
-            ).note("iterate by index instead: (for i (range 0 (len v)) ...)"));
+        if self
+            .iter_roots
+            .iter()
+            .any(|(r, p)| *r == root && paths_overlap(p, &path))
+        {
+            self.err(
+                Diag::error(
+                    "E0403",
+                    place.span,
+                    &format!("cannot {what} '{}' while iterating over it", b.name),
+                )
+                .note("iterate by index instead: (for i (range 0 (len v)) ...)"),
+            );
         }
         Some(root)
     }
@@ -1228,9 +1708,23 @@ impl Checker {
         if let Arg::Mut(e, span) = a {
             let inner_span = e.span;
             self.err(
-                Diag::error("E0405", *span, "this argument is not mutated; pass it without (mut ...)").with_fix(
+                Diag::error(
+                    "E0405",
+                    *span,
+                    "this argument is not mutated; pass it without (mut ...)",
+                )
+                .with_fix(
                     "remove (mut ...)",
-                    vec![Edit { span: Span::new(span.start, inner_span.start), text: String::new() }, Edit { span: Span::new(inner_span.end, span.end), text: String::new() }],
+                    vec![
+                        Edit {
+                            span: Span::new(span.start, inner_span.start),
+                            text: String::new(),
+                        },
+                        Edit {
+                            span: Span::new(inner_span.end, span.end),
+                            text: String::new(),
+                        },
+                    ],
                 ),
             );
         }
@@ -1246,10 +1740,23 @@ impl Checker {
             }
             Arg::Val(e) => {
                 let t = self.check(e, None);
-                let mut d = Diag::error("E0406", e.span, "this argument is mutated by the call; mark it with (mut ...)");
+                let mut d = Diag::error(
+                    "E0406",
+                    e.span,
+                    "this argument is mutated by the call; mark it with (mut ...)",
+                );
                 d = d.with_fix(
                     "wrap it in (mut ...)",
-                    vec![Edit { span: Span::new(e.span.start, e.span.start), text: "(mut ".into() }, Edit { span: Span::new(e.span.end, e.span.end), text: ")".into() }],
+                    vec![
+                        Edit {
+                            span: Span::new(e.span.start, e.span.start),
+                            text: "(mut ".into(),
+                        },
+                        Edit {
+                            span: Span::new(e.span.end, e.span.end),
+                            text: ")".into(),
+                        },
+                    ],
                 );
                 self.err(d);
                 let r = self.place_root(e);
@@ -1259,20 +1766,40 @@ impl Checker {
     }
 
     fn cap_fix(&mut self, cap: Cap, head_span: Span, call_span: Span) -> Diag {
-        let mut d = Diag::error("E0301", call_span, &format!("this call needs a {} capability as its first argument", cap.name()));
-        let existing = self.scopes.iter().rev().flat_map(|s| s.iter()).find(|(_, b)| self.bindings[**b].ty == Ty::Cap(cap)).map(|(n, _)| n.clone());
+        let mut d = Diag::error(
+            "E0301",
+            call_span,
+            &format!(
+                "this call needs a {} capability as its first argument",
+                cap.name()
+            ),
+        );
+        let existing = self
+            .scopes
+            .iter()
+            .rev()
+            .flat_map(|s| s.iter())
+            .find(|(_, b)| self.bindings[**b].ty == Ty::Cap(cap))
+            .map(|(n, _)| n.clone());
         if let Some(n) = existing {
             return d.with_fix_insert(head_span.end, &format!(" {n}"), &format!("pass '{n}'"));
         }
         if self.in_test {
-            return d.note("tests are pure and receive no capabilities; test the pure logic instead");
+            return d
+                .note("tests are pure and receive no capabilities; test the pure logic instead");
         }
         let pname = cap.default_param();
         if let Some(f) = &self.cur_fn {
             let param_edit = if f.has_params_clause {
-                Edit { span: Span::new(f.param_insert_at, f.param_insert_at), text: format!(" ({pname} {})", cap.name()) }
+                Edit {
+                    span: Span::new(f.param_insert_at, f.param_insert_at),
+                    text: format!(" ({pname} {})", cap.name()),
+                }
             } else {
-                Edit { span: Span::new(f.name_span.end, f.name_span.end), text: format!(" (params ({pname} {}))", cap.name()) }
+                Edit {
+                    span: Span::new(f.name_span.end, f.name_span.end),
+                    text: format!(" (params ({pname} {}))", cap.name()),
+                }
             };
             d = d
                 .note(format!("function '{}' has no {} parameter; effects are explicit capabilities passed down from main", f.name, cap.name()))
@@ -1285,11 +1812,19 @@ impl Checker {
     }
 
     /// Returns remaining args after the capability, or None if the cap is missing (error reported).
-    fn need_cap<'a>(&mut self, cap: Cap, args: &'a [Arg], head_span: Span, call_span: Span) -> Option<&'a [Arg]> {
+    fn need_cap<'a>(
+        &mut self,
+        cap: Cap,
+        args: &'a [Arg],
+        head_span: Span,
+        call_span: Span,
+    ) -> Option<&'a [Arg]> {
         if let Some(first) = args.first() {
             let e = first.expr();
             let is_cap_var = match &e.kind {
-                ExprKind::Var(n) => self.lookup(n).map(|b| self.bindings[b].ty.clone()) == Some(Ty::Cap(cap)),
+                ExprKind::Var(n) => {
+                    self.lookup(n).map(|b| self.bindings[b].ty.clone()) == Some(Ty::Cap(cap))
+                }
                 _ => false,
             };
             if is_cap_var {
@@ -1301,7 +1836,15 @@ impl Checker {
                 if let Some(b) = self.lookup(n) {
                     if let Ty::Cap(other) = self.bindings[b].ty {
                         self.check(e, None);
-                        self.err(Diag::error("E0302", e.span, &format!("expected a {} capability, '{n}' is a {}", cap.name(), other.name())));
+                        self.err(Diag::error(
+                            "E0302",
+                            e.span,
+                            &format!(
+                                "expected a {} capability, '{n}' is a {}",
+                                cap.name(),
+                                other.name()
+                            ),
+                        ));
                         return None;
                     }
                 }
@@ -1317,7 +1860,14 @@ impl Checker {
 
     fn arity(&mut self, name: &str, args: &[Arg], n: usize, span: Span, shape: &str) -> bool {
         if args.len() != n {
-            self.err(Diag::error("E0211", span, &format!("'{name}' takes {n} argument(s): {shape}, got {}", args.len())));
+            self.err(Diag::error(
+                "E0211",
+                span,
+                &format!(
+                    "'{name}' takes {n} argument(s): {shape}, got {}",
+                    args.len()
+                ),
+            ));
             for a in args {
                 self.check(a.expr(), None);
             }
@@ -1356,13 +1906,28 @@ impl Checker {
             }
         }
         if let Some(a) = &anchor {
-            if a.is_int() && exp.map_or(true, |t| !t.is_numeric()) && es.iter().any(|e| has_float_lit(e)) {
-                if let Some((i, x)) = es.iter().enumerate().find(|(i, x)| done[*i] && !Self::is_literal(x)) {
+            if a.is_int()
+                && exp.map_or(true, |t| !t.is_numeric())
+                && es.iter().any(|e| has_float_lit(e))
+            {
+                if let Some((i, x)) = es
+                    .iter()
+                    .enumerate()
+                    .find(|(i, x)| done[*i] && !Self::is_literal(x))
+                {
                     let _ = i;
                     self.err(
-                        Diag::error("E0201", x.span, &format!("this is {a} but it is combined with a float literal"))
-                            .with_expected("F64", a.to_string())
-                            .with_fix_replace(x.span, &format!("(as F64 {})", "\u{0}"), "convert it with (as F64 ...)"),
+                        Diag::error(
+                            "E0201",
+                            x.span,
+                            &format!("this is {a} but it is combined with a float literal"),
+                        )
+                        .with_expected("F64", a.to_string())
+                        .with_fix_replace(
+                            x.span,
+                            &format!("(as F64 {})", "\u{0}"),
+                            "convert it with (as F64 ...)",
+                        ),
                     );
                     for (j, y) in es.iter().enumerate() {
                         if !done[j] {
@@ -1397,7 +1962,14 @@ impl Checker {
         args.iter().map(|a| self.arg_val(a)).collect()
     }
 
-    fn check_call(&mut self, e: &Expr, name: &str, nspan: Span, args: &[Arg], exp: Option<&Ty>) -> Ty {
+    fn check_call(
+        &mut self,
+        e: &Expr,
+        name: &str,
+        nspan: Span,
+        args: &[Arg],
+        exp: Option<&Ty>,
+    ) -> Ty {
         let id = e.id as usize;
         if self.info.fns.contains_key(name) {
             if let Some(v) = self.clash_uses.get_mut(name) {
@@ -1417,12 +1989,31 @@ impl Checker {
                 self.res[id] = Res::Variant(en.to_string(), vi);
                 let fts = ei.variants[vi].1.clone();
                 if fts.is_empty() {
-                    self.err(Diag::error("E0115", e.span, &format!("variant {name} has no fields; write it without parens")).with_fix_replace(e.span, name, "remove the parens"));
+                    self.err(
+                        Diag::error(
+                            "E0115",
+                            e.span,
+                            &format!("variant {name} has no fields; write it without parens"),
+                        )
+                        .with_fix_replace(
+                            e.span,
+                            name,
+                            "remove the parens",
+                        ),
+                    );
                     return Ty::User(en.to_string());
                 }
                 if args.len() != fts.len() {
                     let shape: Vec<String> = fts.iter().map(|t| t.to_string()).collect();
-                    self.err(Diag::error("E0211", e.span, &format!("{name} takes {} field(s): ({name} {})", fts.len(), shape.join(" "))));
+                    self.err(Diag::error(
+                        "E0211",
+                        e.span,
+                        &format!(
+                            "{name} takes {} field(s): ({name} {})",
+                            fts.len(),
+                            shape.join(" ")
+                        ),
+                    ));
                 }
                 for (a, t) in args.iter().zip(fts.iter()) {
                     let ex = self.arg_val(a);
@@ -1438,15 +2029,26 @@ impl Checker {
         for a in args {
             self.check(a.expr(), None);
         }
+        if matches!(name, "Vec" | "Map" | "Option" | "Result" | "Str" | "Bool" | "Unit" | "I8" | "I16" | "I32" | "I64" | "U8" | "U16" | "U32" | "U64" | "F32" | "F64") {
+            self.err(
+                Diag::error("E0102", nspan, &format!("'{name}' is a type, not a value or function"))
+                    .note("types never appear inside expressions; put the type on the binding: (var grid (Vec (Vec I64)) (fill n (vec)))"),
+            );
+            return Ty::Err;
+        }
         let mut d = Diag::error("E0102", nspan, &format!("unknown function '{name}'"));
         let mut cands: Vec<&str> = BUILTINS.to_vec();
         cands.extend(self.info.fns.keys().map(|s| s.as_str()));
-        let fix = known_alias(name).map(|s| s.to_string()).or_else(|| closest(name, cands.into_iter()));
+        let fix = known_alias(name)
+            .map(|s| s.to_string())
+            .or_else(|| closest(name, cands.into_iter()));
         if let Some(f) = fix {
             d = d.with_fix_replace(nspan, &f, &format!("use '{f}'"));
         }
         if self.info.structs.contains_key(name) {
-            d = d.note(format!("to build a struct write (new {name} (field value)...)"));
+            d = d.note(format!(
+                "to build a struct write (new {name} (field value)...)"
+            ));
         } else if d.fixes.is_empty() && !name.contains('.') {
             // Probably a helper the program forgot to define: show the signature its call implies.
             let params: Vec<String> = args
@@ -1454,7 +2056,11 @@ impl Checker {
                 .enumerate()
                 .map(|(i, a)| {
                     let t = self.ty[a.expr().id as usize].clone();
-                    let t = if t.is_err() { "TYPE".to_string() } else { t.to_string() };
+                    let t = if t.is_err() {
+                        "TYPE".to_string()
+                    } else {
+                        t.to_string()
+                    };
                     match a {
                         Arg::Mut(..) => format!("(p{} (mut {t}))", i + 1),
                         Arg::Val(_) => format!("(p{} {t})", i + 1),
@@ -1465,13 +2071,36 @@ impl Checker {
                 Some(t) if !t.is_err() => format!(" (returns {t})"),
                 _ => String::new(),
             };
-            let params = if params.is_empty() { String::new() } else { format!(" (params {})", params.join(" ")) };
+            let params = if params.is_empty() {
+                String::new()
+            } else {
+                format!(" (params {})", params.join(" "))
+            };
             d = d.note(format!("if it is a helper you meant to write, define it: (fn {name}{params}{ret} (body ...))"));
         }
-        if let Some(ei) = self.info.enums.values().find(|ei| ei.variants.iter().any(|v| v.0 == name)) {
-            let en = self.info.enums.iter().find(|(_, v)| std::ptr::eq(*v, ei)).map(|(k, _)| k.clone()).unwrap();
-            d = Diag::error("E0102", nspan, &format!("unknown function '{name}'; enum variants are qualified"))
-                .with_fix_replace(nspan, &format!("{en}.{name}"), &format!("use '{en}.{name}'"));
+        if let Some(ei) = self
+            .info
+            .enums
+            .values()
+            .find(|ei| ei.variants.iter().any(|v| v.0 == name))
+        {
+            let en = self
+                .info
+                .enums
+                .iter()
+                .find(|(_, v)| std::ptr::eq(*v, ei))
+                .map(|(k, _)| k.clone())
+                .unwrap();
+            d = Diag::error(
+                "E0102",
+                nspan,
+                &format!("unknown function '{name}'; enum variants are qualified"),
+            )
+            .with_fix_replace(
+                nspan,
+                &format!("{en}.{name}"),
+                &format!("use '{en}.{name}'"),
+            );
         }
         self.err(d);
         Ty::Err
@@ -1480,26 +2109,58 @@ impl Checker {
     fn check_user_call(&mut self, e: &Expr, name: &str, nspan: Span, args: &[Arg]) -> Ty {
         let sig = self.info.fns[name].clone();
         // Missing capability arguments: caller passed exactly the non-capability params.
-        let ncap = sig.params.iter().filter(|p| matches!(p.1, Ty::Cap(_))).count();
+        let ncap = sig
+            .params
+            .iter()
+            .filter(|p| matches!(p.1, Ty::Cap(_)))
+            .count();
         let arg_is_cap = |c: &Checker, a: &Arg| match &a.expr().kind {
-            ExprKind::Var(n) => c.lookup(n).is_some_and(|b| matches!(c.bindings[b].ty, Ty::Cap(_))),
+            ExprKind::Var(n) => c
+                .lookup(n)
+                .is_some_and(|b| matches!(c.bindings[b].ty, Ty::Cap(_))),
             _ => false,
         };
-        if ncap > 0 && args.len() == sig.params.len() - ncap && !args.iter().any(|a| arg_is_cap(self, a)) {
-            let missing: Vec<Cap> = sig.params.iter().filter_map(|p| if let Ty::Cap(c) = p.1 { Some(c) } else { None }).collect();
+        if ncap > 0
+            && args.len() == sig.params.len() - ncap
+            && !args.iter().any(|a| arg_is_cap(self, a))
+        {
+            let missing: Vec<Cap> = sig
+                .params
+                .iter()
+                .filter_map(|p| if let Ty::Cap(c) = p.1 { Some(c) } else { None })
+                .collect();
             let mut edits = Vec::new();
             let mut ai = 0;
             let mut add_params = Vec::new();
             for p in &sig.params {
                 if let Ty::Cap(c) = p.1 {
-                    let at = if ai < args.len() { args[ai].expr().span.start } else { e.span.end - 1 };
-                    let have = self.scopes.iter().rev().flat_map(|s| s.iter()).find(|(_, b)| self.bindings[**b].ty == Ty::Cap(c)).map(|(n, _)| n.clone());
-                    let n = have.clone().unwrap_or_else(|| c.default_param().to_string());
+                    let at = if ai < args.len() {
+                        args[ai].expr().span.start
+                    } else {
+                        e.span.end - 1
+                    };
+                    let have = self
+                        .scopes
+                        .iter()
+                        .rev()
+                        .flat_map(|s| s.iter())
+                        .find(|(_, b)| self.bindings[**b].ty == Ty::Cap(c))
+                        .map(|(n, _)| n.clone());
+                    let n = have
+                        .clone()
+                        .unwrap_or_else(|| c.default_param().to_string());
                     if have.is_none() {
                         add_params.push(c);
                     }
-                    let text = if ai < args.len() { format!("{n} ") } else { format!(" {n}") };
-                    edits.push(Edit { span: Span::new(at, at), text });
+                    let text = if ai < args.len() {
+                        format!("{n} ")
+                    } else {
+                        format!(" {n}")
+                    };
+                    edits.push(Edit {
+                        span: Span::new(at, at),
+                        text,
+                    });
                 } else {
                     ai += 1;
                 }
@@ -1507,21 +2168,40 @@ impl Checker {
             let mut d = Diag::error(
                 "E0301",
                 e.span,
-                &format!("'{name}' needs capabilities {} passed explicitly", missing.iter().map(|c| c.name()).collect::<Vec<_>>().join(", ")),
+                &format!(
+                    "'{name}' needs capabilities {} passed explicitly",
+                    missing
+                        .iter()
+                        .map(|c| c.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
             );
             if self.in_test && !add_params.is_empty() {
                 d = d.note("tests are pure and receive no capabilities");
             } else if let Some(f) = &self.cur_fn {
                 if !add_params.is_empty() {
-                    let text: String = add_params.iter().map(|c| format!(" ({} {})", c.default_param(), c.name())).collect();
+                    let text: String = add_params
+                        .iter()
+                        .map(|c| format!(" ({} {})", c.default_param(), c.name()))
+                        .collect();
                     let pe = if f.has_params_clause {
-                        Edit { span: Span::new(f.param_insert_at, f.param_insert_at), text }
+                        Edit {
+                            span: Span::new(f.param_insert_at, f.param_insert_at),
+                            text,
+                        }
                     } else {
-                        Edit { span: Span::new(f.name_span.end, f.name_span.end), text: format!(" (params{text})") }
+                        Edit {
+                            span: Span::new(f.name_span.end, f.name_span.end),
+                            text: format!(" (params{text})"),
+                        }
                     };
                     edits.push(pe);
                 }
-                d = d.with_fix("pass the capabilities (adding parameters to this function if needed)", edits);
+                d = d.with_fix(
+                    "pass the capabilities (adding parameters to this function if needed)",
+                    edits,
+                );
             }
             self.err(d);
             for a in args {
@@ -1530,12 +2210,29 @@ impl Checker {
             return sig.ret;
         }
         if args.len() != sig.params.len() {
-            let shape: Vec<String> = sig.params.iter().map(|(n, t, m)| if *m { format!("(mut {n}: {t})") } else { format!("{n}: {t}") }).collect();
-            self.err(Diag::error(
-                "E0211",
-                nspan,
-                &format!("'{name}' takes {} argument(s), got {}", sig.params.len(), args.len()),
-            ).note(format!("signature: ({name} {})", shape.join(" "))));
+            let shape: Vec<String> = sig
+                .params
+                .iter()
+                .map(|(n, t, m)| {
+                    if *m {
+                        format!("(mut {n}: {t})")
+                    } else {
+                        format!("{n}: {t}")
+                    }
+                })
+                .collect();
+            self.err(
+                Diag::error(
+                    "E0211",
+                    nspan,
+                    &format!(
+                        "'{name}' takes {} argument(s), got {}",
+                        sig.params.len(),
+                        args.len()
+                    ),
+                )
+                .note(format!("signature: ({name} {})", shape.join(" "))),
+            );
             for a in args {
                 self.check(a.expr(), None);
             }
@@ -1568,7 +2265,14 @@ impl Checker {
                 if let Ty::Cap(c) = pt {
                     let t = self.check(x, Some(pt));
                     if t != Ty::Cap(*c) && !t.is_err() {
-                        self.err(Diag::error("E0302", x.span, &format!("parameter '{pname}' expects a {} capability, found {t}", c.name())));
+                        self.err(Diag::error(
+                            "E0302",
+                            x.span,
+                            &format!(
+                                "parameter '{pname}' expects a {} capability, found {t}",
+                                c.name()
+                            ),
+                        ));
                     }
                 } else {
                     self.check_expect(x, pt);
@@ -1583,10 +2287,18 @@ impl Checker {
                     continue;
                 }
                 let by_ref = !self.info.is_copy(pt) && self.place_root(x).is_some();
-                let mpath = args.iter().find(|a| a.expr().span == *rspan).map(|a| path_of(self, a.expr())).unwrap_or_default();
+                let mpath = args
+                    .iter()
+                    .find(|a| a.expr().span == *rspan)
+                    .map(|a| path_of(self, a.expr()))
+                    .unwrap_or_default();
                 let xpath = path_of(self, x);
                 let conflict = if *pmut {
-                    mut_roots.iter().enumerate().any(|(k, (r2, s2))| k != i && r2 == root && *s2 == x.span) && paths_overlap(&mpath, &xpath)
+                    mut_roots
+                        .iter()
+                        .enumerate()
+                        .any(|(k, (r2, s2))| k != i && r2 == root && *s2 == x.span)
+                        && paths_overlap(&mpath, &xpath)
                 } else {
                     by_ref && self.place_root(x) == Some(*root) && paths_overlap(&mpath, &xpath)
                 };
@@ -1609,12 +2321,23 @@ impl Checker {
             }
         }
         if self.in_contract && sig.params.iter().any(|p| matches!(p.1, Ty::Cap(_))) {
-            self.err(Diag::error("E0303", e.span, "contracts must be pure: this function takes capabilities"));
+            self.err(Diag::error(
+                "E0303",
+                e.span,
+                "contracts must be pure: this function takes capabilities",
+            ));
         }
         sig.ret
     }
 
-    fn check_builtin(&mut self, e: &Expr, name: &str, nspan: Span, args: &[Arg], exp: Option<&Ty>) -> Ty {
+    fn check_builtin(
+        &mut self,
+        e: &Expr,
+        name: &str,
+        nspan: Span,
+        args: &[Arg],
+        exp: Option<&Ty>,
+    ) -> Ty {
         let span = e.span;
         let n = args.len();
         macro_rules! ar {
@@ -1627,23 +2350,51 @@ impl Checker {
         match name {
             "+" | "*" | "-" | "/" | "%" => {
                 if n == 0 || (name != "-" && n < 2) || ((name == "/" || name == "%") && n != 2) {
-                    self.err(Diag::error("E0211", span, &format!("'{name}' takes {} arguments", if name == "+" || name == "*" { "2 or more" } else if name == "-" { "1 or 2" } else { "2" })));
+                    self.err(Diag::error(
+                        "E0211",
+                        span,
+                        &format!(
+                            "'{name}' takes {} arguments",
+                            if name == "+" || name == "*" {
+                                "2 or more"
+                            } else if name == "-" {
+                                "1 or 2"
+                            } else {
+                                "2"
+                            }
+                        ),
+                    ));
                     for a in args {
                         self.check(a.expr(), None);
                     }
                     return Ty::Err;
                 }
                 if name == "-" && n > 2 {
-                    self.err(Diag::error("E0211", span, "'-' takes 1 or 2 arguments; nest them: (- (- a b) c)"));
+                    self.err(Diag::error(
+                        "E0211",
+                        span,
+                        "'-' takes 1 or 2 arguments; nest them: (- (- a b) c)",
+                    ));
                 }
                 let es = self.vals(args);
                 let t = self.check_same(&es, exp);
                 if t == Ty::Str && name == "+" {
-                    self.err(Diag::error("E0212", nspan, "strings are joined with (str a b ...), not +").with_fix_replace(nspan, "str", "use str"));
+                    self.err(
+                        Diag::error(
+                            "E0212",
+                            nspan,
+                            "strings are joined with (str a b ...), not +",
+                        )
+                        .with_fix_replace(nspan, "str", "use str"),
+                    );
                     return Ty::Str;
                 }
                 if !t.is_numeric() && !t.is_err() {
-                    self.err(Diag::error("E0212", span, &format!("'{name}' needs numbers, found {t}")));
+                    self.err(Diag::error(
+                        "E0212",
+                        span,
+                        &format!("'{name}' needs numbers, found {t}"),
+                    ));
                     return Ty::Err;
                 }
                 t
@@ -1653,7 +2404,11 @@ impl Checker {
                 let es = self.vals(args);
                 let t = self.check_same(&es, None);
                 if matches!(t, Ty::Cap(_)) {
-                    self.err(Diag::error("E0212", span, "capabilities cannot be compared"));
+                    self.err(Diag::error(
+                        "E0212",
+                        span,
+                        "capabilities cannot be compared",
+                    ));
                 }
                 Ty::Bool
             }
@@ -1668,7 +2423,11 @@ impl Checker {
             }
             "and" | "or" => {
                 if n < 2 {
-                    self.err(Diag::error("E0211", span, &format!("'{name}' takes 2 or more arguments")));
+                    self.err(Diag::error(
+                        "E0211",
+                        span,
+                        &format!("'{name}' takes 2 or more arguments"),
+                    ));
                 }
                 for a in args {
                     let x = self.arg_val(a);
@@ -1693,7 +2452,11 @@ impl Checker {
                     self.check_same(&es, exp)
                 };
                 if !t.is_int() && !t.is_err() {
-                    self.err(Diag::error("E0212", span, &format!("'{name}' needs integers, found {t}")));
+                    self.err(Diag::error(
+                        "E0212",
+                        span,
+                        &format!("'{name}' needs integers, found {t}"),
+                    ));
                 }
                 t
             }
@@ -1702,7 +2465,11 @@ impl Checker {
                 let x = self.arg_val(&args[0]);
                 let t = self.check(x, exp);
                 if !t.is_numeric() && !t.is_err() {
-                    self.err(Diag::error("E0212", span, &format!("abs needs a number, found {t}")));
+                    self.err(Diag::error(
+                        "E0212",
+                        span,
+                        &format!("abs needs a number, found {t}"),
+                    ));
                 }
                 t
             }
@@ -1711,7 +2478,11 @@ impl Checker {
                 let es = self.vals(args);
                 let t = self.check_same(&es, exp);
                 if !self.info.orderable(&t) {
-                    self.err(Diag::error("E0212", span, &format!("'{name}' needs comparable values, found {t}")));
+                    self.err(Diag::error(
+                        "E0212",
+                        span,
+                        &format!("'{name}' needs comparable values, found {t}"),
+                    ));
                 }
                 t
             }
@@ -1724,19 +2495,35 @@ impl Checker {
                 } else if t.is_float() {
                     self.check_expect(es[1], &t.clone());
                 } else if !t.is_err() {
-                    self.err(Diag::error("E0212", span, &format!("pow needs a number, found {t}")));
+                    self.err(Diag::error(
+                        "E0212",
+                        span,
+                        &format!("pow needs a number, found {t}"),
+                    ));
                 }
                 t
             }
             "sqrt" | "floor" | "ceil" | "round" | "sin" | "cos" | "tan" | "exp" | "ln" => {
                 ar!(1, "(sqrt x)");
                 let x = self.arg_val(&args[0]);
-                let want = if matches!(exp, Some(Ty::F32)) { Ty::F32 } else { Ty::F64 };
+                let want = if matches!(exp, Some(Ty::F32)) {
+                    Ty::F32
+                } else {
+                    Ty::F64
+                };
                 let t = self.check(x, Some(&want));
                 if !t.is_float() && !t.is_err() {
                     self.err(
-                        Diag::error("E0212", x.span, &format!("'{name}' needs a float, found {t}"))
-                            .with_fix_replace(x.span, &format!("(as F64 {})", "\u{0}"), "convert with (as F64 ...)"),
+                        Diag::error(
+                            "E0212",
+                            x.span,
+                            &format!("'{name}' needs a float, found {t}"),
+                        )
+                        .with_fix_replace(
+                            x.span,
+                            &format!("(as F64 {})", "\u{0}"),
+                            "convert with (as F64 ...)",
+                        ),
                     );
                     return Ty::F64;
                 }
@@ -1748,7 +2535,9 @@ impl Checker {
                 self.check_same(&es, Some(&Ty::F64))
             }
             "str" | "print" | "println" | "eprintln" => {
-                let rest = if name == "str" { args } else {
+                let rest = if name == "str" {
+                    args
+                } else {
                     match self.need_cap(Cap::Console, args, nspan, span) {
                         Some(r) => r,
                         None => return if name == "str" { Ty::Str } else { Ty::Unit },
@@ -1759,9 +2548,15 @@ impl Checker {
                     let t = self.check(x, None);
                     if !t.is_displayable() {
                         let hint = match &t {
-                            Ty::Opt(_) | Ty::Res(..) => "unwrap it first with (unwrap-or x default) or (match x ...)",
-                            Ty::Vec(_) => "join the elements, e.g. (join strings \", \") after converting them with str",
-                            Ty::User(_) => "format the fields one by one: (str (. p x) \",\" (. p y))",
+                            Ty::Opt(_) | Ty::Res(..) => {
+                                "unwrap it first with (unwrap-or x default) or (match x ...)"
+                            }
+                            Ty::Vec(_) => {
+                                "join the elements, e.g. (join strings \", \") after converting them with str"
+                            }
+                            Ty::User(_) => {
+                                "format the fields one by one: (str (. p x) \",\" (. p y))"
+                            }
                             _ => "convert it to text explicitly",
                         };
                         self.err(Diag::error("E0213", x.span, &format!("cannot turn {t} into text; only numbers, Bool and Str are displayable")).note(hint));
@@ -1774,9 +2569,17 @@ impl Checker {
                 let x = self.arg_val(&args[0]);
                 let t = self.check(x, None);
                 if !matches!(t, Ty::Vec(_) | Ty::Str | Ty::Map(..) | Ty::Err) {
-                    self.err(Diag::error("E0214", x.span, &format!("'{name}' works on Vec, Str and Map, found {t}")));
+                    self.err(Diag::error(
+                        "E0214",
+                        x.span,
+                        &format!("'{name}' works on Vec, Str and Map, found {t}"),
+                    ));
                 }
-                if name == "len" { Ty::Int(IntK::I64) } else { Ty::Bool }
+                if name == "len" {
+                    Ty::Int(IntK::I64)
+                } else {
+                    Ty::Bool
+                }
             }
             "at" => {
                 ar!(2, "(at vec index)");
@@ -1787,7 +2590,14 @@ impl Checker {
                     Ty::Vec(el) => *el,
                     Ty::Err => Ty::Err,
                     Ty::Map(..) => {
-                        self.err(Diag::error("E0214", nspan, "use (get m k) on maps; it returns an Option").with_fix_replace(nspan, "get", "use get"));
+                        self.err(
+                            Diag::error(
+                                "E0214",
+                                nspan,
+                                "use (get m k) on maps; it returns an Option",
+                            )
+                            .with_fix_replace(nspan, "get", "use get"),
+                        );
                         Ty::Err
                     }
                     Ty::Str => {
@@ -1795,7 +2605,11 @@ impl Checker {
                         Ty::Err
                     }
                     other => {
-                        self.err(Diag::error("E0214", es[0].span, &format!("(at ...) needs a Vec, found {other}")));
+                        self.err(Diag::error(
+                            "E0214",
+                            es[0].span,
+                            &format!("(at ...) needs a Vec, found {other}"),
+                        ));
                         Ty::Err
                     }
                 }
@@ -1809,7 +2623,14 @@ impl Checker {
                     return match el {
                         Some(t) => Ty::Vec(Box::new(t)),
                         None => {
-                            self.err(Diag::error("E0210", span, "cannot infer the element type of an empty (vec)").note("annotate the binding: (var xs (Vec I64) (vec))"));
+                            self.err(
+                                Diag::error(
+                                    "E0210",
+                                    span,
+                                    "cannot infer the element type of an empty (vec)",
+                                )
+                                .note("annotate the binding: (var xs (Vec I64) (vec))"),
+                            );
                             Ty::Err
                         }
                     };
@@ -1888,7 +2709,11 @@ impl Checker {
                 ar!(1, "(clear (mut x))");
                 let (t, _) = self.arg_mut(&args[0]);
                 if !matches!(t, Ty::Vec(_) | Ty::Map(..) | Ty::Str | Ty::Err) {
-                    self.err(Diag::error("E0214", args[0].expr().span, &format!("clear works on Vec, Map and Str, found {t}")));
+                    self.err(Diag::error(
+                        "E0214",
+                        args[0].expr().span,
+                        &format!("clear works on Vec, Map and Str, found {t}"),
+                    ));
                 }
                 Ty::Unit
             }
@@ -1910,7 +2735,11 @@ impl Checker {
                 self.check_expect(es[1], &Ty::Int(IntK::I64));
                 self.check_expect(es[2], &Ty::Int(IntK::I64));
                 if !matches!(t, Ty::Vec(_) | Ty::Err) {
-                    let mut d = Diag::error("E0214", es[0].span, &format!("slice needs a Vec, found {t}"));
+                    let mut d = Diag::error(
+                        "E0214",
+                        es[0].span,
+                        &format!("slice needs a Vec, found {t}"),
+                    );
                     if t == Ty::Str {
                         d = d.with_fix_replace(nspan, "substr", "use substr for strings");
                     }
@@ -1924,7 +2753,11 @@ impl Checker {
                 let t = self.check(es[0], exp);
                 self.check_expect(es[1], &t.clone());
                 if !matches!(t, Ty::Vec(_) | Ty::Err) {
-                    let mut d = Diag::error("E0214", es[0].span, &format!("concat joins two Vecs, found {t}"));
+                    let mut d = Diag::error(
+                        "E0214",
+                        es[0].span,
+                        &format!("concat joins two Vecs, found {t}"),
+                    );
                     if t == Ty::Str {
                         d = d.with_fix_replace(nspan, "str", "use (str a b) for strings");
                     }
@@ -1945,23 +2778,38 @@ impl Checker {
                         self.check_expect(es[1], &Ty::Str);
                     }
                     Ty::Map(..) => {
-                        self.err(Diag::error("E0214", nspan, "use (has m k) for maps").with_fix_replace(nspan, "has", "use has"));
+                        self.err(
+                            Diag::error("E0214", nspan, "use (has m k) for maps")
+                                .with_fix_replace(nspan, "has", "use has"),
+                        );
                     }
                     Ty::Err => {
                         self.check(es[1], None);
                     }
                     other => {
-                        self.err(Diag::error("E0214", es[0].span, &format!("'{name}' works on Vec or Str, found {other}")));
+                        self.err(Diag::error(
+                            "E0214",
+                            es[0].span,
+                            &format!("'{name}' works on Vec or Str, found {other}"),
+                        ));
                     }
                 }
-                if name == "contains" { Ty::Bool } else { Ty::Opt(Box::new(Ty::Int(IntK::I64))) }
+                if name == "contains" {
+                    Ty::Bool
+                } else {
+                    Ty::Opt(Box::new(Ty::Int(IntK::I64)))
+                }
             }
             "sort" | "sort-desc" | "reverse" => {
                 ar!(1, "(sort (mut vec))");
                 let (vt, _) = self.arg_mut(&args[0]);
                 let el = self.vec_elem(&vt, args[0].expr().span, name);
                 if name != "reverse" && !self.info.orderable(&el) {
-                    self.err(Diag::error("E0214", args[0].expr().span, &format!("sort cannot order elements of type {el} (maps have no order)")));
+                    self.err(Diag::error(
+                        "E0214",
+                        args[0].expr().span,
+                        &format!("sort cannot order elements of type {el} (maps have no order)"),
+                    ));
                 }
                 Ty::Unit
             }
@@ -1971,7 +2819,11 @@ impl Checker {
                 let vt = self.check(x, exp.map(|t| Ty::Vec(Box::new(t.clone()))).as_ref());
                 let el = self.vec_elem(&vt, x.span, name);
                 if !el.is_numeric() && !el.is_err() {
-                    self.err(Diag::error("E0214", x.span, &format!("sum needs numeric elements, found {el}")));
+                    self.err(Diag::error(
+                        "E0214",
+                        x.span,
+                        &format!("sum needs numeric elements, found {el}"),
+                    ));
                 }
                 el
             }
@@ -1982,7 +2834,10 @@ impl Checker {
                 match exp {
                     Some(t @ Ty::Map(..)) => t.clone(),
                     _ => {
-                        self.err(Diag::error("E0210", span, "cannot infer the key/value types of (map)").note("annotate the binding: (var m (Map Str I64) (map))"));
+                        self.err(
+                            Diag::error("E0210", span, "cannot infer the key/value types of (map)")
+                                .note("annotate the binding: (var m (Map Str I64) (map))"),
+                        );
                         Ty::Err
                     }
                 }
@@ -2004,12 +2859,19 @@ impl Checker {
                 if let Ty::Vec(el) = &mt {
                     let el = (**el).clone();
                     self.check(es[1], None);
-                    self.err(Diag::error("E0214", nspan, "use (at v i) on vectors").with_fix_replace(nspan, "at", "use at"));
+                    self.err(
+                        Diag::error("E0214", nspan, "use (at v i) on vectors")
+                            .with_fix_replace(nspan, "at", "use at"),
+                    );
                     return el;
                 }
                 let (k, v) = self.map_kv(&mt, es[0].span);
                 self.check_expect(es[1], &k);
-                if name == "get" { Ty::Opt(Box::new(v)) } else { Ty::Bool }
+                if name == "get" {
+                    Ty::Opt(Box::new(v))
+                } else {
+                    Ty::Bool
+                }
             }
             "del" => {
                 ar!(2, "(del (mut map) key)");
@@ -2044,7 +2906,11 @@ impl Checker {
                 let x = self.arg_val(&args[0]);
                 match exp {
                     Some(Ty::Res(a, b)) => {
-                        let want = if name == "ok" { (**a).clone() } else { (**b).clone() };
+                        let want = if name == "ok" {
+                            (**a).clone()
+                        } else {
+                            (**b).clone()
+                        };
                         self.check_expect(x, &want);
                         Ty::Res(a.clone(), b.clone())
                     }
@@ -2054,10 +2920,19 @@ impl Checker {
                     }
                     _ => {
                         self.check(x, None);
-                        let mut d = Diag::error("E0210", span, &format!("cannot infer the full Result type of ({name} ...) here"))
-                            .note("use it where a Result is expected (return value, annotated let)");
+                        let mut d = Diag::error(
+                            "E0210",
+                            span,
+                            &format!("cannot infer the full Result type of ({name} ...) here"),
+                        )
+                        .note("use it where a Result is expected (return value, annotated let)");
                         if let Some(other) = exp {
-                            d = Diag::error("E0201", span, &format!("({name} ...) builds a Result, but {other} is expected")).with_expected(other.to_string(), "(Result ? ?)");
+                            d = Diag::error(
+                                "E0201",
+                                span,
+                                &format!("({name} ...) builds a Result, but {other} is expected"),
+                            )
+                            .with_expected(other.to_string(), "(Result ? ?)");
                         }
                         self.err(d);
                         Ty::Err
@@ -2072,7 +2947,11 @@ impl Checker {
                     Ty::Opt(i) | Ty::Res(i, _) => (**i).clone(),
                     Ty::Err => Ty::Err,
                     other => {
-                        self.err(Diag::error("E0214", es[0].span, &format!("unwrap-or needs an Option or Result, found {other}")));
+                        self.err(Diag::error(
+                            "E0214",
+                            es[0].span,
+                            &format!("unwrap-or needs an Option or Result, found {other}"),
+                        ));
                         Ty::Err
                     }
                 };
@@ -2088,7 +2967,11 @@ impl Checker {
                     Ty::Opt(i) | Ty::Res(i, _) => (**i).clone(),
                     Ty::Err => Ty::Err,
                     other => {
-                        self.err(Diag::error("E0214", es[0].span, &format!("expect needs an Option or Result, found {other}")));
+                        self.err(Diag::error(
+                            "E0214",
+                            es[0].span,
+                            &format!("expect needs an Option or Result, found {other}"),
+                        ));
                         Ty::Err
                     }
                 }
@@ -2102,7 +2985,11 @@ impl Checker {
                     _ => matches!(t, Ty::Res(..) | Ty::Err),
                 };
                 if !ok {
-                    self.err(Diag::error("E0214", x.span, &format!("'{name}' does not apply to {t}")));
+                    self.err(Diag::error(
+                        "E0214",
+                        x.span,
+                        &format!("'{name}' does not apply to {t}"),
+                    ));
                 }
                 Ty::Bool
             }
@@ -2152,7 +3039,11 @@ impl Checker {
                 ar!(1, "(parse-i64 s)");
                 let x = self.arg_val(&args[0]);
                 self.check_expect(x, &Ty::Str);
-                Ty::Opt(Box::new(if name == "parse-i64" { Ty::Int(IntK::I64) } else { Ty::F64 }))
+                Ty::Opt(Box::new(if name == "parse-i64" {
+                    Ty::Int(IntK::I64)
+                } else {
+                    Ty::F64
+                }))
             }
             "chars" => {
                 ar!(1, "(chars s)");
@@ -2172,7 +3063,18 @@ impl Checker {
                 let es = self.vals(args);
                 let t = self.check(es[0], Some(&Ty::F64));
                 if !t.is_float() && !t.is_err() {
-                    self.err(Diag::error("E0212", es[0].span, &format!("fmt-float needs a float, found {t}")).with_fix_replace(es[0].span, &format!("(as F64 {})", "\u{0}"), "convert with (as F64 ...)"));
+                    self.err(
+                        Diag::error(
+                            "E0212",
+                            es[0].span,
+                            &format!("fmt-float needs a float, found {t}"),
+                        )
+                        .with_fix_replace(
+                            es[0].span,
+                            &format!("(as F64 {})", "\u{0}"),
+                            "convert with (as F64 ...)",
+                        ),
+                    );
                 }
                 self.check_expect(es[1], &Ty::Int(IntK::I64));
                 Ty::Str
@@ -2192,14 +3094,25 @@ impl Checker {
             }
             "read-line" => {
                 if self.need_cap(Cap::Console, args, nspan, span).is_some() && n != 1 {
-                    self.err(Diag::error("E0211", span, "(read-line con) takes only the capability"));
+                    self.err(Diag::error(
+                        "E0211",
+                        span,
+                        "(read-line con) takes only the capability",
+                    ));
                 }
                 Ty::Opt(Box::new(Ty::Str))
             }
             "read-file" => {
                 if let Some(rest) = self.need_cap(Cap::Fs, args, nspan, span) {
                     if rest.len() != 2 {
-                        self.err(Diag::error("E0211", span, "(read-file fs path max-bytes): the size limit is mandatory").note("unbounded reads are not representable in ail"));
+                        self.err(
+                            Diag::error(
+                                "E0211",
+                                span,
+                                "(read-file fs path max-bytes): the size limit is mandatory",
+                            )
+                            .note("unbounded reads are not representable in ail"),
+                        );
                     } else {
                         let p = self.arg_val(&rest[0]);
                         self.check_expect(p, &Ty::Str);
@@ -2224,14 +3137,22 @@ impl Checker {
             }
             "now-ms" | "now-ns" => {
                 if self.need_cap(Cap::Clock, args, nspan, span).is_some() && n != 1 {
-                    self.err(Diag::error("E0211", span, &format!("({name} clock) takes only the capability")));
+                    self.err(Diag::error(
+                        "E0211",
+                        span,
+                        &format!("({name} clock) takes only the capability"),
+                    ));
                 }
                 Ty::Int(IntK::I64)
             }
             "rand-int" => {
                 if let Some(rest) = self.need_cap(Cap::Rand, args, nspan, span) {
                     if rest.len() != 2 {
-                        self.err(Diag::error("E0211", span, "(rand-int rng low high): high is exclusive"));
+                        self.err(Diag::error(
+                            "E0211",
+                            span,
+                            "(rand-int rng low high): high is exclusive",
+                        ));
                     } else {
                         for a in rest {
                             let x = self.arg_val(a);
@@ -2243,13 +3164,21 @@ impl Checker {
             }
             "rand-f64" => {
                 if self.need_cap(Cap::Rand, args, nspan, span).is_some() && n != 1 {
-                    self.err(Diag::error("E0211", span, "(rand-f64 rng) takes only the capability; returns [0, 1)"));
+                    self.err(Diag::error(
+                        "E0211",
+                        span,
+                        "(rand-f64 rng) takes only the capability; returns [0, 1)",
+                    ));
                 }
                 Ty::F64
             }
             "args" => {
                 if self.need_cap(Cap::Env, args, nspan, span).is_some() && n != 1 {
-                    self.err(Diag::error("E0211", span, "(args env) takes only the capability"));
+                    self.err(Diag::error(
+                        "E0211",
+                        span,
+                        "(args env) takes only the capability",
+                    ));
                 }
                 Ty::Vec(Box::new(Ty::Str))
             }
@@ -2276,7 +3205,11 @@ impl Checker {
             }
             "read-all" => {
                 if self.need_cap(Cap::Console, args, nspan, span).is_some() && n != 1 {
-                    self.err(Diag::error("E0211", span, "(read-all con) takes only the capability"));
+                    self.err(Diag::error(
+                        "E0211",
+                        span,
+                        "(read-all con) takes only the capability",
+                    ));
                 }
                 Ty::Str
             }
@@ -2305,9 +3238,15 @@ impl Checker {
                 Ty::Res(Box::new(Ty::User("Json".into())), Box::new(Ty::Str))
             }
             "json-str" => {
-                ar!(1, "(json-str json)");
+                ar!(1, "(json-str value)");
                 let x = self.arg_val(&args[0]);
-                self.check_expect(x, &Ty::User("Json".into()));
+                let t = self.check(x, None);
+                if !t.is_err() && !json_encodable(&self.info, &t, &mut Vec::new()) {
+                    self.err(
+                        Diag::error("E0212", x.span, &format!("json-str cannot encode {t}"))
+                            .note("it encodes Json and any value built from numbers, Bool, Str, Vec, Option, (Map Str V) and structs of those"),
+                    );
+                }
                 Ty::Str
             }
             "http-next" => {
@@ -2326,7 +3265,11 @@ impl Checker {
             "http-respond" => {
                 if let Some(rest) = self.need_cap(Cap::Net, args, nspan, span) {
                     if rest.len() != 4 {
-                        self.err(Diag::error("E0211", span, "(http-respond net request status content-type body)"));
+                        self.err(Diag::error(
+                            "E0211",
+                            span,
+                            "(http-respond net request status content-type body)",
+                        ));
                     } else {
                         let r = self.arg_val(&rest[0]);
                         self.check_expect(r, &Ty::User("Request".into()));
@@ -2348,7 +3291,11 @@ impl Checker {
             }
             "assert" => {
                 if n != 1 && n != 2 {
-                    self.err(Diag::error("E0211", span, "(assert condition) or (assert condition \"message\")"));
+                    self.err(Diag::error(
+                        "E0211",
+                        span,
+                        "(assert condition) or (assert condition \"message\")",
+                    ));
                     return Ty::Unit;
                 }
                 let x = self.arg_val(&args[0]);
@@ -2368,7 +3315,11 @@ impl Checker {
             Ty::Vec(el) => (**el).clone(),
             Ty::Err => Ty::Err,
             other => {
-                self.err(Diag::error("E0214", span, &format!("'{what}' needs a Vec, found {other}")));
+                self.err(Diag::error(
+                    "E0214",
+                    span,
+                    &format!("'{what}' needs a Vec, found {other}"),
+                ));
                 Ty::Err
             }
         }
@@ -2379,7 +3330,11 @@ impl Checker {
             Ty::Map(k, v) => ((**k).clone(), (**v).clone()),
             Ty::Err => (Ty::Err, Ty::Err),
             other => {
-                self.err(Diag::error("E0214", span, &format!("expected a Map, found {other}")));
+                self.err(Diag::error(
+                    "E0214",
+                    span,
+                    &format!("expected a Map, found {other}"),
+                ));
                 (Ty::Err, Ty::Err)
             }
         }
@@ -2397,7 +3352,14 @@ impl Checker {
         let mut first_ty: Option<Ty> = None;
         for arm in arms {
             if total {
-                self.err(Diag::warning("W0002", arm.span, "unreachable arm: an earlier arm already matches everything").with_fix_replace(arm.span, "", "remove it"));
+                self.err(
+                    Diag::warning(
+                        "W0002",
+                        arm.span,
+                        "unreachable arm: an earlier arm already matches everything",
+                    )
+                    .with_fix_replace(arm.span, "", "remove it"),
+                );
             }
             self.scopes.push(HashMap::new());
             let refutable = self.check_pat(&arm.pat, &st, false);
@@ -2409,7 +3371,11 @@ impl Checker {
             let t = match &result {
                 Some(r) => {
                     let r = r.clone();
-                    let t = if discard { self.check_block(&arm.body, None) } else { self.check_block(&arm.body, Some(&r)) };
+                    let t = if discard {
+                        self.check_block(&arm.body, None)
+                    } else {
+                        self.check_block(&arm.body, Some(&r))
+                    };
                     if !discard && !Self::compat(&t, &r) && !(r == Ty::Unit && exp.is_none()) {
                         match arm.body.last() {
                             Some(l) => self.mismatch(l, &r, &t),
@@ -2430,15 +3396,28 @@ impl Checker {
         }
         if !total {
             let needed: Option<Vec<(String, String)>> = match &st {
-                Ty::Bool => Some(vec![("true".into(), "true".into()), ("false".into(), "false".into())]),
-                Ty::Opt(_) => Some(vec![("none".into(), "none".into()), ("some".into(), "(some _)".into())]),
-                Ty::Res(..) => Some(vec![("ok".into(), "(ok _)".into()), ("err".into(), "(err _)".into())]),
+                Ty::Bool => Some(vec![
+                    ("true".into(), "true".into()),
+                    ("false".into(), "false".into()),
+                ]),
+                Ty::Opt(_) => Some(vec![
+                    ("none".into(), "none".into()),
+                    ("some".into(), "(some _)".into()),
+                ]),
+                Ty::Res(..) => Some(vec![
+                    ("ok".into(), "(ok _)".into()),
+                    ("err".into(), "(err _)".into()),
+                ]),
                 Ty::User(n) if self.info.enums.contains_key(n) => Some(
                     self.info.enums[n]
                         .variants
                         .iter()
                         .map(|(v, fs)| {
-                            let p = if fs.is_empty() { format!("{n}.{v}") } else { format!("({n}.{v}{})", " _".repeat(fs.len())) };
+                            let p = if fs.is_empty() {
+                                format!("{n}.{v}")
+                            } else {
+                                format!("({n}.{v}{})", " _".repeat(fs.len()))
+                            };
                             (v.clone(), p)
                         })
                         .collect(),
@@ -2447,18 +3426,40 @@ impl Checker {
                 _ => Some(Vec::new()),
             };
             if let Some(needed) = needed {
-                let missing: Vec<&(String, String)> = needed.iter().filter(|(k, _)| !covered.contains(k)).collect();
+                let missing: Vec<&(String, String)> = needed
+                    .iter()
+                    .filter(|(k, _)| !covered.contains(k))
+                    .collect();
                 if needed.is_empty() {
                     self.err(
-                        Diag::error("E0502", e.span, &format!("match on {st} must end with a catch-all arm (case _ ...)"))
-                            .with_fix_insert(e.span.end - 1, " (case _ (fail \"unhandled case\"))", "add a catch-all arm (replace the body)"),
+                        Diag::error(
+                            "E0502",
+                            e.span,
+                            &format!("match on {st} must end with a catch-all arm (case _ ...)"),
+                        )
+                        .with_fix_insert(
+                            e.span.end - 1,
+                            " (case _ (fail \"unhandled case\"))",
+                            "add a catch-all arm (replace the body)",
+                        ),
                     );
                 } else if !missing.is_empty() {
                     let pats: Vec<&str> = missing.iter().map(|m| m.1.as_str()).collect();
-                    let ins: String = missing.iter().map(|m| format!(" (case {} (fail \"TODO: handle {}\"))", m.1, m.0)).collect();
+                    let ins: String = missing
+                        .iter()
+                        .map(|m| format!(" (case {} (fail \"TODO: handle {}\"))", m.1, m.0))
+                        .collect();
                     self.err(
-                        Diag::error("E0501", e.span, &format!("match is not exhaustive: missing {}", pats.join(", ")))
-                            .with_fix_insert(e.span.end - 1, &ins, "add the missing arms (replace each placeholder body)"),
+                        Diag::error(
+                            "E0501",
+                            e.span,
+                            &format!("match is not exhaustive: missing {}", pats.join(", ")),
+                        )
+                        .with_fix_insert(
+                            e.span.end - 1,
+                            &ins,
+                            "add the missing arms (replace each placeholder body)",
+                        ),
                     );
                 }
             }
@@ -2474,7 +3475,11 @@ impl Checker {
 
     /// Returns true if the pattern is refutable.
     fn check_pat(&mut self, p: &Pat, t: &Ty, boxed: bool) -> bool {
-        let kind = if boxed { BindKind::BoxBorrow } else { BindKind::Borrow };
+        let kind = if boxed {
+            BindKind::BoxBorrow
+        } else {
+            BindKind::Borrow
+        };
         match p {
             Pat::Wild(_) => false,
             Pat::Bind(name, span) => {
@@ -2482,12 +3487,38 @@ impl Checker {
                 if let Ty::User(en) = t {
                     if let Some(ei) = self.info.enums.get(en) {
                         if ei.variants.iter().any(|v| &v.0 == name) {
-                            self.err(Diag::error("E0504", *span, &format!("variants are qualified in patterns: write {en}.{name}")).with_fix_replace(*span, &format!("{en}.{name}"), "qualify the variant"));
+                            self.err(
+                                Diag::error(
+                                    "E0504",
+                                    *span,
+                                    &format!(
+                                        "variants are qualified in patterns: write {en}.{name}"
+                                    ),
+                                )
+                                .with_fix_replace(
+                                    *span,
+                                    &format!("{en}.{name}"),
+                                    "qualify the variant",
+                                ),
+                            );
                         }
                     }
                 }
-                if let Some(fixed) = known_alias(name).filter(|a| ["none", "some", "ok", "err", "true", "false"].contains(a)) {
-                    self.err(Diag::error("E0504", *span, &format!("'{name}' is not a constructor in ail; use '{fixed}'")).with_fix_replace(*span, fixed, &format!("use {fixed}")));
+                if let Some(fixed) = known_alias(name)
+                    .filter(|a| ["none", "some", "ok", "err", "true", "false"].contains(a))
+                {
+                    self.err(
+                        Diag::error(
+                            "E0504",
+                            *span,
+                            &format!("'{name}' is not a constructor in ail; use '{fixed}'"),
+                        )
+                        .with_fix_replace(
+                            *span,
+                            fixed,
+                            &format!("use {fixed}"),
+                        ),
+                    );
                 }
                 let b = self.local(name, t.clone(), kind);
                 let bid = self.bind(b);
@@ -2502,17 +3533,29 @@ impl Checker {
                     Ty::Int(k) => {
                         let (lo, hi) = k.range();
                         if *v < lo || *v > hi {
-                            self.err(Diag::error("E0203", *span, &format!("literal {v} is out of range for {}", k.name())));
+                            self.err(Diag::error(
+                                "E0203",
+                                *span,
+                                &format!("literal {v} is out of range for {}", k.name()),
+                            ));
                         }
                     }
                     Ty::Err => {}
-                    other => self.err(Diag::error("E0505", *span, &format!("integer pattern on a value of type {other}"))),
+                    other => self.err(Diag::error(
+                        "E0505",
+                        *span,
+                        &format!("integer pattern on a value of type {other}"),
+                    )),
                 }
                 true
             }
             Pat::Str(_, span) => {
                 if !matches!(t, Ty::Str | Ty::Err) {
-                    self.err(Diag::error("E0505", *span, &format!("string pattern on a value of type {t}")));
+                    self.err(Diag::error(
+                        "E0505",
+                        *span,
+                        &format!("string pattern on a value of type {t}"),
+                    ));
                 }
                 true
             }
@@ -2529,7 +3572,11 @@ impl Checker {
                     }
                 };
                 let arity_err = |c: &mut Checker, want: usize, shape: &str| {
-                    c.err(Diag::error("E0506", *span, &format!("pattern {name} takes {want} sub-pattern(s): {shape}")));
+                    c.err(Diag::error(
+                        "E0506",
+                        *span,
+                        &format!("pattern {name} takes {want} sub-pattern(s): {shape}"),
+                    ));
                 };
                 match (name.as_str(), t) {
                     ("true" | "false", Ty::Bool) => {
@@ -2553,7 +3600,11 @@ impl Checker {
                         if subs.len() != 1 {
                             arity_err(self, 1, "(ok x)");
                         } else {
-                            let inner = if name == "ok" { (**a).clone() } else { (**b).clone() };
+                            let inner = if name == "ok" {
+                                (**a).clone()
+                            } else {
+                                (**b).clone()
+                            };
                             sub(self, subs, &[inner], &[false]);
                         }
                     }
@@ -2565,7 +3616,11 @@ impl Checker {
                     (_, Ty::User(en)) if name.contains('.') && self.info.enums.contains_key(en) => {
                         let (pen, vn) = name.split_once('.').unwrap();
                         if pen != en {
-                            self.err(Diag::error("E0505", *span, &format!("pattern of enum {pen} on a value of type {en}")));
+                            self.err(Diag::error(
+                                "E0505",
+                                *span,
+                                &format!("pattern of enum {pen} on a value of type {en}"),
+                            ));
                             return true;
                         }
                         let ei = self.info.enums[en].clone();
@@ -2575,17 +3630,38 @@ impl Checker {
                         };
                         let fts = &ei.variants[vi].1;
                         if subs.len() != fts.len() {
-                            let shape = if fts.is_empty() { name.clone() } else { format!("({name}{})", " _".repeat(fts.len())) };
-                            let d = Diag::error("E0506", *span, &format!("pattern {name} takes {} sub-pattern(s): {shape}", fts.len()))
-                                .with_fix_replace(*span, &shape, "use the right number of sub-patterns");
+                            let shape = if fts.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("({name}{})", " _".repeat(fts.len()))
+                            };
+                            let d = Diag::error(
+                                "E0506",
+                                *span,
+                                &format!(
+                                    "pattern {name} takes {} sub-pattern(s): {shape}",
+                                    fts.len()
+                                ),
+                            )
+                            .with_fix_replace(
+                                *span,
+                                &shape,
+                                "use the right number of sub-patterns",
+                            );
                             self.err(d);
                         } else {
-                            let boxes: Vec<bool> = (0..fts.len()).map(|i| self.info.is_boxed(en, vi, i)).collect();
+                            let boxes: Vec<bool> = (0..fts.len())
+                                .map(|i| self.info.is_boxed(en, vi, i))
+                                .collect();
                             sub(self, subs, fts, &boxes);
                         }
                     }
                     _ => {
-                        self.err(Diag::error("E0505", *span, &format!("pattern '{name}' does not match a value of type {t}")));
+                        self.err(Diag::error(
+                            "E0505",
+                            *span,
+                            &format!("pattern '{name}' does not match a value of type {t}"),
+                        ));
                         return true;
                     }
                 }
@@ -2597,7 +3673,9 @@ impl Checker {
 
 /// Two places overlap unless they diverge into different fields.
 fn paths_overlap(a: &[String], b: &[String]) -> bool {
-    a.iter().zip(b.iter()).all(|(x, y)| x == y || x == "[]" || y == "[]")
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| x == y || x == "[]" || y == "[]")
 }
 
 fn ctor_key(name: &str) -> String {
@@ -2629,11 +3707,41 @@ fn placeholder(t: &Ty) -> String {
     }
 }
 
+/// True if `(json-str x)` can encode a value of type `t` directly: Json itself, or numbers, Bool,
+/// Str, Vec, Option (none is null), maps with Str keys, and structs made of those (an object
+/// with its fields in name order).
+pub fn json_encodable(info: &TypeInfo, t: &Ty, seen: &mut Vec<String>) -> bool {
+    match t {
+        Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Str => true,
+        Ty::Vec(x) | Ty::Opt(x) => json_encodable(info, x, seen),
+        Ty::Map(k, v) => **k == Ty::Str && json_encodable(info, v, seen),
+        Ty::User(n) if n == "Json" => true,
+        Ty::User(n) => match info.structs.get(n) {
+            Some(si) => {
+                if seen.contains(n) {
+                    return true;
+                }
+                seen.push(n.clone());
+                let ok = si.fields.iter().all(|(_, ft)| json_encodable(info, ft, seen));
+                seen.pop();
+                ok
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
 /// Pre-order walk over an expression tree.
 pub fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     f(e);
     match &e.kind {
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Var(_) | ExprKind::Break | ExprKind::Continue => {}
+        ExprKind::Int(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Var(_)
+        | ExprKind::Break
+        | ExprKind::Continue => {}
         ExprKind::Call(_, _, args) => args.iter().for_each(|a| walk(a.expr(), f)),
         ExprKind::Let { value, .. } => walk(value, f),
         ExprKind::Set(a, b) => {

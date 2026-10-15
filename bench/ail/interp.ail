@@ -1,0 +1,73 @@
+; interp: bytecode interpreter (enum dispatch in a hot loop)
+
+(enum Instr
+  (Push I64) (Load I64) (Store I64)
+  (Add) (Sub) (Mul) (Div) (Mod) (Lt) (Eq)
+  (Jmp I64) (Jz I64) (Halt))
+
+(const LIMIT I64 300000)
+
+; total = sum over n in 1..LIMIT of collatz_steps(n); slots: 0 = n, 1 = x, 2 = steps total
+(fn collatz-program (returns (Vec Instr))
+  (body
+    (vec
+      (Instr.Push 1) (Instr.Store 0)                                        ;  0: n = 1
+      (Instr.Load 0) (Instr.Push LIMIT) Instr.Lt (Instr.Jz 38)              ;  2: outer
+      (Instr.Load 0) (Instr.Store 1)                                        ;  6: x = n
+      (Instr.Load 1) (Instr.Push 1) Instr.Eq (Instr.Jz 13) (Instr.Jmp 33)   ;  8: inner
+      (Instr.Load 1) (Instr.Push 2) Instr.Mod (Instr.Jz 24)                 ; 13: even?
+      (Instr.Push 3) (Instr.Load 1) Instr.Mul (Instr.Push 1) Instr.Add
+      (Instr.Store 1) (Instr.Jmp 28)                                        ; 17: x = 3x + 1
+      (Instr.Load 1) (Instr.Push 2) Instr.Div (Instr.Store 1)               ; 24: x = x / 2
+      (Instr.Load 2) (Instr.Push 1) Instr.Add (Instr.Store 2) (Instr.Jmp 8) ; 28: total += 1
+      (Instr.Load 0) (Instr.Push 1) Instr.Add (Instr.Store 0) (Instr.Jmp 2) ; 33: n += 1
+      Instr.Halt)))                                                         ; 38
+
+; `expect` with a literal message builds the String on every call, so match instead
+(fn pop-int (params (stack (mut (Vec I64)))) (returns I64)
+  (body
+    (match (pop (mut stack))
+      (case (some v) v)
+      (case none (fail "stack underflow")))))
+
+; runs the program; returns the number of instructions executed (including Halt)
+(fn run (params (code (Vec Instr)) (slots (mut (Vec I64)))) (returns I64)
+  (body
+    (var stack (Vec I64) (vec))
+    (var pc 0)
+    (var executed 0)
+    (while true
+      (let ins (at code pc))
+      (set executed (+ executed 1))
+      (set pc (+ pc 1))
+      (match ins
+        (case (Instr.Push v) (push (mut stack) v))
+        (case (Instr.Load s) (push (mut stack) (at slots s)))
+        (case (Instr.Store s) (set (at slots s) (pop-int (mut stack))))
+        (case Instr.Add
+          (let b (pop-int (mut stack))) (let a (pop-int (mut stack))) (push (mut stack) (+ a b)))
+        (case Instr.Sub
+          (let b (pop-int (mut stack))) (let a (pop-int (mut stack))) (push (mut stack) (- a b)))
+        (case Instr.Mul
+          (let b (pop-int (mut stack))) (let a (pop-int (mut stack))) (push (mut stack) (* a b)))
+        (case Instr.Div
+          (let b (pop-int (mut stack))) (let a (pop-int (mut stack))) (push (mut stack) (/ a b)))
+        (case Instr.Mod
+          (let b (pop-int (mut stack))) (let a (pop-int (mut stack))) (push (mut stack) (% a b)))
+        (case Instr.Lt
+          (let b (pop-int (mut stack))) (let a (pop-int (mut stack)))
+          (push (mut stack) (if (< a b) 1 0)))
+        (case Instr.Eq
+          (let b (pop-int (mut stack))) (let a (pop-int (mut stack)))
+          (push (mut stack) (if (== a b) 1 0)))
+        (case (Instr.Jmp t) (set pc t))
+        (case (Instr.Jz t) (if (== (pop-int (mut stack)) 0) (set pc t)))
+        (case Instr.Halt (return executed))))
+    executed))
+
+(fn main (params (con Console))
+  (body
+    (var slots (fill 8 0))
+    (let executed (run (collatz-program) (mut slots)))
+    (println con "total " (at slots 2))
+    (println con "executed " executed)))

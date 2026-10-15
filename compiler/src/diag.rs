@@ -66,14 +66,29 @@ impl Diag {
         self
     }
     pub fn with_fix(mut self, description: &str, edits: Vec<Edit>) -> Diag {
-        self.fixes.push(Fix { description: description.to_string(), edits });
+        self.fixes.push(Fix {
+            description: description.to_string(),
+            edits,
+        });
         self
     }
     pub fn with_fix_replace(self, span: Span, text: &str, description: &str) -> Diag {
-        self.with_fix(description, vec![Edit { span, text: text.to_string() }])
+        self.with_fix(
+            description,
+            vec![Edit {
+                span,
+                text: text.to_string(),
+            }],
+        )
     }
     pub fn with_fix_insert(self, at: usize, text: &str, description: &str) -> Diag {
-        self.with_fix(description, vec![Edit { span: Span::new(at, at), text: text.to_string() }])
+        self.with_fix(
+            description,
+            vec![Edit {
+                span: Span::new(at, at),
+                text: text.to_string(),
+            }],
+        )
     }
 }
 
@@ -146,7 +161,9 @@ pub fn to_json(d: &Diag, src: &str, file: &str) -> String {
     if !d.path.is_empty() {
         o.push_str(&format!(",\"node\":{}", json_str(&d.path)));
     }
-    let snippet = src.get(d.span.start..d.span.end.min(d.span.start + 120)).unwrap_or("");
+    let snippet = src
+        .get(d.span.start..d.span.end.min(d.span.start + 120))
+        .unwrap_or("");
     o.push_str(&format!(",\"source\":{}", json_str(snippet)));
     if let Some(e) = &d.expected {
         o.push_str(&format!(",\"expected\":{}", json_str(e)));
@@ -165,9 +182,19 @@ pub fn to_json(d: &Diag, src: &str, file: &str) -> String {
             let edits: Vec<String> = f
                 .edits
                 .iter()
-                .map(|e| format!("{{\"span\":{},\"text\":{}}}", span_json(&li, file, e.span), json_str(&e.text)))
+                .map(|e| {
+                    format!(
+                        "{{\"span\":{},\"text\":{}}}",
+                        span_json(&li, file, e.span),
+                        json_str(&e.text)
+                    )
+                })
                 .collect();
-            format!("{{\"description\":{},\"edits\":[{}]}}", json_str(&f.description), edits.join(","))
+            format!(
+                "{{\"description\":{},\"edits\":[{}]}}",
+                json_str(&f.description),
+                edits.join(",")
+            )
         })
         .collect();
     o.push_str(&format!(",\"fixes\":[{}]}}", fixes.join(",")));
@@ -177,11 +204,19 @@ pub fn to_json(d: &Diag, src: &str, file: &str) -> String {
 pub fn render_human(d: &Diag, src: &str, file: &str) -> String {
     let li = LineIndex::new(src);
     let (line, col) = li.pos(d.span.start);
-    let mut o = format!("{}[{}]: {}\n  --> {}:{}:{}\n", d.severity, d.code, d.message, file, line, col);
+    let mut o = format!(
+        "{}[{}]: {}\n  --> {}:{}:{}\n",
+        d.severity, d.code, d.message, file, line, col
+    );
     let line_text = src.lines().nth(line - 1).unwrap_or("");
     o.push_str(&format!("   | {}\n", line_text));
-    let width = (d.span.end.saturating_sub(d.span.start)).clamp(1, line_text.len().saturating_sub(col - 1).max(1));
-    o.push_str(&format!("   | {}{}\n", " ".repeat(col - 1), "^".repeat(width)));
+    let width = (d.span.end.saturating_sub(d.span.start))
+        .clamp(1, line_text.len().saturating_sub(col - 1).max(1));
+    o.push_str(&format!(
+        "   | {}{}\n",
+        " ".repeat(col - 1),
+        "^".repeat(width)
+    ));
     if let (Some(e), Some(f)) = (&d.expected, &d.found) {
         o.push_str(&format!("   = expected: {}\n   = found:    {}\n", e, f));
     }
@@ -195,7 +230,13 @@ pub fn render_human(d: &Diag, src: &str, file: &str) -> String {
             if e.span.start == e.span.end {
                 o.push_str(&format!(" [insert {:?} at {}:{}]", e.text, l, c));
             } else {
-                o.push_str(&format!(" [replace {:?} at {}:{} with {:?}]", &src[e.span.start..e.span.end], l, c, e.text));
+                o.push_str(&format!(
+                    " [replace {:?} at {}:{} with {:?}]",
+                    &src[e.span.start..e.span.end],
+                    l,
+                    c,
+                    e.text
+                ));
             }
         }
         o.push('\n');

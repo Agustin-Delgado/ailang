@@ -1,0 +1,203 @@
+; api: in-process REST API (routing + JSON parse/serialize + store). See bench/SPECS.md.
+(struct Todo (id I64) (title Str) (done Bool) (tags (Vec Str)))
+(struct Store (todos (Vec Todo)) (next-id I64))
+(struct Response (status I64) (body Str))
+(struct Rng (state I64))
+
+(const REQUESTS I64 200000)
+(const SEED I64 777)
+
+(fn next-rand (params (r (mut Rng))) (returns I64)
+  (body
+    (set (. r state) (% (* (. r state) 48271) 2147483647))
+    (. r state)))
+
+(fn rand-below (params (r (mut Rng)) (n I64)) (returns I64)
+  (body (% (next-rand (mut r)) n)))
+
+; Response bodies are encoded straight from typed values: (json-str todo) writes the fields of
+; Todo in name order, which is exactly {"done","id","tags","title"}.
+(struct ErrorBody (error Str))
+
+(fn error-response (params (status I64) (msg Str)) (returns Response)
+  (body (new Response (status status) (body (json-str (new ErrorBody (error msg)))))))
+
+(fn parse-query (params (q Str)) (returns (Map Str Str))
+  (body
+    (var m (Map Str Str) (map))
+    (for pair (split q "&")
+      (match (index-of pair "=")
+        (case (some i) (put (mut m) (substr pair 0 i) (substr pair (+ i 1) (len pair))))
+        (case none (if (not (is-empty pair)) (put (mut m) pair "")))))
+    m))
+
+(fn query-int (params (q (Map Str Str)) (key Str) (default I64)) (returns I64)
+  (body
+    (match (get q key)
+      (case (some s) (unwrap-or (parse-i64 s) default))
+      (case none default))))
+
+; Todos are kept in insertion order and ids only grow, so the vector is sorted by id.
+(fn find-todo (params (s Store) (id I64)) (returns (Option I64))
+  (body
+    (var lo 0)
+    (var hi (len (. s todos)))
+    (while (< lo hi)
+      (let mid (/ (+ lo hi) 2))
+      (let mid-id (. (at (. s todos) mid) id))
+      (if (== mid-id id) (return (some mid)))
+      (if (< mid-id id) (set lo (+ mid 1)) (set hi mid)))
+    none))
+
+(fn parse-new-todo (params (body Str)) (returns (Option Todo))
+  (body
+    (let m
+      (match (json-parse body)
+        (case (ok (Json.Obj m)) m)
+        (case _ (return none))))
+    (let title
+      (match (get m "title")
+        (case (some (Json.Str t)) t)
+        (case _ (return none))))
+    (var tags (Vec Str) (vec))
+    (match (get m "tags")
+      (case (some (Json.Arr items))
+        (for item items
+          (match item
+            (case (Json.Str t) (push (mut tags) t))
+            (case _ (return none)))))
+      (case _ (return none)))
+    (some (new Todo (id 0) (title title) (done false) (tags tags)))))
+
+(fn create-todo (params (s (mut Store)) (body Str)) (returns Response)
+  (body
+    (match (parse-new-todo body)
+      (case (some t)
+        (let todo (with t (id (. s next-id))))
+        (set (. s next-id) (+ (. s next-id) 1))
+        (let out (json-str todo))
+        (push (mut (. s todos)) todo)
+        (new Response (status 201) (body out)))
+      (case none (error-response 400 "invalid body")))))
+
+(fn list-todos (params (s Store) (query Str)) (returns Response)
+  (body
+    (let q (parse-query query))
+    (let limit (query-int q "limit" 20))
+    (let offset (query-int q "offset" 0))
+    (let n (len (. s todos)))
+    (new Response (status 200) (body (json-str (slice (. s todos) (min offset n) (min (+ offset limit) n)))))))
+
+(fn patch-todo (params (s (mut Store)) (id I64) (body Str)) (returns Response)
+  (body
+    (match (find-todo s id)
+      (case (some i)
+        (match (json-parse body)
+          (case (ok (Json.Obj m))
+            (match (get m "done")
+              (case (some (Json.Bool d)) (set (. (at (. s todos) i) done) d))
+              (case _ unit)))
+          (case _ unit))
+        (new Response (status 200) (body (json-str (at (. s todos) i)))))
+      (case none (error-response 404 "not found")))))
+
+(fn delete-todo (params (s (mut Store)) (id I64)) (returns Response)
+  (body
+    (match (find-todo s id)
+      (case (some i)
+        (remove-at (mut (. s todos)) i)
+        (new Response (status 204) (body "")))
+      (case none (error-response 404 "not found")))))
+
+(fn handle (params (s (mut Store)) (method Str) (path Str) (body Str)) (returns Response)
+  (body
+    (var route path)
+    (var query "")
+    (match (index-of path "?")
+      (case (some i)
+        (set route (substr path 0 i))
+        (set query (substr path (+ i 1) (len path))))
+      (case none unit))
+    (let parts (split route "/"))
+    (if (or (< (len parts) 2) (!= (at parts 0) "") (!= (at parts 1) "todos"))
+      (return (error-response 404 "not found")))
+    (match (len parts)
+      (case 2
+        (match method
+          (case "GET" (list-todos s query))
+          (case "POST" (create-todo (mut s) body))
+          (case _ (error-response 404 "not found"))))
+      (case 3
+        (match (parse-i64 (at parts 2))
+          (case (some id)
+            (match method
+              (case "PATCH" (patch-todo (mut s) id body))
+              (case "DELETE" (delete-todo (mut s) id))
+              (case _ (error-response 404 "not found"))))
+          (case none (error-response 404 "not found"))))
+      (case _ (error-response 404 "not found")))))
+
+(fn main (params (con Console))
+  (body
+    (var rng (new Rng (state SEED)))
+    (var store (new Store (todos (vec)) (next-id 1)))
+    (var c200 0)
+    (var c201 0)
+    (var c204 0)
+    (var c404 0)
+    (var bytes 0)
+    (for k (range 0 REQUESTS)
+      (let op (rand-below (mut rng) 100))
+      (let hint (. store next-id))
+      (var method "")
+      (var path "")
+      (var body "")
+      (if (< op 45)
+        (do
+          (let a (rand-below (mut rng) 10))
+          (let b (rand-below (mut rng) 10))
+          (set method "POST")
+          (set path "/todos")
+          (set body (str "{\"title\":\"task " k "\",\"tags\":[\"t" a "\",\"t" b "\"]}")))
+        (if (< op 75)
+          (do
+            (let l (+ 1 (rand-below (mut rng) 50)))
+            (let o (rand-below (mut rng) hint))
+            (set method "GET")
+            (set path (str "/todos?limit=" l "&offset=" o)))
+          (if (< op 90)
+            (do
+              (set method "PATCH")
+              (set path (str "/todos/" (+ 1 (rand-below (mut rng) hint))))
+              (set body "{\"done\":true}"))
+            (do
+              (set method "DELETE")
+              (set path (str "/todos/" (+ 1 (rand-below (mut rng) hint))))))))
+      (let resp (handle (mut store) method path body))
+      (match (. resp status)
+        (case 200 (set c200 (+ c200 1)))
+        (case 201 (set c201 (+ c201 1)))
+        (case 204 (set c204 (+ c204 1)))
+        (case 404 (set c404 (+ c404 1)))
+        (case _ unit))
+      (set bytes (+ bytes (len (. resp body)))))
+    (println con "status 200 " c200)
+    (println con "status 201 " c201)
+    (println con "status 204 " c204)
+    (println con "status 404 " c404)
+    (println con "bytes " bytes)))
+
+(test "create, patch, list, delete"
+  (var s (new Store (todos (vec)) (next-id 1)))
+  (let r1 (handle (mut s) "POST" "/todos" "{\"title\":\"a\",\"tags\":[\"x\"]}"))
+  (assert (== (. r1 status) 201))
+  (assert (== (. r1 body) "{\"done\":false,\"id\":1,\"tags\":[\"x\"],\"title\":\"a\"}"))
+  (assert (== (. (handle (mut s) "POST" "/todos" "{\"title\":3,\"tags\":[]}") status) 400))
+  (assert (== (. (handle (mut s) "POST" "/todos" "nope") status) 400))
+  (assert (== (. (handle (mut s) "PATCH" "/todos/1" "{\"done\":true}") body)
+    "{\"done\":true,\"id\":1,\"tags\":[\"x\"],\"title\":\"a\"}"))
+  (assert (== (. (handle (mut s) "GET" "/todos?limit=x" "") body)
+    "[{\"done\":true,\"id\":1,\"tags\":[\"x\"],\"title\":\"a\"}]"))
+  (assert (== (. (handle (mut s) "GET" "/todos?offset=1" "") body) "[]"))
+  (assert (== (. (handle (mut s) "DELETE" "/todos/1" "") status) 204))
+  (assert (== (. (handle (mut s) "DELETE" "/todos/1" "") status) 404)))

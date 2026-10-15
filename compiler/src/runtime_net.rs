@@ -83,6 +83,20 @@ mod ail_json {
                 }
                 b'-' | b'0'..=b'9' => {
                     let st = self.i;
+                    // Fast path: short plain integers are exact in f64 without the float parser.
+                    let neg = self.b[st] == b'-';
+                    let mut j = st + neg as usize;
+                    let mut v: i64 = 0;
+                    while j < self.b.len() && self.b[j].is_ascii_digit() && j - st < 16 {
+                        v = v * 10 + (self.b[j] - b'0') as i64;
+                        j += 1;
+                    }
+                    let digits = j - st - neg as usize;
+                    let ends = j >= self.b.len() || !matches!(self.b[j], b'.' | b'e' | b'E' | b'0'..=b'9' | b'-' | b'+');
+                    if digits > 0 && ends && !(digits > 1 && self.b[st + neg as usize] == b'0') {
+                        self.i = j;
+                        return Ok(J::Num(if neg { -(v as f64) } else { v as f64 }));
+                    }
                     while self.i < self.b.len() && matches!(self.b[self.i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') { self.i += 1; }
                     std::str::from_utf8(&self.b[st..self.i]).ok().and_then(|t| t.parse::<f64>().ok()).map(J::Num)
                         .ok_or_else(|| self.err("invalid number"))
@@ -128,9 +142,10 @@ mod ail_json {
                             _ => return Err(self.err("bad escape")),
                         }
                     }
+                    c if c < 0x20 => return Err(self.err("control character in string")),
                     _ => {
                         let st = self.i;
-                        while self.i < self.b.len() && self.b[self.i] != b'"' && self.b[self.i] != b'\\' { self.i += 1; }
+                        while self.i < self.b.len() && self.b[self.i] != b'"' && self.b[self.i] != b'\\' && self.b[self.i] >= 0x20 { self.i += 1; }
                         out.push_str(std::str::from_utf8(&self.b[st..self.i]).map_err(|_| self.err("invalid UTF-8"))?);
                     }
                 }
@@ -138,25 +153,81 @@ mod ail_json {
         }
     }
 
+    /// Direct encoding of typed values (structs implement it in the generated code).
+    pub trait Enc { fn enc(&self, o: &mut String); }
+    macro_rules! enc_int { ($($t:ty),*) => { $(impl Enc for $t { #[inline] fn enc(&self, o: &mut String) { use std::fmt::Write as _; let _ = write!(o, "{}", self); } })* } }
+    enc_int!(i8, i16, i32, i64, u8, u16, u32, u64);
+    impl Enc for f64 { fn enc(&self, o: &mut String) { num(*self, o) } }
+    impl Enc for f32 { fn enc(&self, o: &mut String) { num(*self as f64, o) } }
+    impl Enc for bool { fn enc(&self, o: &mut String) { o.push_str(if *self { "true" } else { "false" }) } }
+    impl Enc for String { fn enc(&self, o: &mut String) { write_str(self, o) } }
+    impl Enc for J { fn enc(&self, o: &mut String) { write(self, o) } }
+    impl<T: Enc> Enc for Box<T> { fn enc(&self, o: &mut String) { (**self).enc(o) } }
+    impl<T: Enc> Enc for Option<T> { fn enc(&self, o: &mut String) { match self { Some(v) => v.enc(o), None => o.push_str("null") } } }
+    impl<T: Enc> Enc for Vec<T> { fn enc(&self, o: &mut String) { self.as_slice().enc(o) } }
+    impl<T: Enc> Enc for [T] {
+        fn enc(&self, o: &mut String) {
+            o.push('[');
+            for (i, x) in self.iter().enumerate() { if i > 0 { o.push(','); } x.enc(o); }
+            o.push(']');
+        }
+    }
+    impl<T: Enc> Enc for AilMap<String, T> {
+        fn enc(&self, o: &mut String) {
+            let mut kv: Vec<(&String, &T)> = self.iter().collect();
+            kv.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            o.push('{');
+            for (i, (k, v)) in kv.iter().enumerate() { if i > 0 { o.push(','); } write_str(k, o); o.push(':'); v.enc(o); }
+            o.push('}');
+        }
+    }
+    pub fn encode<T: Enc + ?Sized>(x: &T) -> String {
+        let mut o = String::with_capacity(128);
+        x.enc(&mut o);
+        o
+    }
+
+    fn num(n: f64, o: &mut String) {
+        use std::fmt::Write as _;
+        if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 {
+            let _ = write!(o, "{}", n as i64);
+        } else if n.is_finite() {
+            let _ = write!(o, "{n}");
+        } else {
+            o.push_str("null")
+        }
+    }
+
     pub fn to_string(j: &J) -> String {
-        let mut o = String::new();
+        let mut o = String::with_capacity(128);
         write(j, &mut o);
         o
     }
 
     fn write_str(s: &str, o: &mut String) {
+        use std::fmt::Write as _;
         o.push('"');
-        for c in s.chars() {
-            match c {
-                '"' => o.push_str("\\\""),
-                '\\' => o.push_str("\\\\"),
-                '\n' => o.push_str("\\n"),
-                '\r' => o.push_str("\\r"),
-                '\t' => o.push_str("\\t"),
-                c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-                c => o.push(c),
+        let b = s.as_bytes();
+        let mut st = 0;
+        for (i, &c) in b.iter().enumerate() {
+            let esc = match c {
+                b'"' => "\\\"",
+                b'\\' => "\\\\",
+                b'\n' => "\\n",
+                b'\r' => "\\r",
+                b'\t' => "\\t",
+                0..=0x1f => "",
+                _ => continue,
+            };
+            o.push_str(&s[st..i]);
+            if esc.is_empty() {
+                let _ = write!(o, "\\u{:04x}", c);
+            } else {
+                o.push_str(esc);
             }
+            st = i + 1;
         }
+        o.push_str(&s[st..]);
         o.push('"');
     }
 
@@ -164,15 +235,7 @@ mod ail_json {
         match j {
             J::Null => o.push_str("null"),
             J::Bool(b) => o.push_str(if *b { "true" } else { "false" }),
-            J::Num(n) => {
-                if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 {
-                    o.push_str(&format!("{}", *n as i64))
-                } else if n.is_finite() {
-                    o.push_str(&format!("{n}"))
-                } else {
-                    o.push_str("null")
-                }
-            }
+            J::Num(n) => num(*n, o),
             J::Str(s) => write_str(s, o),
             J::Arr(v) => {
                 o.push('[');
@@ -183,14 +246,36 @@ mod ail_json {
                 o.push(']');
             }
             J::Obj(m) => {
-                let mut ks: Vec<&String> = m.keys().collect();
-                ks.sort();
                 o.push('{');
-                for (i, k) in ks.iter().enumerate() {
-                    if i > 0 { o.push(','); }
-                    write_str(k, o);
-                    o.push(':');
-                    write(&m[*k], o);
+                // Keys are written sorted. Small objects sort on the stack, without allocating.
+                if m.len() <= 16 {
+                    let mut kv: [Option<(&String, &J)>; 16] = [None; 16];
+                    let mut n = 0;
+                    for (k, v) in m.iter() {
+                        let mut p = n;
+                        while p > 0 && kv[p - 1].unwrap().0 > k {
+                            kv[p] = kv[p - 1];
+                            p -= 1;
+                        }
+                        kv[p] = Some((k, v));
+                        n += 1;
+                    }
+                    for (i, e) in kv[..n].iter().enumerate() {
+                        let (k, v) = e.unwrap();
+                        if i > 0 { o.push(','); }
+                        write_str(k, o);
+                        o.push(':');
+                        write(v, o);
+                    }
+                } else {
+                    let mut kv: Vec<(&String, &J)> = m.iter().collect();
+                    kv.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                    for (i, (k, v)) in kv.iter().enumerate() {
+                        if i > 0 { o.push(','); }
+                        write_str(k, o);
+                        o.push(':');
+                        write(v, o);
+                    }
                 }
                 o.push('}');
             }
@@ -200,15 +285,25 @@ mod ail_json {
 
 #[allow(dead_code)]
 mod ail_http {
+    //! `http-next` hands the program one parsed request at a time, so handlers stay simple and
+    //! single-threaded. Accepting connections and reading/parsing requests happens on a pool of
+    //! I/O threads, so slow clients never stall the program and parsing runs in parallel.
     use super::U_Request as R;
     use super::ail_rt::AilMap;
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::mpsc::{sync_channel, Receiver};
+    use std::sync::Arc;
+
+    type Parsed = (String, String, AilMap<String, String>, AilMap<String, String>, String);
+
+    struct Port { rx: Receiver<(TcpStream, Parsed)>, max_body: Arc<AtomicI64> }
 
     thread_local! {
-        static LISTENERS: RefCell<HashMap<i64, TcpListener>> = RefCell::new(HashMap::new());
+        static PORTS: RefCell<HashMap<i64, Port>> = RefCell::new(HashMap::new());
         static PENDING: RefCell<HashMap<i64, TcpStream>> = RefCell::new(HashMap::new());
         static NEXT_ID: RefCell<i64> = RefCell::new(1);
     }
@@ -223,7 +318,7 @@ mod ail_http {
             if b[i] == b'+' {
                 out.push(b' ');
                 i += 1;
-            } else if b[i] == b'%' && i + 2 < b.len() + 1 && i + 3 <= b.len() {
+            } else if b[i] == b'%' && i + 3 <= b.len() {
                 match std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
                     Some(v) => { out.push(v); i += 3; }
                     None => { out.push(b'%'); i += 1; }
@@ -236,11 +331,9 @@ mod ail_http {
         String::from_utf8_lossy(&out).into_owned()
     }
 
-    type Parsed = (String, String, AilMap<String, String>, AilMap<String, String>, String);
-
     fn read_request(stream: &TcpStream, max_body: i64) -> Result<Parsed, String> {
         stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
-        let mut r = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+        let mut r = BufReader::new(stream);
         let mut line = String::new();
         let mut total = r.read_line(&mut line).map_err(|e| e.to_string())?;
         let mut parts = line.trim_end().splitn(3, ' ');
@@ -263,6 +356,7 @@ mod ail_http {
         if len as i64 > max_body { return Err(format!("body of {len} bytes exceeds the limit of {max_body}")); }
         let mut body = vec![0u8; len];
         r.read_exact(&mut body).map_err(|e| e.to_string())?;
+        let body = String::from_utf8(body).map_err(|_| "body is not valid UTF-8".to_string())?;
         let (path, qs) = match target.split_once('?') {
             Some((p, q)) => (p.to_string(), q.to_string()),
             None => (target.clone(), String::new()),
@@ -272,39 +366,63 @@ mod ail_http {
             let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
             query.insert(decode(k), decode(v));
         }
-        Ok((method, decode(&path), query, headers, String::from_utf8_lossy(&body).into_owned()))
+        Ok((method, decode(&path), query, headers, body))
+    }
+
+    fn reply(mut s: &TcpStream, status: i64, content_type: &str, body: &str) -> std::io::Result<()> {
+        let mut out = Vec::with_capacity(128 + body.len());
+        let _ = write!(
+            out,
+            "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            reason(status),
+            body.len()
+        );
+        out.extend_from_slice(body.as_bytes());
+        s.write_all(&out)
+    }
+
+    fn listen(port: i64, max_body: i64) -> Result<Port, String> {
+        let p = u16::try_from(port).map_err(|_| format!("invalid port {port}"))?;
+        let ls = TcpListener::bind(("0.0.0.0", p)).map_err(|e| format!("cannot listen on port {port}: {e}"))?;
+        let limit = Arc::new(AtomicI64::new(max_body));
+        let (tx, rx) = sync_channel::<(TcpStream, Parsed)>(1024);
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 16);
+        for _ in 0..workers {
+            let ls = ls.try_clone().map_err(|e| e.to_string())?;
+            let tx = tx.clone();
+            let limit = limit.clone();
+            std::thread::spawn(move || loop {
+                let Ok((stream, _)) = ls.accept() else { continue };
+                let _ = stream.set_nodelay(true);
+                match read_request(&stream, limit.load(Ordering::Relaxed)) {
+                    Ok(p) => {
+                        if tx.send((stream, p)).is_err() { return; }
+                    }
+                    Err(e) => { let _ = reply(&stream, 400, "text/plain", &format!("bad request: {e}")); }
+                }
+            });
+        }
+        Ok(Port { rx, max_body: limit })
     }
 
     pub fn next(port: i64, max_body: i64) -> Result<R, String> {
         super::ail_rt::flush();
-        let listener = LISTENERS.with(|l| -> Result<TcpListener, String> {
-            let mut l = l.borrow_mut();
-            if !l.contains_key(&port) {
-                let p = u16::try_from(port).map_err(|_| format!("invalid port {port}"))?;
-                let ls = TcpListener::bind(("0.0.0.0", p)).map_err(|e| format!("cannot listen on port {port}: {e}"))?;
-                l.insert(port, ls);
+        let (stream, (method, path, query, headers, body)) = PORTS.with(|ports| -> Result<_, String> {
+            let mut ports = ports.borrow_mut();
+            if !ports.contains_key(&port) {
+                ports.insert(port, listen(port, max_body)?);
             }
-            l[&port].try_clone().map_err(|e| e.to_string())
+            let p = &ports[&port];
+            p.max_body.store(max_body, Ordering::Relaxed);
+            p.rx.recv().map_err(|_| format!("server on port {port} stopped"))
         })?;
-        loop {
-            let (stream, _) = listener.accept().map_err(|e| e.to_string())?;
-            match read_request(&stream, max_body) {
-                Ok((method, path, query, headers, body)) => {
-                    let id = NEXT_ID.with(|n| {
-                        let v = *n.borrow();
-                        *n.borrow_mut() = v + 1;
-                        v
-                    });
-                    PENDING.with(|p| p.borrow_mut().insert(id, stream));
-                    return Ok(R { id, method, path, query, headers, body });
-                }
-                Err(e) => {
-                    let mut s = stream;
-                    let msg = format!("bad request: {e}");
-                    let _ = write!(s, "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{msg}", msg.len());
-                }
-            }
-        }
+        let id = NEXT_ID.with(|n| {
+            let v = *n.borrow();
+            *n.borrow_mut() = v + 1;
+            v
+        });
+        PENDING.with(|p| p.borrow_mut().insert(id, stream));
+        Ok(R { id, method, path, query, headers, body })
     }
 
     fn reason(code: i64) -> &'static str {
@@ -319,13 +437,8 @@ mod ail_http {
     pub fn respond(req: &R, status: i64, content_type: &String, body: &String) -> Result<(), String> {
         if !(100..=999).contains(&status) { return Err(format!("invalid status {status}")); }
         let stream = PENDING.with(|p| p.borrow_mut().remove(&req.id));
-        let Some(mut s) = stream else { return Err(format!("request {} was already answered", req.id)) };
-        let head = format!(
-            "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            reason(status),
-            body.len()
-        );
-        s.write_all(head.as_bytes()).and_then(|_| s.write_all(body.as_bytes())).and_then(|_| s.flush()).map_err(|e| e.to_string())
+        let Some(s) = stream else { return Err(format!("request {} was already answered", req.id)) };
+        reply(&s, status, content_type, body).map_err(|e| e.to_string())
     }
 }
 "####;

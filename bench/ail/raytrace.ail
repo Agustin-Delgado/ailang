@@ -1,0 +1,125 @@
+; raytrace: small ray tracer (f64 vector math, structs, enums)
+
+(struct Vec3 (x F64) (y F64) (z F64))
+
+(enum Shape (Sphere Vec3 F64) (Plane))   ; Plane is y = 0 with normal (0, 1, 0)
+
+(struct Obj (shape Shape) (color Vec3) (refl F64))
+
+(struct Hit (t F64) (obj I64))
+
+(const WIDTH I64 480)
+(const HEIGHT I64 360)
+(const EPS F64 0.0001)
+(const MAX-DEPTH I64 3)
+
+(fn v3 (params (x F64) (y F64) (z F64)) (returns Vec3)
+  (body (new Vec3 (x x) (y y) (z z))))
+
+(fn add (params (a Vec3) (b Vec3)) (returns Vec3)
+  (body (v3 (+ (. a x) (. b x)) (+ (. a y) (. b y)) (+ (. a z) (. b z)))))
+
+(fn sub (params (a Vec3) (b Vec3)) (returns Vec3)
+  (body (v3 (- (. a x) (. b x)) (- (. a y) (. b y)) (- (. a z) (. b z)))))
+
+(fn scale (params (a Vec3) (k F64)) (returns Vec3)
+  (body (v3 (* (. a x) k) (* (. a y) k) (* (. a z) k))))
+
+(fn dot (params (a Vec3) (b Vec3)) (returns F64)
+  (body (+ (* (. a x) (. b x)) (* (. a y) (. b y)) (* (. a z) (. b z)))))
+
+(fn normalize (params (a Vec3)) (returns Vec3)
+  (body
+    (let l (sqrt (dot a a)))
+    (v3 (/ (. a x) l) (/ (. a y) l) (/ (. a z) l))))
+
+(fn reflect (params (d Vec3) (n Vec3)) (returns Vec3)
+  (body (sub d (scale n (* 2.0 (dot d n))))))
+
+(fn scene (returns (Vec Obj))
+  (body
+    (vec
+      (new Obj (shape (Shape.Sphere (v3 0.0 1.0 3.0) 1.0)) (color (v3 1.0 0.2 0.2)) (refl 0.3))
+      (new Obj (shape (Shape.Sphere (v3 -2.2 0.7 4.0) 0.7)) (color (v3 0.2 1.0 0.2)) (refl 0.5))
+      (new Obj (shape (Shape.Sphere (v3 2.0 0.5 2.5) 0.5)) (color (v3 0.2 0.4 1.0)) (refl 0.0))
+      (new Obj (shape (Shape.Sphere (v3 0.8 0.3 1.2) 0.3)) (color (v3 1.0 1.0 0.2)) (refl 0.6))
+      (new Obj (shape Shape.Plane) (color (v3 0.8 0.8 0.8)) (refl 0.4)))))
+
+; distance along the ray to the shape, or a value <= EPS on a miss
+(fn intersect (params (s Shape) (o Vec3) (d Vec3)) (returns F64)
+  (body
+    (match s
+      (case (Shape.Sphere c r)
+        (let oc (sub o c))
+        (let b (dot oc d))
+        (let cc (- (dot oc oc) (* r r)))
+        (let disc (- (* b b) cc))
+        (if (< disc 0.0) (return -1.0))
+        (let sq (sqrt disc))
+        (let t (- (- b) sq))
+        (if (> t EPS) t (+ (- b) sq)))
+      (case Shape.Plane
+        (let denom (. d y))
+        (if (< (abs denom) 1e-9) -1.0 (/ (- (. o y)) denom))))))
+
+(fn nearest (params (objs (Vec Obj)) (o Vec3) (d Vec3)) (returns (Option Hit))
+  (body
+    (var best (Option Hit) none)
+    (var best-t 0.0)
+    (for i (range 0 (len objs))
+      (let t (intersect (. (at objs i) shape) o d))
+      (if (and (> t EPS) (or (is-none best) (< t best-t)))
+        (do
+          (set best-t t)
+          (set best (some (new Hit (t t) (obj i)))))))
+    best))
+
+(fn occluded (params (objs (Vec Obj)) (o Vec3) (d Vec3)) (returns Bool)
+  (body
+    (for ob objs
+      (if (> (intersect (. ob shape) o d) EPS) (return true)))
+    false))
+
+(fn trace (params (objs (Vec Obj)) (light Vec3) (o Vec3) (d Vec3) (depth I64)) (returns Vec3)
+  (body
+    (match (nearest objs o d)
+      (case none
+        (let k (+ 0.5 (* 0.5 (. d y))))
+        (v3 (* 0.6 k) (* 0.8 k) (* 1.0 k)))
+      (case (some h)
+        (let ob (at objs (. h obj)))
+        (let p (add o (scale d (. h t))))
+        (let n
+          (match (. ob shape)
+            (case (Shape.Sphere c _) (normalize (sub p c)))
+            (case Shape.Plane (v3 0.0 1.0 0.0))))
+        (let start (add p (scale n 0.001)))
+        (let diff (if (occluded objs start light) 0.0 (max (dot n light) 0.0)))
+        (let base (scale (. ob color) (+ 0.1 (* 0.9 diff))))
+        (let refl (. ob refl))
+        (if (and (> refl 0.0) (< depth MAX-DEPTH))
+          (do
+            (let rc (trace objs light start (reflect d n) (+ depth 1)))
+            (add (scale base (- 1.0 refl)) (scale rc refl)))
+          base)))))
+
+(fn channel (params (c F64)) (returns I64)
+  (body (as I64 (floor (* (min (max c 0.0) 1.0) 255.0)))))
+
+(fn main (params (con Console))
+  (body
+    (let objs (scene))
+    (let light (normalize (v3 -4.0 6.0 -3.0)))
+    (let eye (v3 0.0 1.0 -4.0))
+    (var checksum 0)
+    (var center (v3 0.0 0.0 0.0))
+    (for py (range 0 HEIGHT)
+      (for px (range 0 WIDTH)
+        (let u (- (* (/ (+ (as F64 px) 0.5) 480.0) 2.0) 1.0))
+        (let v (- 1.0 (* (/ (+ (as F64 py) 0.5) 360.0) 2.0)))
+        (let dir (normalize (v3 (* u 1.3333333333333333) v 1.5)))
+        (let c (trace objs light eye dir 0))
+        (set checksum (+ checksum (channel (. c x)) (channel (. c y)) (channel (. c z))))
+        (if (and (== px 240) (== py 180)) (set center c))))
+    (println con "checksum " checksum)
+    (println con "center " (channel (. center x)) " " (channel (. center y)) " " (channel (. center z)))))

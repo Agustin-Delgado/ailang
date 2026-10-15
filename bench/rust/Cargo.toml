@@ -1,0 +1,18 @@
+[package]
+name = "bench-rust"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Idiomatic Rust baselines. Crates are allowed where a Rust developer would reach for them
+# (serde_json for JSON). Release profile: opt-level 3, one codegen unit, fat LTO, abort on panic,
+# overflow checks OFF (the Rust default for release). ail always keeps overflow and bounds checks ON.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+panic = "abort"

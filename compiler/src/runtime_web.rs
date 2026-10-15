@@ -92,6 +92,7 @@ mod ail_web {
         static IN: RefCell<Vec<u8>> = RefCell::new(Vec::new());
         static CMDS: RefCell<Vec<f64>> = RefCell::new(Vec::new());
         static STRS: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        static STR_IDS: RefCell<std::collections::HashMap<String, u32>> = RefCell::new(std::collections::HashMap::new());
         static OUT: RefCell<Vec<u8>> = RefCell::new(Vec::new());
     }
 
@@ -118,6 +119,7 @@ mod ail_web {
     pub fn begin_frame() {
         CMDS.with(|c| c.borrow_mut().clear());
         STRS.with(|s| s.borrow_mut().clear());
+        STR_IDS.with(|s| s.borrow_mut().clear());
     }
     pub fn frame_len() -> u32 { CMDS.with(|c| c.borrow().len() as u32) }
 
@@ -138,26 +140,52 @@ mod ail_web {
         })
     }
 
+    /// Strings (colors, texts) are sent once per frame: a frame drawing 4000 circles in 3 colors
+    /// carries 3 strings, and the host decodes each once.
     fn intern(s: &str) -> f64 {
-        STRS.with(|v| {
-            let mut v = v.borrow_mut();
-            v.push(s.to_string());
-            (v.len() - 1) as f64
+        // Most frames use a handful of strings: a linear scan beats hashing.
+        if let Some(i) = STRS.with(|v| { let v = v.borrow(); if v.len() <= 8 { v.iter().position(|x| x == s) } else { None } }) {
+            return i as f64;
+        }
+        STR_IDS.with(|ids| {
+            let mut ids = ids.borrow_mut();
+            if let Some(&i) = ids.get(s) {
+                return i as f64;
+            }
+            let i = STRS.with(|v| {
+                let mut v = v.borrow_mut();
+                v.push(s.to_string());
+                (v.len() - 1) as u32
+            });
+            ids.insert(s.to_string(), i);
+            i as f64
         })
     }
 
     fn push(xs: &[f64]) { CMDS.with(|c| c.borrow_mut().extend_from_slice(xs)); }
 
     // Draw commands: opcode followed by a fixed number of operands.
-    pub fn clear(color: &String) { let c = intern(color); push(&[0.0, c]); }
-    pub fn rect(x: f64, y: f64, w: f64, h: f64, color: &String) { let c = intern(color); push(&[1.0, x, y, w, h, c]); }
-    pub fn circle(x: f64, y: f64, r: f64, color: &String) { let c = intern(color); push(&[2.0, x, y, r, c]); }
-    pub fn line(x1: f64, y1: f64, x2: f64, y2: f64, width: f64, color: &String) { let c = intern(color); push(&[3.0, x1, y1, x2, y2, width, c]); }
-    pub fn text(x: f64, y: f64, size: f64, color: &String, s: &String) { let c = intern(color); let t = intern(s); push(&[4.0, x, y, size, c, t]); }
+    pub fn clear(color: &str) { let c = intern(color); push(&[0.0, c]); }
+    pub fn rect(x: f64, y: f64, w: f64, h: f64, color: &str) { let c = intern(color); push(&[1.0, x, y, w, h, c]); }
+    pub fn circle(x: f64, y: f64, r: f64, color: &str) { let c = intern(color); push(&[2.0, x, y, r, c]); }
+    pub fn line(x1: f64, y1: f64, x2: f64, y2: f64, width: f64, color: &str) { let c = intern(color); push(&[3.0, x1, y1, x2, y2, width, c]); }
+    pub fn text(x: f64, y: f64, size: f64, color: &str, s: &str) { let c = intern(color); let t = intern(s); push(&[4.0, x, y, size, c, t]); }
 
     pub fn log(s: &str, is_err: bool) { unsafe { host_log(s.as_ptr(), s.len(), is_err as u32) } }
     pub fn now_ms() -> f64 { unsafe { host_now() } }
     pub fn trap(s: &str) { unsafe { host_trap(s.as_ptr(), s.len()) } }
+}
+"####;
+
+/// Native stand-in so apps also build natively (tests): drawing is a no-op.
+pub const RUNTIME_WEB_STUB: &str = r####"
+#[allow(dead_code)]
+mod ail_web {
+    pub fn clear(_color: &str) {}
+    pub fn rect(_x: f64, _y: f64, _w: f64, _h: f64, _color: &str) {}
+    pub fn circle(_x: f64, _y: f64, _r: f64, _color: &str) {}
+    pub fn line(_x1: f64, _y1: f64, _x2: f64, _y2: f64, _width: f64, _color: &str) {}
+    pub fn text(_x: f64, _y: f64, _size: f64, _color: &str, _s: &str) {}
 }
 "####;
 
@@ -222,7 +250,8 @@ pub const HOST_HTML: &str = r####"<!doctype html>
       call(() => { n = x.ail_view(); });
       if (dead) return;
       const c = new Float64Array(mem.buffer, x.ail_cmds(), n);
-      const s = (i) => str(x.ail_str_ptr(i), x.ail_str_len(i));
+      const strs = [];
+      const s = (i) => strs[i] ?? (strs[i] = str(x.ail_str_ptr(i), x.ail_str_len(i)));
       for (let i = 0; i < n;) {
         switch (c[i]) {
           case 0: g.fillStyle = s(c[i + 1]); g.fillRect(0, 0, innerWidth, innerHeight); i += 2; break;

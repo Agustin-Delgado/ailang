@@ -80,14 +80,18 @@ fn frontend_lenient(src: &str) -> Result<(Front, String), Vec<Diag>> {
         Ok(f) => Ok((f, src.to_string())),
         Err(diags) => {
             if diags.first().is_some_and(|d| d.code == "E0006") {
-                let fixed = parinfer::infer(src);
-                if let Ok(mut f) = frontend_raw(&fixed) {
-                    let mut w = diags[0].clone();
-                    w.severity = "warning";
-                    w.code = "W0004";
-                    w.message = "closing parentheses were repaired from the indentation; run `ail fix` to write the repair into the file".into();
-                    f.warnings.insert(0, w);
-                    return Ok((f, fixed));
+                for fixed in parinfer::candidates(src) {
+                    let Ok(mut f) = frontend_raw(&fixed) else {
+                        continue;
+                    };
+                    {
+                        let mut w = diags[0].clone();
+                        w.severity = "warning";
+                        w.code = "W0004";
+                        w.message = "closing parentheses were repaired from the indentation; run `ail fix` to write the repair into the file".into();
+                        f.warnings.insert(0, w);
+                        return Ok((f, fixed));
+                    }
                 }
             }
             Err(diags)
@@ -105,12 +109,12 @@ fn error_count(r: &Result<Front, Vec<Diag>>) -> usize {
 /// When parens disagree with indentation and the indentation-implied structure is better,
 /// offer it as a fix: one edit per changed line.
 fn paren_fix(src: &str, diags: &[Diag]) -> Option<Diag> {
-    let fixed = parinfer::infer(src);
-    if fixed == src {
-        return None;
-    }
     let before = diags.iter().filter(|d| d.severity == "error").count();
-    let after = error_count(&frontend_raw(&fixed));
+    let (after, fixed) = parinfer::candidates(src)
+        .into_iter()
+        .filter(|c| c != src)
+        .map(|c| (error_count(&frontend_raw(&c)), c))
+        .min_by_key(|x| x.0)?;
     if after >= before {
         return None;
     }
@@ -125,7 +129,10 @@ fn paren_fix(src: &str, diags: &[Diag]) -> Option<Diag> {
     for (o, n) in old.iter().zip(new.iter()) {
         if o != n {
             first.get_or_insert(offset);
-            edits.push(diag::Edit { span: diag::Span::new(offset, offset + o.len()), text: n.to_string() });
+            edits.push(diag::Edit {
+                span: diag::Span::new(offset, offset + o.len()),
+                text: n.to_string(),
+            });
         }
         offset += o.len() + 1;
     }
@@ -152,14 +159,23 @@ fn frontend_raw(src: &str) -> Result<Front, Vec<Diag>> {
     if diags.iter().any(|d| d.severity == "error") {
         return Err(diags);
     }
-    Ok(Front { prog, ck, warnings: diags })
+    Ok(Front {
+        prog,
+        ck,
+        warnings: diags,
+    })
 }
 
 fn report(diags: &[Diag], src: &str, file: &str, json: bool) {
     if json {
         let items: Vec<String> = diags.iter().map(|d| diag::to_json(d, src, file)).collect();
         let errors = diags.iter().filter(|d| d.severity == "error").count();
-        println!("{{\"ok\":{},\"errors\":{},\"diagnostics\":[{}]}}", errors == 0, errors, items.join(","));
+        println!(
+            "{{\"ok\":{},\"errors\":{},\"diagnostics\":[{}]}}",
+            errors == 0,
+            errors,
+            items.join(",")
+        );
     } else {
         for d in diags {
             eprint!("{}", diag::render_human(d, src, file));
@@ -191,7 +207,14 @@ fn main() -> ExitCode {
         eprint!("{USAGE}");
         return ExitCode::from(2);
     };
-    let mut opts = Opts { json: false, fast: false, native: false, web: cmd == "web", port: 8000, out: None };
+    let mut opts = Opts {
+        json: false,
+        fast: false,
+        native: false,
+        web: cmd == "web",
+        port: 8000,
+        out: None,
+    };
     let mut prog_args = Vec::new();
     let mut i = 2;
     while i < argv.len() {
@@ -209,7 +232,10 @@ fn main() -> ExitCode {
                     Some("web") => opts.web = true,
                     Some("native") => opts.web = false,
                     other => {
-                        eprintln!("unknown target {:?}; use native or web", other.unwrap_or(""));
+                        eprintln!(
+                            "unknown target {:?}; use native or web",
+                            other.unwrap_or("")
+                        );
                         return ExitCode::from(2);
                     }
                 }
@@ -233,7 +259,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let fname = Path::new(file).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or(file.clone());
+    let fname = Path::new(file)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or(file.clone());
     match cmd {
         "check" => match frontend_lenient(&src) {
             Ok((f, eff)) => {
@@ -256,7 +285,10 @@ fn main() -> ExitCode {
                     Ok(f) => f.warnings,
                     Err(d) => d,
                 };
-                let errors: Vec<Diag> = diags.into_iter().filter(|d| d.severity == "error").collect();
+                let errors: Vec<Diag> = diags
+                    .into_iter()
+                    .filter(|d| d.severity == "error")
+                    .collect();
                 let (next, n) = diag::apply_fixes(&cur, &errors);
                 if n == 0 || next == cur {
                     break;
@@ -294,13 +326,17 @@ fn main() -> ExitCode {
                 emit_rust::Mode::Test
             } else if opts.web {
                 if !f.ck.info.fns.contains_key("init") {
-                    eprintln!("the web target needs an app: (fn init ...), (fn update ...) and (fn view ...) or (fn page ...)");
+                    eprintln!(
+                        "the web target needs an app: (fn init ...), (fn update ...) and (fn view ...) or (fn page ...)"
+                    );
                     return ExitCode::from(1);
                 }
                 emit_rust::Mode::Web
             } else {
                 if !f.ck.info.fns.contains_key("main") && cmd != "emit" {
-                    eprintln!("{fname} is an app (init/update/view); build it with --target web or run it with `ail web`");
+                    eprintln!(
+                        "{fname} is an app (init/update/view); build it with --target web or run it with `ail web`"
+                    );
                     return ExitCode::from(1);
                 }
                 emit_rust::Mode::Run
@@ -317,20 +353,35 @@ fn main() -> ExitCode {
             let bin = match compile(&rust, cmd == "test", &opts) {
                 Ok(b) => b,
                 Err(e) => {
-                    let d = Diag::error("E9000", diag::Span::new(0, 0), "internal compiler error: generated Rust did not compile")
-                        .note(e.lines().take(40).collect::<Vec<_>>().join("\n"));
+                    let d = Diag::error(
+                        "E9000",
+                        diag::Span::new(0, 0),
+                        "internal compiler error: generated Rust did not compile",
+                    )
+                    .note(e.lines().take(40).collect::<Vec<_>>().join("\n"));
                     report(&[d], &src, &fname, opts.json);
                     return ExitCode::from(3);
                 }
             };
             if opts.web {
                 let dir = PathBuf::from(opts.out.clone().unwrap_or_else(|| {
-                    format!("{}-web", Path::new(file).file_stem().unwrap().to_string_lossy())
+                    format!(
+                        "{}-web",
+                        Path::new(file).file_stem().unwrap().to_string_lossy()
+                    )
                 }));
                 std::fs::create_dir_all(&dir).expect("create output dir");
                 std::fs::copy(&bin, dir.join("app.wasm")).expect("copy wasm");
-                let title = Path::new(file).file_stem().unwrap().to_string_lossy().to_string();
-                std::fs::write(dir.join("index.html"), runtime_web::HOST_HTML.replace("{TITLE}", &title)).expect("write html");
+                let title = Path::new(file)
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                std::fs::write(
+                    dir.join("index.html"),
+                    runtime_web::HOST_HTML.replace("{TITLE}", &title),
+                )
+                .expect("write html");
                 eprintln!("built {}", dir.display());
                 if cmd == "web" {
                     return serve(&dir, opts.port);
@@ -339,14 +390,25 @@ fn main() -> ExitCode {
             }
             if cmd == "build" {
                 let out = opts.out.clone().unwrap_or_else(|| {
-                    let stem = Path::new(file).file_stem().unwrap().to_string_lossy().to_string();
-                    if cfg!(windows) { format!("{stem}.exe") } else { stem }
+                    let stem = Path::new(file)
+                        .file_stem()
+                        .unwrap()
+                        .to_string_lossy()
+                        .to_string();
+                    if cfg!(windows) {
+                        format!("{stem}.exe")
+                    } else {
+                        stem
+                    }
                 });
                 std::fs::copy(&bin, &out).expect("copy binary");
                 eprintln!("built {out}");
                 return ExitCode::SUCCESS;
             }
-            let status = Command::new(&bin).args(&prog_args).status().expect("run binary");
+            let status = Command::new(&bin)
+                .args(&prog_args)
+                .status()
+                .expect("run binary");
             ExitCode::from(status.code().unwrap_or(1) as u8)
         }
         _ => {
@@ -373,17 +435,41 @@ fn serve(dir: &Path, port: u16) -> ExitCode {
         if BufReader::new(&s).read_line(&mut line).is_err() {
             continue;
         }
-        let path = line.split_whitespace().nth(1).unwrap_or("/").split('?').next().unwrap_or("/").to_string();
-        let name = if path == "/" { "index.html".to_string() } else { path.trim_start_matches('/').to_string() };
+        let path = line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("/")
+            .split('?')
+            .next()
+            .unwrap_or("/")
+            .to_string();
+        let name = if path == "/" {
+            "index.html".to_string()
+        } else {
+            path.trim_start_matches('/').to_string()
+        };
         let safe = !name.contains("..") && !name.contains('\\');
         match std::fs::read(dir.join(&name)) {
             Ok(body) if safe => {
-                let ct = if name.ends_with(".wasm") { "application/wasm" } else if name.ends_with(".html") { "text/html; charset=utf-8" } else { "application/octet-stream" };
-                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", body.len());
+                let ct = if name.ends_with(".wasm") {
+                    "application/wasm"
+                } else if name.ends_with(".html") {
+                    "text/html; charset=utf-8"
+                } else {
+                    "application/octet-stream"
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
                 let _ = s.write_all(&body);
             }
             _ => {
-                let _ = write!(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
             }
         }
     }
@@ -400,23 +486,52 @@ fn fnv(s: &str) -> u64 {
 }
 
 fn compile(rust: &str, test: bool, o: &Opts) -> Result<PathBuf, String> {
-    let mut flags = vec!["--edition", "2021", "-C", "overflow-checks=on", "-C", "debuginfo=0"];
+    let mut flags = vec![
+        "--edition",
+        "2021",
+        "-C",
+        "overflow-checks=on",
+        "-C",
+        "debuginfo=0",
+    ];
     if test {
         flags.extend(["-C", "opt-level=1", "-C", "panic=unwind"]);
     } else if o.fast {
         flags.extend(["-C", "opt-level=0", "-C", "panic=abort"]);
     } else {
-        flags.extend(["-C", "opt-level=3", "-C", "panic=abort", "-C", "codegen-units=1"]);
+        flags.extend([
+            "-C",
+            "opt-level=3",
+            "-C",
+            "panic=abort",
+            "-C",
+            "codegen-units=1",
+            "-C",
+            "lto=fat",
+            "-C",
+            "strip=symbols",
+        ]);
     }
     if o.native {
         flags.extend(["-C", "target-cpu=native"]);
     }
     if o.web {
-        flags.extend(["--target", "wasm32-unknown-unknown", "--crate-type", "cdylib"]);
+        flags.extend([
+            "--target",
+            "wasm32-unknown-unknown",
+            "--crate-type",
+            "cdylib",
+        ]);
     }
     let key = format!("{:016x}", fnv(&format!("{}{}", rust, flags.join(" "))));
     let dir = std::env::temp_dir().join("ail-cache").join(&key);
-    let bin = dir.join(if o.web { "prog.wasm" } else if cfg!(windows) { "prog.exe" } else { "prog" });
+    let bin = dir.join(if o.web {
+        "prog.wasm"
+    } else if cfg!(windows) {
+        "prog.exe"
+    } else {
+        "prog"
+    });
     if bin.exists() {
         return Ok(bin);
     }
@@ -433,7 +548,11 @@ fn compile(rust: &str, test: bool, o: &Opts) -> Result<PathBuf, String> {
         .map_err(|e| format!("cannot run rustc: {e}"))?;
     if !out.status.success() {
         let _ = std::fs::remove_file(&bin);
-        return Err(format!("{}\n(generated source: {})", String::from_utf8_lossy(&out.stderr), src.display()));
+        return Err(format!(
+            "{}\n(generated source: {})",
+            String::from_utf8_lossy(&out.stderr),
+            src.display()
+        ));
     }
     Ok(bin)
 }

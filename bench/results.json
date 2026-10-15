@@ -1,16 +1,95 @@
 [
  {
-  "bench": "trees",
-  "ail_s": 15.041,
-  "rust_s": 97.958,
-  "ratio": 0.154,
+  "bench": "api",
+  "ail_s": 2.091,
+  "rust_s": 2.322,
+  "ratio": 0.9,
+  "same_output": true
+ },
+ {
+  "bench": "fannkuch",
+  "ail_s": 2.605,
+  "rust_s": 3.161,
+  "ratio": 0.82,
+  "same_output": true
+ },
+ {
+  "bench": "game",
+  "ail_s": 1.382,
+  "rust_s": 1.281,
+  "ratio": 1.08,
+  "same_output": true
+ },
+ {
+  "bench": "hashmap",
+  "ail_s": 1.281,
+  "rust_s": 2.511,
+  "ratio": 0.51,
+  "same_output": true
+ },
+ {
+  "bench": "interp",
+  "ail_s": 3.737,
+  "rust_s": 3.249,
+  "ratio": 1.15,
+  "same_output": true
+ },
+ {
+  "bench": "json",
+  "ail_s": 1.897,
+  "rust_s": 3.217,
+  "ratio": 0.59,
+  "same_output": true
+ },
+ {
+  "bench": "nbody",
+  "ail_s": 3.354,
+  "rust_s": 3.126,
+  "ratio": 1.07,
+  "same_output": true
+ },
+ {
+  "bench": "pathfind",
+  "ail_s": 0.063,
+  "rust_s": 0.089,
+  "ratio": 0.7,
+  "same_output": true
+ },
+ {
+  "bench": "raytrace",
+  "ail_s": 0.034,
+  "rust_s": 0.034,
+  "ratio": 1.0,
+  "same_output": true
+ },
+ {
+  "bench": "sieve",
+  "ail_s": 5.563,
+  "rust_s": 5.258,
+  "ratio": 1.06,
   "same_output": true
  },
  {
   "bench": "strings",
-  "ail_s": 0.785,
-  "rust_s": 1.32,
-  "ratio": 0.594,
+  "ail_s": 0.317,
+  "rust_s": 0.634,
+  "ratio": 0.5,
   "same_output": true
+ },
+ {
+  "bench": "trees",
+  "ail_s": 8.711,
+  "rust_s": 51.706,
+  "ratio": 0.168,
+  "same_output": true,
+  "note": "separate run, same compiler"
+ },
+ {
+  "bench": "wordfreq",
+  "ail_s": 0.641,
+  "rust_s": 0.41,
+  "ratio": 1.56,
+  "same_output": true,
+  "note": "run before the per-thread allocator change"
  }
 ]

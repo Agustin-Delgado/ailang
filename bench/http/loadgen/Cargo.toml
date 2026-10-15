@@ -1,0 +1,8 @@
+[package]
+name = "loadgen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+socket2 = "0.5"

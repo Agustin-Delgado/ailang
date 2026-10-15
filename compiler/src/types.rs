@@ -89,7 +89,15 @@ impl Cap {
         }
     }
     pub fn all() -> [Cap; 7] {
-        [Cap::Console, Cap::Fs, Cap::Clock, Cap::Rand, Cap::Env, Cap::Net, Cap::Gfx]
+        [
+            Cap::Console,
+            Cap::Fs,
+            Cap::Clock,
+            Cap::Rand,
+            Cap::Env,
+            Cap::Net,
+            Cap::Gfx,
+        ]
     }
 }
 
@@ -126,7 +134,10 @@ impl Ty {
         matches!(self, Ty::Err)
     }
     pub fn is_displayable(&self) -> bool {
-        matches!(self, Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Str | Ty::Err | Ty::Never)
+        matches!(
+            self,
+            Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Str | Ty::Err | Ty::Never
+        )
     }
     pub fn is_ordered(&self) -> bool {
         self.is_numeric() || matches!(self, Ty::Str | Ty::Bool | Ty::Err)
@@ -200,7 +211,14 @@ pub struct TypeInfo {
 impl TypeInfo {
     pub fn is_copy(&self, t: &Ty) -> bool {
         match t {
-            Ty::Int(_) | Ty::F32 | Ty::F64 | Ty::Bool | Ty::Unit | Ty::Never | Ty::Cap(_) | Ty::Err => true,
+            Ty::Int(_)
+            | Ty::F32
+            | Ty::F64
+            | Ty::Bool
+            | Ty::Unit
+            | Ty::Never
+            | Ty::Cap(_)
+            | Ty::Err => true,
             Ty::Opt(a) => self.is_copy(a),
             Ty::Res(a, b) => self.is_copy(a) && self.is_copy(b),
             Ty::User(n) => self.copy_types.contains(n),
@@ -227,7 +245,10 @@ impl TypeInfo {
         if let Some(s) = self.structs.get(name) {
             s.fields.iter().map(|f| f.1.clone()).collect()
         } else if let Some(e) = self.enums.get(name) {
-            e.variants.iter().flat_map(|v| v.1.iter().cloned()).collect()
+            e.variants
+                .iter()
+                .flat_map(|v| v.1.iter().cloned())
+                .collect()
         } else {
             Vec::new()
         }
@@ -246,7 +267,12 @@ impl TypeInfo {
                 _ => {}
             }
         }
-        let names: Vec<String> = self.structs.keys().chain(self.enums.keys()).cloned().collect();
+        let names: Vec<String> = self
+            .structs
+            .keys()
+            .chain(self.enums.keys())
+            .cloned()
+            .collect();
         let mut edges: HashMap<String, Vec<String>> = HashMap::new();
         for n in &names {
             let mut out = Vec::new();
