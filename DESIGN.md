@@ -65,7 +65,33 @@ machine lines to source lines that is read only when a trap happens.
 - Overflow and bounds checks stay on; they are the price of having no UB and are measured in the
   benchmarks as such.
 
-## 7. Toolchain
+## 7. Strings are values, read in place
+
+A `Str` behaves like any other value: it is never shared and never changes behind your back. The
+compiler still avoids copying it whenever it can prove that nobody could tell the difference:
+
+- read-only `Str` parameters are passed as `&str`;
+- an immutable local bound to a piece of another string (`substr`, `trim`, a literal, a branch
+  that picks one of several) is a borrowed view, as long as the string it comes from is neither
+  changed nor moved while the view is used; `lower`/`upper` give a view that is copied only when a
+  character actually changes;
+- a fn whose result is always a piece of one of its `Str` parameters returns a view of it;
+- `(put (mut m) k (... (get m k) ...))` looks `k` up once, and copies `k` only if it is new.
+
+None of this is visible in the language: there are no lifetimes, and the program means the same
+with or without it. It is what lets idiomatic ail match hand-tuned Rust on text processing.
+
+## 8. Functions are arguments, never values
+
+A parameter can be a function `(Fn A B R)`, and the caller passes a `lambda`, a fn name or a
+function it received. That is all: functions cannot be bound with `let`, stored in data or
+returned, and a lambda only reads its surroundings. So there are no closures that outlive the
+call, nothing a closure can mutate, no capture rules to learn and nothing to allocate: every
+function argument compiles to a direct, inlinable call. `map`, `filter`, `fold`, `sort-by` and
+friends cover the common loops; a `for` loop is still the way to change variables or exit
+early.
+
+## 9. Toolchain
 
 `ail check` (instant), `ail fix`, `ail run`, `ail test`, `ail build`, `ail emit` (generated Rust),
 `ail spec` (the specification an agent should read, embedded in the binary).

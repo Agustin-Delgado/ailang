@@ -140,10 +140,16 @@ Vec: `(vec a b ...)` `(fill n x)` `(len v)` `(is-empty v)` `(at v i)` `(push (mu
 
 Ordering: numbers, Str (bytewise), Bool, and Vec/Option/structs/enums built from them compare with
 `< <= > >= min max` and `sort`. Structs compare field by field in declaration order and enums by variant
-order, so to sort records by a key declare the key as the first field. Maps have no order.
+order. To sort records by one field use `(sort-by (mut v) (lambda (r) (. r field)))`. Maps have no order.
 
 Map: `(map)` empty (needs a type annotation) `(put (mut m) k v)` `(get m k)` -> Option `(has m k)`
 `(del (mut m) k)` -> Option `(keys m)` (sorted) `(values m)` (sorted by key) `(len m)` `(is-empty m)` `(clear (mut m))`.
+
+Vec with a function (see below): `(map v f)` -> Vec of the results `(filter v f)` `(any v f)` `(all v f)`
+`(count v f)` -> I64 `(find v f)` -> Option `(find-index v f)` -> `(Option I64)`
+`(fold v init (lambda (acc x) new-acc))` `(sort-by (mut v) (lambda (x) key))` (stable, ascending; negate a
+number key for descending) `(min-by v key-fn)` `(max-by v key-fn)` -> Option (first element with the
+smallest/largest key). The Vec always comes first: `(map xs (lambda (x) (* x 2)))`.
 
 Option/Result: `(some x)` `none` `(ok x)` `(err e)` `(unwrap-or o default)` `(expect o "msg")`
 `(is-some o)` `(is-none o)` `(is-ok r)` `(is-err r)`.
@@ -197,7 +203,23 @@ Request `path` and `query` are URL-decoded; header names are lowercase. A server
 
 Other: `(fail "msg")` stops the program (type Never, fits anywhere). `(assert cond)` `(assert cond "msg")`.
 
-There are no lambdas, no generics in user code, no globals except `const`, no inheritance,
+## Functions as arguments
+
+A parameter can be a function. `(Fn A B R)` lists the argument types, then the result:
+
+```
+(fn twice (params (f (Fn I64 I64)) (x I64)) (returns I64) (body (f (f x))))
+(twice (lambda (x) (* x 3)) 2)   ; 18
+(twice inc 5)                    ; the name of a fn works too
+```
+
+`(lambda (x y) body...)` gets its parameter types from the `(Fn ...)` it is passed to; write
+`(lambda ((x I64)) ...)` to state one. Its value is its last expression. A lambda reads the variables
+around it but never changes them, and `return`, `break`, `continue` and `try` cannot leave it.
+Functions are only passed as arguments (to a `(Fn ...)` parameter or a builtin like `map`): they
+cannot be bound with `let`, stored in data or returned.
+
+There are no generics in user code, no globals except `const`, no inheritance,
 no exceptions and no implicit conversions.
 
 ## Example

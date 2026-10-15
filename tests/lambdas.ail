@@ -1,0 +1,102 @@
+; Tests for functions passed as arguments: lambdas, named fns and (Fn ...) parameters, and the
+; builtins that take them. Run with: ail test tests/lambdas.ail
+
+(struct Item (name Str) (price I64) (weight F64))
+
+(fn items (returns (Vec Item))
+  (body
+    (vec (new Item (name "pear") (price 30) (weight 0.5))
+         (new Item (name "apple") (price 20) (weight 1.5))
+         (new Item (name "fig") (price 30) (weight 0.25))
+         (new Item (name "kiwi") (price 10) (weight 2.0)))))
+
+(fn twice (params (f (Fn I64 I64)) (x I64)) (returns I64) (body (f (f x))))
+
+(fn apply-all (params (xs (Vec I64)) (f (Fn I64 I64))) (returns (Vec I64))
+  (body (map xs f)))
+
+(fn label-all (params (xs (Vec Item)) (f (Fn Item Str))) (returns Str)
+  (body (join (map xs f) ",")))
+
+(fn inc (params (x I64)) (returns I64) (body (+ x 1)))
+
+(fn shout (params (s Str)) (returns Str) (body (upper s)))
+
+(fn first-char (params (s Str)) (returns Str) (body (substr s 0 1)))
+
+(test "map, filter and the predicates"
+  (let xs (vec 1 2 3 4 5 6))
+  (assert (== (map xs (lambda (x) (* x x))) (vec 1 4 9 16 25 36)))
+  (assert (== (filter xs (lambda (x) (== (% x 2) 0))) (vec 2 4 6)))
+  (assert (any xs (lambda (x) (> x 5))))
+  (assert (not (all xs (lambda (x) (> x 1)))))
+  (assert (== (count xs (lambda (x) (> x 2))) 4))
+  (assert (== (find xs (lambda (x) (> x 3))) (some 4)))
+  (assert (== (find xs (lambda (x) (> x 30))) none))
+  (assert (== (find-index xs (lambda (x) (== x 5))) (some 4)))
+  (let empty (Vec I64) (vec))
+  (assert (all empty (lambda (x) (> x 100))))
+  (assert (== (count empty (lambda (x) true)) 0)))
+
+(test "lambdas read their surroundings"
+  (let limit 3)
+  (let names (vec "a" "bb" "ccc" "dddd"))
+  (assert (== (filter names (lambda (s) (>= (len s) limit))) (vec "ccc" "dddd")))
+  (var total 0)
+  (for i (range 0 3)
+    (set total (+ total (count names (lambda (s) (> (len s) i))))))
+  (assert (== total 9)))
+
+(test "map changes the element type"
+  (let words (vec "alpha" "be" "gam"))
+  (assert (== (map words (lambda (w) (len w))) (vec 5 2 3)))
+  (assert (== (map words (lambda (w) (str w "!"))) (vec "alpha!" "be!" "gam!")))
+  (let fs (Vec F64) (map (vec 1 2) (lambda (x) 0.5)))
+  (assert (== fs (vec 0.5 0.5))))
+
+(test "fold"
+  (let xs (vec 1 2 3 4))
+  (assert (== (fold xs 0 (lambda (acc x) (+ acc x))) 10))
+  (assert (== (fold xs "" (lambda (acc x) (str acc x))) "1234"))
+  (let pairs (fold xs (Vec I64) (vec) (lambda (acc x) (concat acc (vec x x)))))
+  (assert (== (len pairs) 8)))
+
+(test "sort-by, min-by and max-by"
+  (var its (items))
+  (sort-by (mut its) (lambda (it) (. it price)))
+  (assert (== (map its (lambda (it) (. it name))) (vec "kiwi" "apple" "pear" "fig")))
+  (sort-by (mut its) (lambda (it) (. it name)))
+  (assert (== (map its (lambda (it) (. it name))) (vec "apple" "fig" "kiwi" "pear")))
+  (sort-by (mut its) (lambda (it) (. it weight)))
+  (assert (== (. (at its 0) name) "fig"))
+  (sort-by (mut its) (lambda (it) (- 0 (. it price))))
+  (assert (== (map its (lambda (it) (. it name))) (vec "fig" "pear" "apple" "kiwi")))
+  (let all (items))
+  (assert (== (. (expect (min-by all (lambda (it) (. it price))) "some") name) "kiwi"))
+  (assert (== (. (expect (max-by all (lambda (it) (. it price))) "some") name) "pear"))
+  (assert (== (. (expect (max-by all (lambda (it) (. it weight))) "some") name) "kiwi"))
+  (let none-left (Vec Item) (vec))
+  (assert (is-none (min-by none-left (lambda (it) (. it price))))))
+
+(test "user functions that take functions"
+  (assert (== (twice (lambda (x) (* x 3)) 2) 18))
+  (assert (== (twice inc 5) 7))
+  (assert (== (apply-all (vec 1 2) inc) (vec 2 3)))
+  (assert (== (apply-all (vec 1 2) (lambda (x) (- x))) (vec -1 -2)))
+  (assert (== (label-all (items) (lambda (it) (str (. it name) "=" (. it price))))
+              "pear=30,apple=20,fig=30,kiwi=10"))
+  (assert (== (map (vec "a" "b") shout) (vec "A" "B")))
+  (assert (== (map (vec "xy" "zw") first-char) (vec "x" "z"))))
+
+(test "lambda params with types and nested lambdas"
+  (let grid (vec (vec 1 2) (vec 3 4 5)))
+  (assert (== (map grid (lambda ((row (Vec I64))) (fold row 0 (lambda (a x) (+ a x))))) (vec 3 12)))
+  (assert (== (count grid (lambda (row) (any row (lambda (x) (> x 4))))) 1)))
+
+(test "loops inside a lambda"
+  (let xs (vec 3 5))
+  (assert (== (map xs (lambda (n)
+                (var s 0)
+                (for i (range 0 n) (if (== i 2) continue) (set s (+ s i)))
+                s))
+              (vec 1 8))))
