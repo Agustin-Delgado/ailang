@@ -117,6 +117,9 @@ Arithmetic and logic: `(+ a b ...)` `(- a b)` `(- a)` `(* a b ...)` `(/ a b)` `(
 `(bit-and a b)` `(bit-or a b)` `(bit-xor a b)` `(shl a n)` `(shr a n)` `(abs x)` `(min a b)` `(max a b)`
 `(pow b e)` (int: e is U32) `(sqrt x)` `(floor x)` `(ceil x)` `(round x)` `(sin x)` `(cos x)` `(tan x)`
 `(atan2 y x)` `(exp x)` `(ln x)`. Operands of one operator must have the same type; convert with `as`.
+Explicit overflow handling (integers): `(wrapping-add a b)` `(wrapping-sub a b)` `(wrapping-mul a b)`
+wrap around (for hashes and RNGs); `(checked-add a b)` `(checked-sub a b)` `(checked-mul a b)` ->
+`(Option T)`, `none` on overflow. Plain `+ - *` trap on overflow.
 `(+ a b c)` evaluates left to right as `((a + b) + c)`. Floats are IEEE-754 and never fused
 (no multiply-add contraction), so float results are the same on every platform.
 `(as T x)` checks `x` with its own type first, then converts: `(as F64 (% n 1000))` is integer `%`.

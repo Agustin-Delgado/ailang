@@ -291,6 +291,12 @@ pub const BUILTINS: &[&str] = &[
     "and",
     "or",
     "not",
+    "wrapping-add",
+    "wrapping-sub",
+    "wrapping-mul",
+    "checked-add",
+    "checked-sub",
+    "checked-mul",
     "bit-and",
     "bit-or",
     "bit-xor",
@@ -3096,6 +3102,21 @@ impl Checker {
                 let x = self.arg_val(&args[0]);
                 self.check_expect(x, &Ty::Bool);
                 Ty::Bool
+            }
+            "wrapping-add" | "wrapping-sub" | "wrapping-mul" | "checked-add" | "checked-sub" | "checked-mul" => {
+                ar!(2, &format!("({name} a b)"));
+                let es = self.vals(args);
+                let checked = name.starts_with("checked");
+                let inner = match exp {
+                    Some(Ty::Opt(t)) if checked => Some((**t).clone()),
+                    Some(t) if !checked => Some(t.clone()),
+                    _ => None,
+                };
+                let t = self.check_same(&es, inner.as_ref());
+                if !t.is_int() && !t.is_err() {
+                    self.err(Diag::error("E0212", span, &format!("'{name}' needs integers, found {t}")));
+                }
+                if checked { Ty::Opt(Box::new(t)) } else { t }
             }
             "bit-and" | "bit-or" | "bit-xor" | "shl" | "shr" => {
                 ar!(2, "(bit-and a b)");

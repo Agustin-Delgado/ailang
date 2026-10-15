@@ -157,3 +157,13 @@
   (assert (== s "1 -2 2.5 true y -9223372036854775808"))
   (let n I32 7)
   (assert (== (str "n=" n ", m=" 0) "n=7, m=0")))
+
+(test "explicit overflow handling"
+  (let big 9223372036854775807)
+  (assert (== (checked-add big 1) none))
+  (assert (== (checked-add 1 2) (some 3)))
+  (assert (== (checked-mul big 2) none))
+  (assert (== (wrapping-add big 1) (- (- 0 big) 1)))
+  (let h U64 14695981039346656037)
+  (let p U64 1099511628211)
+  (assert (== (wrapping-mul (bit-xor h (as U64 97)) p) 12638187200555641996)))

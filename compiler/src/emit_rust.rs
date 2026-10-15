@@ -1254,6 +1254,10 @@ impl<'a> Emitter<'a> {
                 format!("({})", parts.join(op))
             }
             "not" => format!("(!{})", self.val(a(0))),
+            "wrapping-add" | "wrapping-sub" | "wrapping-mul" | "checked-add" | "checked-sub" | "checked-mul" => {
+                let m = name.replace('-', "_");
+                format!("({}).{m}({})", self.val(a(0)), self.val(a(1)))
+            }
             "bit-and" => format!("({} & {})", self.val(a(0)), self.val(a(1))),
             "bit-or" => format!("({} | {})", self.val(a(0)), self.val(a(1))),
             "bit-xor" => format!("({} ^ {})", self.val(a(0)), self.val(a(1))),
