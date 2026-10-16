@@ -126,7 +126,18 @@ exclusively, which stalls every other request, cannot be written either. A trap 
 could not have changed anything; a trap in `write` stops the program, because the state may be
 half-changed.
 
-## 12. Toolchain
+## 12. Tasks that cannot deadlock
+
+`(tasks ...)` is structured: the block starts its tasks and ends when every one has finished, so
+no task outlives the code that started it. Tasks talk only through channels, and the checker
+holds them to three rules. Every channel has exactly one sender and one receiver. The graph of
+tasks has no cycle. An outer variable is changed by at most one task, its owner, and no other task
+may read it. With unbounded channels, the only way to wait forever is a cycle of waits, and a
+cycle cannot be written, so a deadlock cannot be written either. Shared mutable state cannot be
+written, so there are no data races. Each channel keeps its order, and Console and Rand belong to
+one task at most, so a program's output does not depend on timing.
+
+## 13. Toolchain
 
 `ail check` (instant), `ail fix`, `ail run`, `ail test`, `ail build`, `ail emit` (generated Rust),
 `ail spec` (the specification an agent should read, embedded in the binary).

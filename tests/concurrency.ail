@@ -24,3 +24,55 @@
   (let empty (Vec I64) (vec))
   (assert (is-empty (par-run empty (lambda (x) x)))))
 
+
+(test "a pipeline keeps the order of every channel"
+  (var got (Vec I64) (vec))
+  (var evens 0)
+  (tasks
+    (channel nums I64)
+    (channel squares I64)
+    (task (out nums)
+      (for i (range 0 20000) (send nums i)))
+    (task (in nums) (out squares) (mut evens)
+      (for n nums
+        (if (== (% n 2) 0) (set evens (+ evens 1)))
+        (send squares (* n n))))
+    (task (in squares) (mut got)
+      (for s squares (push (mut got) s))))
+  (assert (== evens 10000))
+  (assert (== (len got) 20000))
+  (var ok true)
+  (for i (range 0 20000) (if (!= (at got i) (* i i)) (set ok false)))
+  (assert ok))
+
+(test "recv returns none once the sender has finished"
+  (var seen (Vec Str) (vec))
+  (tasks
+    (channel words Str)
+    (task (out words) (for w (split "a b c" " ") (send words w)))
+    (task (in words) (mut seen)
+      (while true
+        (match (recv words)
+          (case (some w) (push (mut seen) (upper w)))
+          (case none break)))))
+  (assert (== (join seen "") "ABC")))
+
+(test "independent tasks each fill their own variable"
+  (var a 0)
+  (var b "")
+  (let base 10)
+  (tasks
+    (task (mut a) (for i (range 0 1000) (set a (+ a base))))
+    (task (mut b) (for i (range 0 3) (set b (str b base)))))
+  (assert (== a 10000))
+  (assert (== b "101010")))
+
+(test "structs and vectors travel over channels"
+  (var total 0)
+  (tasks
+    (channel batches (Vec I64))
+    (task (out batches)
+      (for i (range 0 100) (send batches (vec i (+ i 1) (+ i 2)))))
+    (task (in batches) (mut total)
+      (for v batches (set total (+ total (sum v))))))
+  (assert (== total 15150)))

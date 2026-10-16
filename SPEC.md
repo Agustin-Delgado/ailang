@@ -221,6 +221,32 @@ Request `path` and `query` are URL-decoded; header names are lowercase. A server
     (case _ (try (http-respond net req 404 "text/plain" "not found")))))
 ```
 
+## Tasks and channels
+
+`(tasks ...)` runs several tasks at the same time and ends when all of them have finished:
+
+```
+(var total 0)
+(tasks
+  (channel nums I64)                      ; (channel name Type): values flow one way
+  (task (out nums)                        ; this task sends on nums
+    (for i (range 0 100) (send nums i)))
+  (task (in nums) (mut total)             ; receives from nums; owns total (may change it)
+    (for n nums (set total (+ total n)))))  ; the loop ends when the sender has finished
+(println con total)
+```
+
+- `(send c v)` sends a value; `(for x c ...)` receives until the sending task ends; `(recv c)` ->
+  `(Option T)` receives one (`none` once the sender has ended). Channels are unbounded.
+- Every channel has exactly one task with `(out c)` and one with `(in c)`, and values flow one way:
+  tasks cannot form a cycle. So no task can wait forever.
+- A task may change an outer `var` only if it owns it, `(mut x y)`; no other task can even read
+  it. Other outer variables are read-only. Results come back through owned variables.
+- Console and Rand may be used by one task at most, so the output order is fixed. Net, Fs, Clock
+  and Env may be used by any task. A task cannot `return`, `try` or `break` out of itself.
+
+## Servers
+
 For real servers use `http-serve`: GET and HEAD requests go to `read`, which runs many requests at
 once and only reads the state; every other method goes to `write`, one request at a time, with the
 state as `mut`. `read` is a lambda or fn of `(req Request) (s State)` returning `Reply`; `write` must

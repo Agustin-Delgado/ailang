@@ -1,0 +1,46 @@
+; pipeline: three stages connected by channels (bench/SPECS.md "pipeline").
+(const N I64 2000000)
+
+(struct Hit (path Str) (status I64) (ms I64))
+(struct Agg (count I64) (ms I64))
+
+(fn parse-hit (params (line Str)) (returns Hit)
+  (body
+    (let parts (split line " "))
+    (new Hit (path (at parts 1))
+      (status (expect (parse-i64 (at parts 2)) "status"))
+      (ms (expect (parse-i64 (at parts 3)) "ms")))))
+
+(fn main (params (con Console))
+  (body
+    (var by-path (Map Str Agg) (map))
+    (var errors 0)
+    (var missing 0)
+    (tasks
+      (channel lines Str)
+      (channel hits Hit)
+      (task (out lines)
+        (for i (range 0 N)
+          (let status (if (== (% i 13) 0) 500 (if (== (% i 7) 0) 404 200)))
+          (send lines (str "GET /item/" (% i 1000) " " status " " (% (* i 7919) 1000)))))
+      (task (in lines) (out hits)
+        (for line lines (send hits (parse-hit line))))
+      (task (in hits) (mut by-path errors missing)
+        (for h hits
+          (if (>= (. h status) 500) (set errors (+ errors 1)))
+          (if (== (. h status) 404) (set missing (+ missing 1)))
+          (let a (unwrap-or (get by-path (. h path)) (new Agg (count 0) (ms 0))))
+          (put (mut by-path) (. h path) (new Agg (count (+ (. a count) 1)) (ms (+ (. a ms) (. h ms))))))))
+    (var total 0)
+    (var total-ms 0)
+    (var best "")
+    (var best-ms -1)
+    (for p (keys by-path)
+      (let a (expect (get by-path p) "key"))
+      (set total (+ total (. a count)))
+      (set total-ms (+ total-ms (. a ms)))
+      (if (> (. a ms) best-ms)
+        (do (set best p) (set best-ms (. a ms)))))
+    (println con "hits " total " errors " errors " missing " missing)
+    (println con "paths " (len by-path) " ms " total-ms)
+    (println con "slowest " best " " best-ms)))

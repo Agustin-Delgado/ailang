@@ -57,6 +57,8 @@ pub struct Checked {
     pub fn_params: HashMap<String, Vec<BindId>>,
     /// Params of each lambda (by expr id), in order.
     pub lambda_params: HashMap<u32, Vec<BindId>>,
+    /// Element types of the channels of each (tasks ...) block, by its expr id, in order.
+    pub chan_types: HashMap<u32, Vec<Ty>>,
     /// Concrete copies of generic fns, one per set of type arguments used.
     pub instances: Vec<FnDef>,
     /// Pattern-key epoch of each instance (its patterns share spans with the generic fn).
@@ -81,8 +83,12 @@ pub fn check(prog: &Program) -> (Checked, Vec<Diag>) {
         decl: HashMap::new(),
         fn_params: HashMap::new(),
         lambda_params: HashMap::new(),
+        chan_types: HashMap::new(),
         lambda_floor: None,
         loop_floor: 0,
+        in_task: false,
+        task_owned: Vec::new(),
+        task_foreign: Vec::new(),
         generic_types: HashMap::new(),
         generic_sigs: HashMap::new(),
         generic_fns: HashMap::new(),
@@ -188,6 +194,7 @@ pub fn check(prog: &Program) -> (Checked, Vec<Diag>) {
         fn_params: c.fn_params,
         result_binding: c.result_binding,
         lambda_params: c.lambda_params,
+        chan_types: c.chan_types,
         instances: c.instances,
         fn_epoch: c.fn_epoch,
     };
@@ -223,10 +230,16 @@ struct Checker {
     /// Expressions whose value is discarded (statement position): their branches may differ in type.
     stmt_ids: std::collections::HashSet<u32>,
     lambda_params: HashMap<u32, Vec<BindId>>,
+    chan_types: HashMap<u32, Vec<Ty>>,
     /// Inside a lambda: bindings below this id belong to the code around it (read-only there).
     lambda_floor: Option<usize>,
     /// break/continue need a loop deeper than this (a lambda body starts a new level).
     loop_floor: u32,
+    /// Inside a task of (tasks ...): the outer variables this task owns (it may change them),
+    /// and those owned by the other tasks (it cannot even read them).
+    in_task: bool,
+    task_owned: Vec<BindId>,
+    task_foreign: Vec<BindId>,
     /// Generic definitions, kept apart from the concrete ones in `info`.
     generic_types: HashMap<String, GenericType>,
     generic_sigs: HashMap<String, (Vec<String>, FnSig)>,
@@ -399,6 +412,8 @@ pub const BUILTINS: &[&str] = &[
     "http-respond",
     "http-serve",
     "http-request",
+    "send",
+    "recv",
     "read-all",
     "lines",
     "is-digit",
@@ -1226,6 +1241,7 @@ impl Checker {
             },
             ExprKind::Str(_) => Ty::Str,
             ExprKind::Var(name) => self.check_var(e, name, exp),
+            ExprKind::Tasks(chans, tasks) => self.check_tasks(e, chans, tasks),
             ExprKind::Lambda(..) => {
                 self.err(
                     Diag::error("E0321", e.span, "a lambda can only be passed as an argument where a (Fn ...) parameter is expected")
@@ -1358,6 +1374,19 @@ impl Checker {
                         (at, BindKind::Local { mutable: false }, None)
                     }
                     ForIter::Each(v) => {
+                        if let Some((ct, sending)) = self.chan_arg(v) {
+                            if sending {
+                                self.err(Diag::error("E0336", v.span, "this task sends on this channel; only the task with (in ...) can read it"));
+                            }
+                            self.loop_depth += 1;
+                            let b = self.local(var, ct, BindKind::Local { mutable: false });
+                            let bid = self.bind(b);
+                            self.decl.insert(id, bid);
+                            self.check_block(body, Some(&Ty::Unit));
+                            self.loop_depth -= 1;
+                            self.scopes.pop();
+                            return Ty::Unit;
+                        }
                         let vt = self.check(v, None);
                         let elem = match &vt {
                             Ty::Vec(t) => (**t).clone(),
@@ -1433,7 +1462,7 @@ impl Checker {
                     self.err(Diag::error(
                         "E0323",
                         e.span,
-                        "break/continue cannot leave a lambda",
+                        &format!("break/continue cannot leave a {}", self.closure_kind()),
                     ));
                 }
                 Ty::Never
@@ -1442,7 +1471,7 @@ impl Checker {
                 self.err(Diag::error(
                     "E0323",
                     e.span,
-                    "return cannot leave a lambda: the lambda's value is its last expression",
+                    &if self.in_task { "return cannot leave a task: a task ends at the end of its body".to_string() } else { "return cannot leave a lambda: the lambda's value is its last expression".to_string() },
                 ));
                 Ty::Never
             }
@@ -1574,7 +1603,7 @@ impl Checker {
                 self.err(Diag::error(
                     "E0323",
                     e.span,
-                    "try cannot leave a lambda; handle the Option/Result inside it with match or unwrap-or",
+                    &format!("try cannot leave a {}; handle the Option/Result inside it with match or unwrap-or", self.closure_kind()),
                 ));
                 Ty::Err
             }
@@ -1712,6 +1741,21 @@ impl Checker {
         if let Some(b) = self.lookup(name) {
             self.res[id] = Res::Local(b);
             let t = self.bindings[b].ty.clone();
+            if self.task_foreign.contains(&b) {
+                self.err(
+                    Diag::error("E0333", e.span, &format!("'{name}' is owned by another task, so this task cannot use it"))
+                        .note("tasks share nothing they could change; send the value over a channel instead"),
+                );
+                return Ty::Err;
+            }
+            if matches!(t, Ty::Chan(..)) {
+                self.err(Diag::error(
+                    "E0336",
+                    e.span,
+                    &format!("'{name}' is a channel: use it only as (send {name} value), (recv {name}) or (for x {name} ...)"),
+                ));
+                return Ty::Err;
+            }
             if matches!(t, Ty::Fn(..)) {
                 self.err(Diag::error(
                     "E0321",
@@ -1901,7 +1945,14 @@ impl Checker {
             return None;
         };
         let b = self.bindings[root].clone();
-        if self.lambda_floor.is_some_and(|f| root < f) {
+        if self.in_task && self.lambda_floor.is_some_and(|f| root < f) && !self.task_owned.contains(&root) {
+            self.err(
+                Diag::error("E0333", place.span, &format!("this task cannot {what} '{}': it belongs to the code around the tasks", b.name))
+                    .note(format!("let the task own it: (task (mut {}) ...); then no other task can touch it", b.name)),
+            );
+            return None;
+        }
+        if self.lambda_floor.is_some_and(|f| root < f) && !self.task_owned.contains(&root) {
             self.err(
                 Diag::error(
                     "E0322",
@@ -2958,6 +3009,9 @@ impl Checker {
             ));
         }
         let saved = (self.loop_depth, self.loop_floor, self.lambda_floor);
+        // A lambda inside a task only reads, like any lambda: it does not share the task's ownership.
+        let saved_task = (self.in_task, std::mem::take(&mut self.task_owned));
+        self.in_task = false;
         self.lambda_floor = Some(self.bindings.len());
         self.loop_depth += 1;
         self.loop_floor = self.loop_depth;
@@ -2991,6 +3045,7 @@ impl Checker {
         };
         self.scopes.pop();
         (self.loop_depth, self.loop_floor, self.lambda_floor) = saved;
+        (self.in_task, self.task_owned) = saved_task;
         let bt = if r.is_err() { bt } else { r.clone() };
         self.set_ty(e, Ty::Fn(ps.to_vec(), Box::new(bt)))
     }
@@ -4066,6 +4121,40 @@ impl Checker {
                 }
                 Ty::Res(Box::new(Ty::Unit), Box::new(Ty::Str))
             }
+            "send" => {
+                ar!(2, "(send channel value)");
+                let c = self.arg_val(&args[0]);
+                let v = self.arg_val(&args[1]);
+                match self.chan_arg(c) {
+                    Some((t, true)) => {
+                        self.check_expect(v, &t);
+                    }
+                    Some((_, false)) => {
+                        self.err(Diag::error("E0336", c.span, "this task receives from this channel; only the task with (out ...) can send on it"));
+                        self.check(v, None);
+                    }
+                    None => {
+                        self.not_a_chan(c, "send");
+                        self.check(v, None);
+                    }
+                }
+                Ty::Unit
+            }
+            "recv" => {
+                ar!(1, "(recv channel)");
+                let c = self.arg_val(&args[0]);
+                match self.chan_arg(c) {
+                    Some((t, false)) => Ty::Opt(Box::new(t)),
+                    Some((_, true)) => {
+                        self.err(Diag::error("E0336", c.span, "this task sends on this channel; only the task with (in ...) can receive from it"));
+                        Ty::Err
+                    }
+                    None => {
+                        self.not_a_chan(c, "recv");
+                        Ty::Err
+                    }
+                }
+            }
             "http-request" => {
                 if let Some(rest) = self.need_cap(Cap::Net, args, nspan, span) {
                     if rest.len() != 4 {
@@ -4160,6 +4249,181 @@ impl Checker {
 
     /// The Vec and the function of a higher-order builtin: (name vec f). Catches the Lisp
     /// argument order (name f vec).
+    fn closure_kind(&self) -> &'static str {
+        if self.in_task { "task" } else { "lambda" }
+    }
+
+    /// The channel named by `x` in the current task: its element type and whether this task
+    /// is the sending end. Reports an error (and returns None) for anything else.
+    fn chan_arg(&mut self, x: &Expr) -> Option<(Ty, bool)> {
+        let ExprKind::Var(n) = &x.kind else { return None };
+        let b = self.lookup(n)?;
+        let Ty::Chan(t, sending) = self.bindings[b].ty.clone() else { return None };
+        self.res[x.id as usize] = Res::Local(b);
+        self.set_ty(x, Ty::Chan(t.clone(), sending));
+        Some(((*t).clone(), sending))
+    }
+
+    fn not_a_chan(&mut self, c: &Expr, what: &str) {
+        let t = self.check(c, None);
+        if !t.is_err() {
+            self.err(Diag::error("E0336", c.span, &format!("({what} ...) needs a channel of this task, declared in (tasks (channel name Type) ...) and listed in (in ...) or (out ...); found {t}")));
+        }
+    }
+
+    /// `(tasks ...)`: every channel has exactly one sending task and one receiving task, and
+    /// the tasks form no cycle, so no task can wait forever; an outer variable is changed by at
+    /// most one task (its owner) and read by no other; Console and Rand go to one task at most.
+    /// Together: no data race and no deadlock can be written, and the output is deterministic.
+    fn check_tasks(&mut self, e: &Expr, chans: &[ChanDecl], tasks: &[TaskDef]) -> Ty {
+        if self.in_task || self.lambda_floor.is_some() {
+            self.err(Diag::error("E0337", e.span, "(tasks ...) cannot be nested inside a task or a lambda"));
+        }
+        let mut ctys: Vec<Ty> = Vec::new();
+        let mut cidx: HashMap<String, usize> = HashMap::new();
+        for (i, c) in chans.iter().enumerate() {
+            let t = self.resolve_type(&c.ty);
+            if t.contains_cap() || t.contains_fn() {
+                self.err(Diag::error("E0332", c.ty.span, &format!("a channel carries values, not {t}")));
+            }
+            if cidx.insert(c.name.clone(), i).is_some() {
+                self.err(Diag::error("E0332", c.span, &format!("channel '{}' is declared twice", c.name)));
+            }
+            ctys.push(t);
+        }
+        self.chan_types.insert(e.id, ctys.clone());
+        // Who sends and who receives on each channel; who owns each outer variable.
+        let mut senders: Vec<Vec<usize>> = vec![Vec::new(); chans.len()];
+        let mut receivers: Vec<Vec<usize>> = vec![Vec::new(); chans.len()];
+        let mut owner: HashMap<BindId, usize> = HashMap::new();
+        for (ti, t) in tasks.iter().enumerate() {
+            for (dir, list) in [(true, &t.outs), (false, &t.ins)] {
+                for (n, sp) in list {
+                    match cidx.get(n) {
+                        Some(&ci) => (if dir { &mut senders } else { &mut receivers })[ci].push(ti),
+                        None => self.err(Diag::error("E0332", *sp, &format!("no channel named '{n}'; declare it with (channel {n} Type)"))),
+                    }
+                }
+            }
+            for (n, sp) in &t.owns {
+                let Some(b) = self.lookup(n) else {
+                    self.err(Diag::error("E0333", *sp, &format!("no variable named '{n}' to own")));
+                    continue;
+                };
+                if !matches!(self.bindings[b].kind, BindKind::Local { mutable: true } | BindKind::Param { mutable: true }) {
+                    self.err(Diag::error("E0333", *sp, &format!("'{n}' cannot change, so there is nothing to own: declare it with var")));
+                }
+                let first = *owner.entry(b).or_insert(ti);
+                if first != ti {
+                    self.err(Diag::error("E0333", *sp, &format!("'{n}' is already owned by another task; a variable has one owner")));
+                }
+            }
+        }
+        for (ci, c) in chans.iter().enumerate() {
+            if senders[ci].len() != 1 || receivers[ci].len() != 1 {
+                self.err(
+                    Diag::error(
+                        "E0332",
+                        c.span,
+                        &format!(
+                            "channel '{}' needs exactly one task with (out {}) and one with (in {}); it has {} and {}",
+                            c.name, c.name, c.name, senders[ci].len(), receivers[ci].len()
+                        ),
+                    )
+                    .note("one sender and one receiver keep the order of the values fixed; to merge streams, give each its own channel"),
+                );
+            } else if senders[ci][0] == receivers[ci][0] {
+                self.err(Diag::error("E0332", c.span, &format!("channel '{}' goes from a task to itself", c.name)));
+            }
+        }
+        // No cycles: a task never waits, directly or not, on itself.
+        let n = tasks.len();
+        let mut edges = vec![Vec::new(); n];
+        for ci in 0..chans.len() {
+            if let (Some(&a), Some(&b)) = (senders[ci].first(), receivers[ci].first()) {
+                if a != b {
+                    edges[a].push((b, ci));
+                }
+            }
+        }
+        let mut state = vec![0u8; n];
+        fn cycle(v: usize, edges: &[Vec<(usize, usize)>], st: &mut [u8]) -> Option<usize> {
+            st[v] = 1;
+            for &(w, ci) in &edges[v] {
+                if st[w] == 1 {
+                    return Some(ci);
+                }
+                if st[w] == 0 {
+                    if let Some(c) = cycle(w, edges, st) {
+                        return Some(c);
+                    }
+                }
+            }
+            st[v] = 2;
+            None
+        }
+        for v in 0..n {
+            if state[v] == 0 {
+                if let Some(ci) = cycle(v, &edges, &mut state) {
+                    self.err(
+                        Diag::error("E0335", chans[ci].span, &format!("channel '{}' closes a cycle between tasks: they could wait on each other forever", chans[ci].name))
+                            .note("values must flow one way, from producers to consumers"),
+                    );
+                    break;
+                }
+            }
+        }
+        // Check each task like a lambda that may change only what it owns.
+        let saved = (self.loop_depth, self.loop_floor, self.lambda_floor, self.in_task);
+        let saved_sets = (std::mem::take(&mut self.task_owned), std::mem::take(&mut self.task_foreign));
+        let mut cap_user: HashMap<&'static str, usize> = HashMap::new();
+        for (ti, t) in tasks.iter().enumerate() {
+            self.lambda_floor = Some(self.bindings.len());
+            self.loop_depth += 1;
+            self.loop_floor = self.loop_depth;
+            self.in_task = true;
+            self.task_owned = owner.iter().filter(|(_, o)| **o == ti).map(|(b, _)| *b).collect();
+            self.task_foreign = owner.iter().filter(|(_, o)| **o != ti).map(|(b, _)| *b).collect();
+            self.scopes.push(HashMap::new());
+            for (dir, list) in [(true, &t.outs), (false, &t.ins)] {
+                for (cn, _) in list {
+                    if let Some(&ci) = cidx.get(cn) {
+                        let b = self.local(cn, Ty::Chan(Box::new(ctys[ci].clone()), dir), BindKind::Local { mutable: false });
+                        self.bind(b);
+                    }
+                }
+            }
+            self.check_block(&t.body, Some(&Ty::Unit));
+            self.scopes.pop();
+            (self.loop_depth, self.loop_floor, self.lambda_floor, self.in_task) = saved;
+            let mut used = Vec::new();
+            for x in &t.body {
+                walk(x, &mut |x| {
+                    if let (ExprKind::Var(_), Some(Res::Local(b))) = (&x.kind, self.res.get(x.id as usize)) {
+                        if let Ty::Cap(c @ (Cap::Console | Cap::Rand | Cap::Gfx)) = self.bindings[*b].ty {
+                            used.push((x.span, c));
+                        }
+                    }
+                });
+            }
+            for (sp, c) in used {
+                match cap_user.get(c.name()) {
+                    Some(&o) if o != ti => {
+                        self.err(
+                            Diag::error("E0334", sp, &format!("{} is already used by another task; only one task may use it", c.name()))
+                                .note("send the values to that task over a channel, so the order of the output stays fixed"),
+                        );
+                    }
+                    _ => {
+                        cap_user.insert(c.name(), ti);
+                    }
+                }
+            }
+        }
+        (self.task_owned, self.task_foreign) = saved_sets;
+        Ty::Unit
+    }
+
     /// Code that runs on many threads at once may use Net, Fs, Clock and Env, but not Console
     /// (output would interleave in timing order) nor Rand (the sequence would depend on timing).
     fn forbid_shared_caps(&mut self, f: &Expr, what: &str) {
@@ -4745,6 +5009,7 @@ pub fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
         ExprKind::Field(b, _, _) => walk(b, f),
         ExprKind::Try(x) | ExprKind::As(_, x) | ExprKind::Copy(x) => walk(x, f),
         ExprKind::Lambda(_, b) => b.iter().for_each(|x| walk(x, f)),
+        ExprKind::Tasks(_, ts) => ts.iter().for_each(|t| t.body.iter().for_each(|x| walk(x, f))),
     }
 }
 
