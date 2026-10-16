@@ -92,3 +92,67 @@ What happened:
    records with `with`, and string views are invisible but free.
 
 Code size (Sonnet, all 8 tasks): see `runs/r3/`.
+
+## Run r4: speed of the code the models write (2026-10-17)
+
+The question changes here. r2 and r3 asked whether a model writes correct ail. r4 asks whether the
+ail a model writes runs as fast as the Rust the same model writes.
+
+Seven compute-heavy tasks: heat diffusion, segmented prime counting, integer k-means, path counting
+in a grid, Collatz chains, modular matrix product, and word bigrams. Each task has hidden tests with
+the usual traps (64-bit sums, floor division of negatives, ties, overflow in modular arithmetic).
+Each also has one large input at the stated limits (7 to 44 MB), which is timed. The statement
+says the machine has 12 cores and that threads may be used. Opus and Sonnet each wrote all
+3 x 7 programs once, with no compiling and no testing.
+
+**Correctness: 42 of 42.** Every program in every language passed every hidden test on the first
+attempt. Correctness does not separate the languages on these tasks; speed does.
+
+**Speed:** ail time divided by the time of the Rust program the same model wrote for the same task,
+best of 3 interleaved runs. The programs are unchanged between the columns; only the ail compiler
+differs.
+
+| model | task | ail compiler before | after this round |
+|---|---|---|---|
+| Opus | bigrams | 0.51 | 0.47 |
+| Opus | collatz | 1.11 | 1.18 |
+| Opus | heat | 2.90 | 1.25 |
+| Opus | kmeans | 1.20 | 1.06 |
+| Opus | matmul | 2.13 | 1.79 |
+| Opus | paths | 1.54 | 1.41 |
+| Opus | primes | 1.32 | 1.30 |
+| Sonnet | bigrams | 1.10 | 1.19 |
+| Sonnet | collatz | 1.59 | 1.47 |
+| Sonnet | heat | 3.69 | 1.82 |
+| Sonnet | kmeans | 1.54 | 1.49 |
+| Sonnet | matmul | 2.37 | 1.96 |
+| Sonnet | paths | 1.17 | 1.09 |
+| Sonnet | primes | 1.93 | 2.30 |
+| | **geometric mean** | **1.55** | **1.33** |
+
+Most runs take 0.1 to 1 s, so a few hundredths of a second of noise moves the small ratios.
+
+What the run showed:
+
+1. **The models write fast Rust when told about the cores.** Opus parallelized 4 of 7 Rust programs
+   with `std::thread::scope`, and used flat arrays, slices without bounds checks and byte-level
+   input parsing. So the Rust baseline here is far from naive.
+2. **Safe parallelism gets used more.** Opus used `par-map` in 6 of 7 ail programs, against threads
+   in 4 of 7 Rust ones. Sonnet used parallelism in 4 of 7 in both languages.
+3. **Where the ail time went, and what changed in the compiler:**
+   - Reading the input took 60% of the time in matmul and kmeans. `(for line (lines text) ...)` now
+     walks the text without copying each line. `(for tok (split (trim line) " ") ...)` now
+     streams when the source is any expression whose variables the loop does not change, not only a
+     plain variable.
+   - `par-map` started a new set of threads on every call (300 times in heat). It now runs on a
+     pool started once, and each result is written straight into its slot.
+   - An innermost `(for j (range a b) ...)` whose `(at v j+c)` reads stay on a Vec the loop does not
+     change is tested once before the loop. If every index is in range, the loop runs without bounds
+     checks; otherwise the checked loop runs and traps exactly where it would have.
+   - A loop that pushes to a vector on every iteration reserves the room up front.
+   - Blocks of 1 KB to 1 MB now come from ail's own allocator (power-of-two classes, shared free
+     lists). On Windows the system heap serializes threads on blocks above 16 KB.
+4. **What remains is mostly algorithmic or arithmetic.** In primes, Sonnet's Rust uses 256 KB
+   segments that fit in cache; its ail uses 2 MB ones. In matmul, Rust sums `u64` products with
+   unchecked arithmetic that LLVM vectorizes; ail checks every `*` and `+`, and the model wrote the
+   inner loop as a `while`.

@@ -17,3 +17,6 @@ experiment/tasks_r3/*/tests/
 experiment/make_tasks.py
 experiment/heldout_tasks.py
 experiment/r3_tasks.py
+experiment/tasks_r4/*/tests/
+experiment/tasks_r4/*/perf/
+experiment/r4_tasks.py

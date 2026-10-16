@@ -40,10 +40,67 @@ mod ail_alloc {
         chunk
     }
 
+    // Medium blocks (1 KB to 1 MB) come in power-of-two classes with one free list per class
+    // shared by all threads, behind a spin lock. They never go back to the system: a freed
+    // block waits for the next allocation of its class. This keeps rows of a grid built on one
+    // thread and dropped on another from piling up, and keeps them out of the system heap,
+    // which on Windows serializes threads on blocks above 16 KB.
+    const MEDIUM_MAX: usize = 1 << 20;
+    const NMEDIUM: usize = 10;
+    struct MediumList { lock: std::sync::atomic::AtomicBool, head: UnsafeCell<*mut u8> }
+    unsafe impl Sync for MediumList {}
+    static MEDIUM: [MediumList; NMEDIUM] = [const { MediumList { lock: std::sync::atomic::AtomicBool::new(false), head: UnsafeCell::new(null_mut()) } }; NMEDIUM];
+
+    #[inline(always)]
+    fn medium_class(size: usize) -> usize { (usize::BITS - (size - 1).leading_zeros()) as usize - 11 }
+
+    #[derive(PartialEq, Clone, Copy)]
+    enum Kind { Small(usize), Medium(usize), Large }
+
+    #[inline(always)]
+    fn kind(size: usize, align: usize) -> Kind {
+        if align > CLASS || size > MEDIUM_MAX { Kind::Large }
+        else if size <= MAX_SMALL { Kind::Small(class_of(size)) }
+        else { Kind::Medium(medium_class(size)) }
+    }
+
+    fn lock(m: &MediumList) {
+        use std::sync::atomic::Ordering;
+        while m.lock.swap(true, Ordering::Acquire) {
+            while m.lock.load(Ordering::Relaxed) { std::hint::spin_loop(); }
+        }
+    }
+    fn unlock(m: &MediumList) { m.lock.store(false, std::sync::atomic::Ordering::Release); }
+
+    unsafe fn medium_alloc(c: usize) -> *mut u8 {
+        let m = &MEDIUM[c];
+        lock(m);
+        let head = *m.head.get();
+        if !head.is_null() {
+            *m.head.get() = *(head as *mut *mut u8);
+        }
+        unlock(m);
+        if !head.is_null() { return head; }
+        System.alloc(Layout::from_size_align_unchecked(1 << (c + 11), CLASS))
+    }
+
+    unsafe fn medium_free(p: *mut u8, c: usize) {
+        let m = &MEDIUM[c];
+        lock(m);
+        *(p as *mut *mut u8) = *m.head.get();
+        *m.head.get() = p;
+        unlock(m);
+    }
+
     unsafe impl GlobalAlloc for SizeClassAlloc {
         #[inline(always)]
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            if l.size() > MAX_SMALL || l.align() > CLASS { return System.alloc(l); }
+            if l.size() > MAX_SMALL || l.align() > CLASS {
+                return match kind(l.size(), l.align()) {
+                    Kind::Medium(c) => medium_alloc(c),
+                    _ => System.alloc(l),
+                };
+            }
             let st = &mut *state();
             let c = class_of(l.size());
             let head = st.free[c];
@@ -61,7 +118,12 @@ mod ail_alloc {
         }
         #[inline(always)]
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            if l.size() > MAX_SMALL || l.align() > CLASS { return System.dealloc(p, l); }
+            if l.size() > MAX_SMALL || l.align() > CLASS {
+                return match kind(l.size(), l.align()) {
+                    Kind::Medium(c) => medium_free(p, c),
+                    _ => System.dealloc(p, l),
+                };
+            }
             let st = &mut *state();
             let c = class_of(l.size());
             *(p as *mut *mut u8) = st.free[c];
@@ -69,10 +131,9 @@ mod ail_alloc {
         }
         #[inline]
         unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
-            let small_old = l.size() <= MAX_SMALL && l.align() <= CLASS;
-            let small_new = new_size <= MAX_SMALL && l.align() <= CLASS;
-            if !small_old && !small_new { return System.realloc(p, l, new_size); }
-            if small_old && small_new && class_of(l.size()) == class_of(new_size) { return p; }
+            let (old, new) = (kind(l.size(), l.align()), kind(new_size, l.align()));
+            if old == Kind::Large && new == Kind::Large { return System.realloc(p, l, new_size); }
+            if old == new && old != Kind::Large { return p; }
             let nl = Layout::from_size_align_unchecked(new_size, l.align());
             let q = self.alloc(nl);
             if !q.is_null() {
@@ -347,14 +408,16 @@ mod ail_rt {
         parts.into_iter().map(|p| p.1).collect()
     }
 
-    /// `f` over `xs` on all cores; the result is in order, the same as a sequential map. Threads
-    /// take small blocks from a shared counter, so uneven work still keeps every core busy. `f`
-    /// cannot have effects (the checker forbids capabilities): the result never depends on timing.
+    /// `f` over `xs` on all cores; the result is in order, the same as a sequential map. The
+    /// work runs on a pool of threads started once (not per call), and each result is written
+    /// straight into its slot of the output. `f` cannot have effects (the checker forbids
+    /// capabilities): the result never depends on timing.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn par_map<T: Sync, R: Send, F: Fn(&T) -> R + Sync>(xs: &[T], f: &F) -> Vec<R> {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let n = xs.len();
-        let threads = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1).min(n);
-        if threads <= 1 {
+        let threads = pool::size().min(n);
+        if threads <= 1 || pool::inside() {
             return xs.iter().map(f).collect();
         }
         // A trap in a worker exits the process: make sure what main printed is out first.
@@ -362,31 +425,140 @@ mod ail_rt {
         let block = (n / (threads * 16)).max(1);
         let blocks = n.div_ceil(block);
         let next = AtomicUsize::new(0);
-        let mut parts: Vec<(usize, Vec<R>)> = std::thread::scope(|s| {
-            let hs: Vec<_> = (0..threads)
-                .map(|_| {
-                    s.spawn(|| {
-                        let mut mine = Vec::new();
-                        loop {
-                            let b = next.fetch_add(1, Ordering::Relaxed);
-                            if b >= blocks {
-                                break;
-                            }
-                            let lo = b * block;
-                            mine.push((b, xs[lo..(lo + block).min(n)].iter().map(f).collect::<Vec<R>>()));
-                        }
-                        mine
-                    })
-                })
-                .collect();
-            hs.into_iter().flat_map(|h| h.join().unwrap_or_else(|_| std::process::exit(101))).collect()
-        });
-        parts.sort_unstable_by_key(|p| p.0);
-        let mut out = Vec::with_capacity(n);
-        for (_, p) in parts {
-            out.extend(p);
+        let mut out: Vec<R> = Vec::with_capacity(n);
+        struct Slots<R>(*mut R);
+        unsafe impl<R: Send> Sync for Slots<R> {}
+        impl<R> Slots<R> {
+            // A method, so closures capture the whole Slots (which is Sync), not the raw field.
+            fn at(&self, i: usize) -> *mut R { unsafe { self.0.add(i) } }
         }
+        let slots = Slots(out.as_mut_ptr());
+        let work = || loop {
+            let b = next.fetch_add(1, Ordering::Relaxed);
+            if b >= blocks {
+                break;
+            }
+            let lo = b * block;
+            for i in lo..(lo + block).min(n) {
+                // Each index is claimed by exactly one block, so each slot is written once.
+                unsafe { slots.at(i).write(f(&xs[i])) };
+            }
+        };
+        pool::run(&work);
+        unsafe { out.set_len(n) };
         out
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn par_map<T: Sync, R: Send, F: Fn(&T) -> R + Sync>(xs: &[T], f: &F) -> Vec<R> {
+        xs.iter().map(f).collect()
+    }
+
+    /// The threads behind par-map, started on first use and kept for the whole run.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub mod pool {
+        use std::cell::Cell;
+        use std::sync::{Condvar, Mutex, OnceLock};
+
+        struct Job(*const (dyn Fn() + Sync));
+        unsafe impl Send for Job {}
+        struct State { generation: u64, job: Option<Job>, running: usize, trapped: bool }
+        struct Pool { state: Mutex<State>, start: Condvar, end: Condvar, busy: Mutex<()>, workers: usize }
+
+        thread_local! { static INSIDE: Cell<bool> = const { Cell::new(false) }; }
+
+        fn get() -> &'static Pool {
+            static POOL: OnceLock<&'static Pool> = OnceLock::new();
+            POOL.get_or_init(|| {
+                // AIL_THREADS caps the threads (for measuring); by default, one per core.
+                let cores = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
+                let wanted = std::env::var("AIL_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n >= 1);
+                let workers = wanted.unwrap_or(cores).saturating_sub(1);
+                let p: &'static Pool = Box::leak(Box::new(Pool {
+                    state: Mutex::new(State { generation: 0, job: None, running: 0, trapped: false }),
+                    start: Condvar::new(),
+                    end: Condvar::new(),
+                    busy: Mutex::new(()),
+                    workers,
+                }));
+                for _ in 0..workers {
+                    std::thread::spawn(move || worker(p));
+                }
+                p
+            })
+        }
+
+        fn worker(p: &'static Pool) {
+            INSIDE.with(|c| c.set(true));
+            let mut seen = 0;
+            loop {
+                let job = {
+                    let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
+                    while st.generation == seen {
+                        st = p.start.wait(st).unwrap_or_else(|e| e.into_inner());
+                    }
+                    seen = st.generation;
+                    st.job.as_ref().map(|j| j.0)
+                };
+                let ok = match job {
+                    Some(f) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*f)() })).is_ok(),
+                    None => true,
+                };
+                let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.trapped |= !ok;
+                st.running -= 1;
+                if st.running == 0 {
+                    p.end.notify_all();
+                }
+            }
+        }
+
+        /// Threads that run par-map work, counting the caller.
+        pub fn size() -> usize {
+            get().workers + 1
+        }
+
+        /// True on a pool thread: a par-map inside a par-map runs sequentially there.
+        pub fn inside() -> bool {
+            INSIDE.with(|c| c.get())
+        }
+
+        /// Runs `work` on every pool thread and on the caller, and returns when all have
+        /// finished, so `work` may borrow from the caller's stack.
+        pub fn run(work: &(dyn Fn() + Sync)) {
+            let p = get();
+            // Another thread (a task) is already using the pool: do the work here instead.
+            let Ok(_busy) = p.busy.try_lock() else {
+                work();
+                return;
+            };
+            {
+                let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
+                // The pointer outlives this call only in the pool's state, which is cleared below
+                // before returning; workers use it only while `running` counts them.
+                let job: *const (dyn Fn() + Sync) = work;
+                st.job = Some(Job(unsafe { std::mem::transmute::<*const (dyn Fn() + Sync + '_), *const (dyn Fn() + Sync + 'static)>(job) }));
+                st.running = p.workers;
+                st.trapped = false;
+                st.generation += 1;
+            }
+            p.start.notify_all();
+            INSIDE.with(|c| c.set(true));
+            let mine = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+            INSIDE.with(|c| c.set(false));
+            let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
+            while st.running > 0 {
+                st = p.end.wait(st).unwrap_or_else(|e| e.into_inner());
+            }
+            st.job = None;
+            let trapped = st.trapped;
+            drop(st);
+            if let Err(e) = mine {
+                std::panic::resume_unwind(e);
+            }
+            if trapped {
+                panic!("a parallel worker trapped");
+            }
+        }
     }
     /// Stable sort of `v` by precomputed keys (one per element): elements are moved, not copied.
     pub fn sort_by_keys<T, K>(v: &mut Vec<T>, keys: Vec<K>, cmp: impl Fn(&K, &K) -> std::cmp::Ordering) {
@@ -437,6 +609,10 @@ mod ail_rt {
         let mut s = String::new();
         let _ = std::io::stdin().read_to_string(&mut s);
         s
+    }
+    /// `(for line (lines text) ...)`: the lines as views, no copies.
+    pub fn lines_iter(s: &str) -> impl Iterator<Item = &str> {
+        s.lines().map(|l| l.trim_end_matches('\r'))
     }
     pub fn lines(s: &str) -> Vec<String> {
         s.lines().map(|l| l.trim_end_matches('\r').to_string()).collect()
