@@ -231,6 +231,15 @@ mod ail_rt {
     pub fn init(lines: &'static [(u32, u32, u32)], file: &'static str) {
         unsafe { LINES = lines; FILE = file; }
         std::panic::set_hook(Box::new(|info| {
+            let par = PAR_TRAP.with(|t| t.get());
+            if !par.is_null() {
+                unsafe { (*par).store(true, std::sync::atomic::Ordering::Release) };
+                if cfg!(panic = "unwind") {
+                    return;
+                }
+                pool::abandon();
+                loop { std::thread::park(); }
+            }
             if SOFT_TRAP.with(|s| s.get()) {
                 eprintln!("trap in a read handler (answered 500): {}", describe(info));
                 return;
@@ -308,6 +317,56 @@ mod ail_rt {
         }
     )* } }
     shift_impl!(i8, i16, i32, i64, u8, u16, u32, u64);
+
+    // Arithmetic with the overflow check deferred: the result wraps and `of` records that some
+    // operation overflowed. A loop built from these has no branch per operation, so LLVM can
+    // vectorize it; when `of` comes back set, the loop runs again with the ordinary checks and
+    // traps exactly where it would have. Only for loops whose second run gives the same result.
+    pub trait Dov: Copy {
+        fn dadd(self, b: Self, of: &mut bool) -> Self;
+        fn dsub(self, b: Self, of: &mut bool) -> Self;
+        fn dmul(self, b: Self, of: &mut bool) -> Self;
+        /// Multiplication by a constant: the check folds into two comparisons.
+        fn dmulc(self, c: Self, of: &mut bool) -> Self;
+        fn ddiv(self, b: Self, of: &mut bool) -> Self;
+        fn drem(self, b: Self, of: &mut bool) -> Self;
+        fn dneg(self, of: &mut bool) -> Self;
+        fn dabs(self, of: &mut bool) -> Self;
+    }
+    macro_rules! dov_signed { ($($t:ty),*) => { $(
+        impl Dov for $t {
+            #[inline(always)] fn dadd(self, b: Self, of: &mut bool) -> Self { let r = self.wrapping_add(b); *of |= ((self ^ r) & (b ^ r)) < 0; r }
+            #[inline(always)] fn dsub(self, b: Self, of: &mut bool) -> Self { let r = self.wrapping_sub(b); *of |= ((self ^ b) & (self ^ r)) < 0; r }
+            #[inline(always)] fn dmul(self, b: Self, of: &mut bool) -> Self { let (r, o) = self.overflowing_mul(b); *of |= o; r }
+            #[inline(always)] fn dmulc(self, c: Self, of: &mut bool) -> Self {
+                if c > 0 { *of |= self > <$t>::MAX / c || self < <$t>::MIN / c; self.wrapping_mul(c) } else { self.dmul(c, of) }
+            }
+            #[inline(always)] fn ddiv(self, b: Self, of: &mut bool) -> Self {
+                if b == 0 || (b == -1 && self == <$t>::MIN) { *of = true; 0 } else { self / b }
+            }
+            #[inline(always)] fn drem(self, b: Self, of: &mut bool) -> Self {
+                if b == 0 || (b == -1 && self == <$t>::MIN) { *of = true; 0 } else { self % b }
+            }
+            #[inline(always)] fn dneg(self, of: &mut bool) -> Self { *of |= self == <$t>::MIN; self.wrapping_neg() }
+            #[inline(always)] fn dabs(self, of: &mut bool) -> Self { *of |= self == <$t>::MIN; self.wrapping_abs() }
+        }
+    )* } }
+    dov_signed!(i8, i16, i32, i64);
+    macro_rules! dov_unsigned { ($($t:ty),*) => { $(
+        impl Dov for $t {
+            #[inline(always)] fn dadd(self, b: Self, of: &mut bool) -> Self { let r = self.wrapping_add(b); *of |= r < self; r }
+            #[inline(always)] fn dsub(self, b: Self, of: &mut bool) -> Self { *of |= b > self; self.wrapping_sub(b) }
+            #[inline(always)] fn dmul(self, b: Self, of: &mut bool) -> Self { let (r, o) = self.overflowing_mul(b); *of |= o; r }
+            #[inline(always)] fn dmulc(self, c: Self, of: &mut bool) -> Self {
+                if c > 0 { *of |= self > <$t>::MAX / c; self.wrapping_mul(c) } else { 0 }
+            }
+            #[inline(always)] fn ddiv(self, b: Self, of: &mut bool) -> Self { if b == 0 { *of = true; 0 } else { self / b } }
+            #[inline(always)] fn drem(self, b: Self, of: &mut bool) -> Self { if b == 0 { *of = true; 0 } else { self % b } }
+            #[inline(always)] fn dneg(self, of: &mut bool) -> Self { *of |= self != 0; self.wrapping_neg() }
+            #[inline(always)] fn dabs(self, _of: &mut bool) -> Self { self }
+        }
+    )* } }
+    dov_unsigned!(u8, u16, u32, u64);
 
     #[track_caller] #[inline(always)]
     pub fn icast<A: Copy + std::fmt::Display, B: TryFrom<A>>(a: A) -> B {
@@ -444,7 +503,9 @@ mod ail_rt {
                 unsafe { slots.at(i).write(f(&xs[i])) };
             }
         };
-        pool::run(&work);
+        if !pool::run(&work) {
+            work();
+        }
         unsafe { out.set_len(n) };
         out
     }
@@ -453,7 +514,8 @@ mod ail_rt {
         xs.iter().map(f).collect()
     }
 
-    /// The threads behind par-map, started on first use and kept for the whole run.
+    /// The threads behind par-map and parallel loops, started on first use and kept for the
+    /// whole run, one per core.
     #[cfg(not(target_arch = "wasm32"))]
     pub mod pool {
         use std::cell::Cell;
@@ -461,8 +523,8 @@ mod ail_rt {
 
         struct Job(*const (dyn Fn() + Sync));
         unsafe impl Send for Job {}
-        struct State { generation: u64, job: Option<Job>, running: usize, trapped: bool }
-        struct Pool { state: Mutex<State>, start: Condvar, end: Condvar, busy: Mutex<()>, workers: usize }
+        struct State { generation: u64, job: Option<Job>, running: usize, alive: usize, trapped: bool }
+        struct Pool { state: Mutex<State>, start: Condvar, end: Condvar, busy: Mutex<()> }
 
         thread_local! { static INSIDE: Cell<bool> = const { Cell::new(false) }; }
 
@@ -472,13 +534,13 @@ mod ail_rt {
                 // AIL_THREADS caps the threads (for measuring); by default, one per core.
                 let cores = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(1);
                 let wanted = std::env::var("AIL_THREADS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n >= 1);
-                let workers = wanted.unwrap_or(cores).saturating_sub(1);
+                let workers = wanted.unwrap_or(cores);
+                let workers = if workers <= 1 { 0 } else { workers };
                 let p: &'static Pool = Box::leak(Box::new(Pool {
-                    state: Mutex::new(State { generation: 0, job: None, running: 0, trapped: false }),
+                    state: Mutex::new(State { generation: 0, job: None, running: 0, alive: workers, trapped: false }),
                     start: Condvar::new(),
                     end: Condvar::new(),
                     busy: Mutex::new(()),
-                    workers,
                 }));
                 for _ in 0..workers {
                     std::thread::spawn(move || worker(p));
@@ -512,39 +574,50 @@ mod ail_rt {
             }
         }
 
-        /// Threads that run par-map work, counting the caller.
+        /// Threads that run the work (the caller only waits).
         pub fn size() -> usize {
-            get().workers + 1
+            get().state.lock().unwrap_or_else(|e| e.into_inner()).alive
         }
 
-        /// True on a pool thread: a par-map inside a par-map runs sequentially there.
+        /// True on a pool thread: a parallel construct inside another runs sequentially there.
         pub fn inside() -> bool {
             INSIDE.with(|c| c.get())
         }
 
-        /// Runs `work` on every pool thread and on the caller, and returns when all have
-        /// finished, so `work` may borrow from the caller's stack.
-        pub fn run(work: &(dyn Fn() + Sync)) {
+        /// Called by a worker that trapped inside a parallel loop, which then never returns: the
+        /// pool stops waiting for it (the loop runs again on the caller, which traps the same way).
+        pub fn abandon() {
             let p = get();
-            // Another thread (a task) is already using the pool: do the work here instead.
+            let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.alive = st.alive.saturating_sub(1);
+            st.running = st.running.saturating_sub(1);
+            if st.running == 0 {
+                p.end.notify_all();
+            }
+        }
+
+        /// Runs `work` on every pool thread and returns when all have finished, so `work` may
+        /// borrow from the caller's stack. False (and nothing ran) if the pool is in use by
+        /// another thread or has no threads.
+        pub fn run(work: &(dyn Fn() + Sync)) -> bool {
+            let p = get();
             let Ok(_busy) = p.busy.try_lock() else {
-                work();
-                return;
+                return false;
             };
             {
                 let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
+                if st.alive == 0 {
+                    return false;
+                }
                 // The pointer outlives this call only in the pool's state, which is cleared below
                 // before returning; workers use it only while `running` counts them.
                 let job: *const (dyn Fn() + Sync) = work;
                 st.job = Some(Job(unsafe { std::mem::transmute::<*const (dyn Fn() + Sync + '_), *const (dyn Fn() + Sync + 'static)>(job) }));
-                st.running = p.workers;
+                st.running = st.alive;
                 st.trapped = false;
                 st.generation += 1;
             }
             p.start.notify_all();
-            INSIDE.with(|c| c.set(true));
-            let mine = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-            INSIDE.with(|c| c.set(false));
             let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
             while st.running > 0 {
                 st = p.end.wait(st).unwrap_or_else(|e| e.into_inner());
@@ -552,14 +625,139 @@ mod ail_rt {
             st.job = None;
             let trapped = st.trapped;
             drop(st);
-            if let Err(e) = mine {
-                std::panic::resume_unwind(e);
-            }
             if trapped {
                 panic!("a parallel worker trapped");
             }
+            true
         }
     }
+
+    // Set on a pool thread while it runs a chunk of a parallel loop: a trap there marks the loop
+    // as failed and parks the thread instead of ending the program, and the caller runs the
+    // whole loop again sequentially, which reaches the first trap in program order.
+    thread_local! { pub static PAR_TRAP: std::cell::Cell<*const std::sync::atomic::AtomicBool> = const { std::cell::Cell::new(std::ptr::null()) }; }
+
+    /// Worth running `lo..hi` in parallel: enough iterations (any count above one when the body
+    /// itself loops or calls functions), not already on a pool thread, and threads to spare.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn par_worth(lo: i64, hi: i64, heavy: bool) -> bool {
+        let n = hi as i128 - lo as i128;
+        if n < 2 || (!heavy && n < 1 << 15) || pool::inside() || SOFT_TRAP.with(|s| s.get()) {
+            return false;
+        }
+        pool::size() > 1
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn par_worth(_lo: i64, _hi: i64, _heavy: bool) -> bool { false }
+
+    /// Runs `f` over consecutive chunks of `lo..hi` on the pool and returns the chunk results in
+    /// order, or None if the pool was not available or some chunk trapped (then nothing the
+    /// caller can see has changed except writes the sequential run repeats identically).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn par_for<R: Send>(lo: i64, hi: i64, chunks: usize, f: &(dyn Fn(i64, i64) -> R + Sync)) -> Option<Vec<R>> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let n = (hi - lo) as usize;
+        let threads = pool::size();
+        // chunks: 0 = several per thread (balances uneven work), 1 = one per thread (for big
+        // private state), more = that many.
+        let k = (match chunks { 0 => threads * 8, 1 => threads, c => c }).clamp(1, n.max(1));
+        let trapped = AtomicBool::new(false);
+        let next = AtomicUsize::new(0);
+        let mut out: Vec<std::mem::MaybeUninit<R>> = Vec::with_capacity(k);
+        unsafe { out.set_len(k) };
+        let done: Vec<AtomicBool> = (0..k).map(|_| AtomicBool::new(false)).collect();
+        struct Slots<R>(*mut std::mem::MaybeUninit<R>);
+        unsafe impl<R: Send> Sync for Slots<R> {}
+        impl<R> Slots<R> {
+            #[inline(always)]
+            unsafe fn put(&self, c: usize, r: R) { (*self.0.add(c)).write(r); }
+        }
+        let slots = Slots(out.as_mut_ptr());
+        let work = || {
+            PAR_TRAP.with(|t| t.set(&trapped));
+            loop {
+                if trapped.load(Ordering::Relaxed) {
+                    break;
+                }
+                let c = next.fetch_add(1, Ordering::Relaxed);
+                if c >= k {
+                    break;
+                }
+                let a = lo + (n * c / k) as i64;
+                let b = lo + (n * (c + 1) / k) as i64;
+                // Where traps unwind (tests, servers), the trap ends here; elsewhere the panic
+                // hook parks this thread before any unwinding.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(a, b))) {
+                    Ok(r) => {
+                        // Each chunk index is claimed once, so each slot is written once.
+                        unsafe { slots.put(c, r) };
+                        done[c].store(true, Ordering::Release);
+                    }
+                    Err(_) => trapped.store(true, Ordering::Release),
+                }
+            }
+            PAR_TRAP.with(|t| t.set(std::ptr::null()));
+        };
+        let ran = pool::run(&work);
+        let ok = ran && !trapped.load(Ordering::Acquire);
+        if !ok {
+            for (c, d) in done.iter().enumerate() {
+                if d.load(Ordering::Acquire) {
+                    unsafe { out[c].assume_init_drop() };
+                }
+            }
+            return None;
+        }
+        Some(out.into_iter().map(|x| unsafe { x.assume_init() }).collect())
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn par_for<R: Send>(_lo: i64, _hi: i64, _chunks: usize, _f: &(dyn Fn(i64, i64) -> R + Sync)) -> Option<Vec<R>> { None }
+
+    /// A vector that a parallel loop writes from several threads, each element by one
+    /// iteration only (the compiler proves the writes disjoint before using it).
+    pub struct SharedSlice<T> { ptr: *mut T, len: usize }
+    unsafe impl<T: Send> Sync for SharedSlice<T> {}
+    unsafe impl<T: Send> Send for SharedSlice<T> {}
+    impl<T> SharedSlice<T> {
+        pub fn new(s: &mut [T]) -> Self { SharedSlice { ptr: s.as_mut_ptr(), len: s.len() } }
+        #[track_caller] #[inline(always)] #[allow(clippy::mut_from_ref)]
+        pub fn at(&self, i: i64) -> &mut T {
+            let u = ix(i);
+            if u >= self.len { index_out(u, self.len) }
+            unsafe { &mut *self.ptr.add(u) }
+        }
+        #[inline(always)]
+        pub fn ptr(&self) -> *mut T { self.ptr }
+        #[inline(always)]
+        pub fn len(&self) -> usize { self.len }
+    }
+    #[track_caller] #[cold]
+    fn index_out(u: usize, len: usize) -> ! { panic!("index out of bounds: the len is {len} but the index is {u}") }
+
+    /// Writes of iteration i fall in [i*s + lo, i*s + hi] for each window (lo, hi), empty when
+    /// lo > hi: iterations write disjoint elements if the windows together span less than s.
+    pub fn disjoint(s: i128, ws: &[(i128, i128)]) -> bool {
+        let (mut lo, mut hi, mut any) = (i128::MAX, i128::MIN, false);
+        for &(a, b) in ws {
+            if a <= b {
+                any = true;
+                lo = lo.min(a);
+                hi = hi.max(b);
+            }
+        }
+        !any || (s > 0 && hi - lo < s)
+    }
+
+    /// Magnitude of an integer, for the bound that proves a parallel sum cannot overflow.
+    pub trait UAbs: Copy { fn uabs(self) -> u64; fn wide(self) -> i128; }
+    macro_rules! uabs_impl { ($($t:ty),*) => { $(
+        impl UAbs for $t {
+            #[inline(always)] fn uabs(self) -> u64 { (self as i128).unsigned_abs() as u64 }
+            #[inline(always)] fn wide(self) -> i128 { self as i128 }
+        }
+    )* } }
+    uabs_impl!(i8, i16, i32, i64, u8, u16, u32, u64);
+
     /// Stable sort of `v` by precomputed keys (one per element): elements are moved, not copied.
     pub fn sort_by_keys<T, K>(v: &mut Vec<T>, keys: Vec<K>, cmp: impl Fn(&K, &K) -> std::cmp::Ordering) {
         let mut idx: Vec<usize> = (0..v.len()).collect();
@@ -676,6 +874,10 @@ mod ail_rt {
 
     pub fn run_tests(tests: &[(&str, fn())]) {
         std::panic::set_hook(Box::new(|info| {
+            // A trap inside a parallel loop only makes the loop run again sequentially.
+            if !PAR_TRAP.with(|t| t.get()).is_null() {
+                return;
+            }
             let d = describe(info);
             LAST_TRAP.with(|t| *t.borrow_mut() = Some(d));
         }));

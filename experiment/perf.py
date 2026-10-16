@@ -12,7 +12,7 @@ import json, os, shutil, subprocess, sys, tempfile, time
 import grade
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TASKS_DIR = os.path.join(HERE, "tasks_r4")
+TASKS_DIR = os.path.join(HERE, os.environ.get("EXP_TASKS", "tasks_r4"))
 LIMIT = 60
 
 
