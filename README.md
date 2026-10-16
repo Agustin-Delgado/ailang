@@ -21,6 +21,8 @@ the first attempt?
   checked and compiled as its own copy, so there is no trait syntax and no runtime cost.
 - **Parallelism that cannot race.** `(par-map xs f)` runs on every core and returns exactly what
   `map` would: values are never shared, lambdas only read, and no effects are allowed inside.
+- **Concurrent I/O.** `(par-run xs f)` runs `f` on up to 64 elements at once for work that waits
+  on the network or the disk, and `http-request` is an HTTP client with kept-alive connections.
 - **Servers where GET cannot write.** `(http-serve net port max-body state read write)` runs GET
   handlers in parallel with read-only access to the state, and every other method one at a time
   with `mut` access. A GET with side effects does not compile, and handlers cannot race.
@@ -92,6 +94,10 @@ Results:
 
 Even on one thread, ail's scan runs twice as fast as Rust's. ail's allocator keeps the small
 strings of the store contiguous, so the scan stays in cache.
+
+Calling a service is just as direct. `(par-run qs (lambda (q) (http-request net "GET" url (map) "")))`
+sends 3,000 requests, 64 at a time, over kept-alive connections. It takes 0.64 of the time of tokio +
+reqwest when the answers are cheap, and 0.93 when the backend does the work.
 
 Two requests out of about a million failed. Both were client-side `connect` errors (Windows
 error 10055, out of socket buffers), not server errors.
@@ -205,5 +211,5 @@ target/release/ail web ../examples/dodge.ail          # build for the browser an
 
 ail is an early research language: v0.3 is released and v0.4 (string views, functions as
 arguments, generics, programs split across files with `(use name)`, `par-map`, concurrent servers
-with `http-serve`) is in development on `main`. The pieces above work and are measured. General
-concurrency (tasks, channels, outbound I/O while serving) is not built yet.
+with `http-serve`) is in development on `main`. The pieces above work and are measured. Still to
+come: long-lived tasks and channels, keep-alive on the server side, and https.

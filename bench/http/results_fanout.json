@@ -1,0 +1,59 @@
+{
+ "meta": {
+  "in_flight": 64,
+  "backend": "Rust axum (bench/http/server_axum)",
+  "rounds": 5,
+  "kept": "median",
+  "platform": "win32"
+ },
+ "results": [
+  {
+   "mode": "todos",
+   "requests": 3000,
+   "ail_ms": 106,
+   "rust_ms": 165,
+   "all_ms": {
+    "ail": [
+     108,
+     105,
+     113,
+     106,
+     105
+    ],
+    "rust": [
+     174,
+     162,
+     165,
+     172,
+     163
+    ]
+   },
+   "same_sum": true,
+   "failed": 0
+  },
+  {
+   "mode": "search",
+   "requests": 3000,
+   "ail_ms": 1961,
+   "rust_ms": 2115,
+   "all_ms": {
+    "ail": [
+     2055,
+     2471,
+     1863,
+     1961,
+     1770
+    ],
+    "rust": [
+     2379,
+     2144,
+     2115,
+     1975,
+     2009
+    ]
+   },
+   "same_sum": true,
+   "failed": 0
+  }
+ ]
+}

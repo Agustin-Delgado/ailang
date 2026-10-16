@@ -339,6 +339,7 @@ pub const BUILTINS: &[&str] = &[
     "sum",
     "map",
     "par-map",
+    "par-run",
     "filter",
     "any",
     "all",
@@ -397,6 +398,7 @@ pub const BUILTINS: &[&str] = &[
     "http-next",
     "http-respond",
     "http-serve",
+    "http-request",
     "read-all",
     "lines",
     "is-digit",
@@ -3523,11 +3525,24 @@ impl Checker {
                     }
                 });
                 for (sp, c) in caps {
-                    self.err(
-                        Diag::error("E0327", sp, &format!("par-map runs its function on several threads at once, so it cannot use {}", c.name()))
-                            .note("compute the values with par-map, then print or store them after it returns"),
-                    );
+                    let d = Diag::error("E0327", sp, &format!("par-map runs its function on several threads at once, so it cannot use {}", c.name()));
+                    self.err(if matches!(c, Cap::Net | Cap::Fs | Cap::Clock | Cap::Env) {
+                        d.note("par-map is for pure computation; for work that waits on I/O use (par-run vec (lambda (x) ...))")
+                    } else {
+                        d.note("compute the values with par-map, then print or store them after it returns")
+                    });
                 }
+                Ty::Vec(Box::new(fn_result(&ft)))
+            }
+            "par-run" => {
+                ar!(2, "(par-run vec (lambda (x) ...))");
+                let (el, f) = self.hof_head(name, args);
+                let want_r = match exp {
+                    Some(Ty::Vec(r)) => (**r).clone(),
+                    _ => Ty::Err,
+                };
+                let ft = self.check_fn_arg(f, &Ty::Fn(vec![el], Box::new(want_r)));
+                self.forbid_shared_caps(f, "par-run runs its function on many threads at once");
                 Ty::Vec(Box::new(fn_result(&ft)))
             }
             "map" if n == 2 => {
@@ -4051,6 +4066,27 @@ impl Checker {
                 }
                 Ty::Res(Box::new(Ty::Unit), Box::new(Ty::Str))
             }
+            "http-request" => {
+                if let Some(rest) = self.need_cap(Cap::Net, args, nspan, span) {
+                    if rest.len() != 4 {
+                        self.err(
+                            Diag::error("E0211", span, "(http-request net method url headers body)")
+                                .note("for example (http-request net \"GET\" \"http://localhost:8080/todos\" (map) \"\")"),
+                        );
+                        for a in rest {
+                            let x = self.arg_val(a);
+                            self.check(x, None);
+                        }
+                    } else {
+                        for (i, a) in rest.iter().enumerate() {
+                            let x = self.arg_val(a);
+                            let want = if i == 2 { Ty::Map(Box::new(Ty::Str), Box::new(Ty::Str)) } else { Ty::Str };
+                            self.check_expect(x, &want);
+                        }
+                    }
+                }
+                Ty::Res(Box::new(Ty::User("Reply".into())), Box::new(Ty::Str))
+            }
             "http-serve" => {
                 let reply = Ty::User("Reply".into());
                 let request = Ty::User("Request".into());
@@ -4087,21 +4123,8 @@ impl Checker {
                         } else {
                             self.check_fn_arg(rf, &Ty::Fn(vec![request.clone(), st.clone()], Box::new(reply.clone())));
                         }
-                        // Read handlers run on several threads at once: no effects inside.
-                        let mut caps = Vec::new();
-                        walk(rf, &mut |x| {
-                            if let (ExprKind::Var(_), Res::Local(b)) = (&x.kind, &self.res[x.id as usize]) {
-                                if let Ty::Cap(c) = self.bindings[*b].ty {
-                                    caps.push((x.span, c));
-                                }
-                            }
-                        });
-                        for (sp, c) in caps {
-                            self.err(
-                                Diag::error("E0328", sp, &format!("the read handler runs on several threads at once, so it cannot use {}", c.name()))
-                                    .note("a handler computes its Reply from the request and the state; the server sends it"),
-                            );
-                        }
+                        // Read handlers run on several threads at once; they may call other services.
+                        self.forbid_shared_caps(rf, "the read handler runs on several threads at once");
                         let wf = self.arg_val(&rest[4]);
                         self.check_write_handler(wf, &request, &st, &reply);
                     }
@@ -4137,6 +4160,31 @@ impl Checker {
 
     /// The Vec and the function of a higher-order builtin: (name vec f). Catches the Lisp
     /// argument order (name f vec).
+    /// Code that runs on many threads at once may use Net, Fs, Clock and Env, but not Console
+    /// (output would interleave in timing order) nor Rand (the sequence would depend on timing).
+    fn forbid_shared_caps(&mut self, f: &Expr, what: &str) {
+        let mut caps = Vec::new();
+        walk(f, &mut |x| {
+            if let (ExprKind::Var(_), Res::Local(b)) = (&x.kind, &self.res[x.id as usize]) {
+                if let Ty::Cap(c) = self.bindings[*b].ty {
+                    if matches!(c, Cap::Console | Cap::Rand | Cap::Gfx) {
+                        caps.push((x.span, c));
+                    }
+                }
+            }
+        });
+        for (sp, c) in caps {
+            let why = match c {
+                Cap::Rand => "the random sequence would depend on timing",
+                _ => "the output would interleave in whatever order the threads run",
+            };
+            self.err(
+                Diag::error("E0328", sp, &format!("{what}, so it cannot use {}: {why}", c.name()))
+                    .note("return the values and print them (or draw random numbers) after it finishes"),
+            );
+        }
+    }
+
     /// The write handler of http-serve must be a fn that takes the request and the state as
     /// `mut`: the only place where a server changes its state, one request at a time.
     fn check_write_handler(&mut self, x: &Expr, request: &Ty, state: &Ty, reply: &Ty) {

@@ -1,0 +1,26 @@
+; Tests for par-map and par-run: same results, same order as map, whatever the timing.
+; Run with: ail test tests/concurrency.ail
+
+(fn collatz (params (n I64)) (returns I64)
+  (body
+    (var x n)
+    (var steps 0)
+    (while (!= x 1)
+      (set x (if (== (% x 2) 0) (/ x 2) (+ (* 3 x) 1)))
+      (set steps (+ steps 1)))
+    steps))
+
+(test "par-map equals map, in order"
+  (var xs (Vec I64) (vec))
+  (for i (range 1 5000) (push (mut xs) i))
+  (assert (== (par-map xs (lambda (x) (collatz x))) (map xs (lambda (x) (collatz x))))))
+
+(test "par-run equals map, in order"
+  (var xs (Vec I64) (vec))
+  (for i (range 0 300) (push (mut xs) i))
+  (let k 7)
+  (assert (== (par-run xs (lambda (x) (str x "-" (* x k)))) (map xs (lambda (x) (str x "-" (* x k))))))
+  (assert (== (len (par-run (vec 1) (lambda (x) x))) 1))
+  (let empty (Vec I64) (vec))
+  (assert (is-empty (par-run empty (lambda (x) x)))))
+

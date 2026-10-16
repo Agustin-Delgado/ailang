@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["server_std", "server_axum", "loadgen"]
+members = ["server_std", "server_axum", "loadgen", "fanout"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

@@ -503,6 +503,182 @@ mod ail_http {
         )
     }
 
+    const MAX_RESPONSE_BYTES: usize = 64 << 20;
+
+    /// `http-request`: an HTTP/1.1 client. Connections are kept alive and reused per host:port
+    /// (up to 64 idle ones), so many requests to one service do not pay a TCP handshake each.
+    /// Header names and values cannot contain line breaks, so a request can never smuggle a
+    /// second one.
+    pub fn request(method: &str, url: &str, headers: &AilMap<String, String>, body: &str) -> Result<super::U_Reply, String> {
+        if method.is_empty() || !method.bytes().all(|b| b.is_ascii_uppercase()) {
+            return Err(format!("invalid method {method:?}: use an uppercase name like GET or POST"));
+        }
+        let rest = match url.strip_prefix("http://") {
+            Some(r) => r,
+            None if url.starts_with("https://") => return Err("https is not supported yet; use an http:// url".into()),
+            None => return Err(format!("url must start with http://, got {url:?}")),
+        };
+        let rest = rest.split('#').next().unwrap_or("");
+        let (hostport, path) = match rest.find(['/', '?']) {
+            Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], rest[i..].to_string()),
+            Some(i) => (&rest[..i], format!("/{}", &rest[i..])),
+            None => (rest, "/".to_string()),
+        };
+        if hostport.is_empty() { return Err(format!("url has no host: {url:?}")); }
+        let (host, port) = match hostport.rsplit_once(':') {
+            Some((h, p)) => (h, p.parse::<u16>().map_err(|_| format!("invalid port in {url:?}"))?),
+            None => (hostport, 80),
+        };
+        let bad = |s: &str| s.contains(['\r', '\n']);
+        if bad(&path) || path.contains(' ') { return Err(format!("invalid characters in the path of {url:?}")); }
+        let mut head = format!("{method} {path} HTTP/1.1\r\nHost: {hostport}\r\n");
+        let mut keys: Vec<&String> = headers.keys().collect();
+        keys.sort();
+        for k in keys {
+            let v = &headers[k];
+            if k.is_empty() || bad(k) || k.contains(':') || bad(v) {
+                return Err(format!("invalid header {k:?}: names cannot be empty or contain ':', and neither can contain line breaks"));
+            }
+            match k.to_ascii_lowercase().as_str() {
+                "host" | "connection" | "content-length" | "transfer-encoding" => {
+                    return Err(format!("header {k:?} is set by http-request itself"));
+                }
+                _ => head.push_str(&format!("{k}: {v}\r\n")),
+            }
+        }
+        if !body.is_empty() || !matches!(method, "GET" | "HEAD" | "DELETE" | "OPTIONS") {
+            head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
+        head.push_str("\r\n");
+        let mut out = head.into_bytes();
+        out.extend_from_slice(body.as_bytes());
+        // A kept-alive connection may have been closed by the server while idle: that shows up
+        // as a failure before any byte of the answer, and the request goes on a fresh one.
+        loop {
+            let (s, reused) = match take_idle(hostport) {
+                Some(s) => (s, true),
+                None => (connect(host, port, hostport)?, false),
+            };
+            match exchange(&s, &out, method, hostport) {
+                Ok((reply, keep)) => {
+                    if keep { give_back(hostport, s); }
+                    return Ok(reply);
+                }
+                Err((e, answered)) => {
+                    if reused && !answered { continue; }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    const MAX_IDLE: usize = 64;
+
+    fn idle() -> &'static std::sync::Mutex<HashMap<String, Vec<TcpStream>>> {
+        static IDLE: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<TcpStream>>>> = std::sync::OnceLock::new();
+        IDLE.get_or_init(Default::default)
+    }
+
+    fn take_idle(hostport: &str) -> Option<TcpStream> {
+        idle().lock().unwrap_or_else(|e| e.into_inner()).get_mut(hostport).and_then(|v| v.pop())
+    }
+
+    fn give_back(hostport: &str, s: TcpStream) {
+        let mut m = idle().lock().unwrap_or_else(|e| e.into_inner());
+        let v = m.entry(hostport.to_string()).or_default();
+        if v.len() < MAX_IDLE { v.push(s); }
+    }
+
+    fn connect(host: &str, port: u16, hostport: &str) -> Result<TcpStream, String> {
+        use std::net::ToSocketAddrs;
+        use std::time::Duration;
+        let addrs: Vec<_> = (host, port).to_socket_addrs().map_err(|e| format!("cannot resolve {host}: {e}"))?.collect();
+        let mut last = format!("no address for {host}");
+        for a in addrs {
+            match TcpStream::connect_timeout(&a, Duration::from_secs(10)) {
+                Ok(s) => {
+                    let _ = s.set_nodelay(true);
+                    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+                    s.set_write_timeout(Some(Duration::from_secs(30))).ok();
+                    return Ok(s);
+                }
+                Err(e) => last = format!("cannot connect to {hostport}: {e}"),
+            }
+        }
+        Err(last)
+    }
+
+    /// Sends one request and reads its answer. Ok carries whether the connection can be reused;
+    /// Err carries whether any of the answer had arrived (if not, a reused connection was stale).
+    fn exchange(mut s: &TcpStream, out: &[u8], method: &str, hostport: &str) -> Result<(super::U_Reply, bool), (String, bool)> {
+        if let Err(e) = s.write_all(out) {
+            return Err((format!("sending to {hostport}: {e}"), false));
+        }
+        let mut r = BufReader::new(s);
+        let mut line = String::new();
+        match r.read_line(&mut line) {
+            Ok(0) => return Err((format!("{hostport} closed the connection without answering"), false)),
+            Ok(_) => {}
+            Err(e) => return Err((format!("reading from {hostport}: {e}"), false)),
+        }
+        let fail = |m: String| (m, true);
+        let mut parts = line.trim_end().splitn(3, ' ');
+        let version = parts.next().unwrap_or("");
+        let status: i64 = parts.next().and_then(|c| c.parse().ok()).filter(|_| version.starts_with("HTTP/1."))
+            .ok_or_else(|| fail(format!("{hostport} did not answer with HTTP: {:?}", line.trim_end())))?;
+        let mut rh: HashMap<String, String> = HashMap::new();
+        let mut total = 0;
+        let rerr = |e: std::io::Error| fail(format!("reading from {hostport}: {e}"));
+        loop {
+            let mut h = String::new();
+            let n = r.read_line(&mut h).map_err(rerr)?;
+            total += n;
+            if total > MAX_HEADER_BYTES { return Err(fail(format!("response headers from {hostport} are too large"))); }
+            let h = h.trim_end();
+            if n == 0 || h.is_empty() { break; }
+            if let Some((k, v)) = h.split_once(':') {
+                rh.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+            }
+        }
+        let too_big = || fail(format!("response from {hostport} is larger than 64 MB"));
+        let mut keep = version == "HTTP/1.1" && !rh.get("connection").is_some_and(|c| c.eq_ignore_ascii_case("close"));
+        let mut data = Vec::new();
+        if method == "HEAD" || status == 204 || status == 304 || (100..200).contains(&status) {
+        } else if rh.get("transfer-encoding").is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) {
+            loop {
+                let mut sz = String::new();
+                r.read_line(&mut sz).map_err(rerr)?;
+                let sz = sz.trim().split(';').next().unwrap_or("");
+                let n = usize::from_str_radix(sz, 16).map_err(|_| fail(format!("bad chunk size from {hostport}")))?;
+                if data.len() + n > MAX_RESPONSE_BYTES { return Err(too_big()); }
+                if n == 0 {
+                    let mut t = String::new();
+                    while r.read_line(&mut t).map_err(rerr)? > 2 { t.clear(); }
+                    break;
+                }
+                let at = data.len();
+                data.resize(at + n, 0);
+                r.read_exact(&mut data[at..]).map_err(rerr)?;
+                let mut crlf = [0u8; 2];
+                r.read_exact(&mut crlf).map_err(rerr)?;
+            }
+        } else if let Some(len) = rh.get("content-length") {
+            let n: usize = len.parse().map_err(|_| fail(format!("bad content-length from {hostport}")))?;
+            if n > MAX_RESPONSE_BYTES { return Err(too_big()); }
+            data.resize(n, 0);
+            r.read_exact(&mut data).map_err(rerr)?;
+        } else {
+            // The body ends when the server closes: this connection is done.
+            keep = false;
+            (&mut r).take(MAX_RESPONSE_BYTES as u64 + 1).read_to_end(&mut data).map_err(rerr)?;
+            if data.len() > MAX_RESPONSE_BYTES { return Err(too_big()); }
+        }
+        // Bytes past the answer would belong to nobody: do not reuse such a connection.
+        keep &= r.buffer().is_empty();
+        let body = String::from_utf8(data).map_err(|_| fail(format!("response from {hostport} is not valid UTF-8")))?;
+        Ok((super::U_Reply { status, content_type: rh.remove("content-type").unwrap_or_default(), body }, keep))
+    }
+
     fn reason(code: i64) -> &'static str {
         match code {
             200 => "OK", 201 => "Created", 204 => "No Content", 301 => "Moved Permanently", 302 => "Found",

@@ -159,6 +159,9 @@ smallest/largest key). The Vec always comes first: `(map xs (lambda (x) (* x 2))
 `(par-map v f)` is `map` spread over all CPU cores, with the same result in the same order. Its
 function cannot use capabilities (no printing, clock or randomness inside), so the result never
 depends on timing; lambdas cannot change variables, so there are no data races to write.
+`(par-run v f)` is the same for work that waits on I/O (requests to other services, files): up to 64
+elements at once, results in order. Its function may use Net, Fs, Clock and Env, but not Console or
+Rand: print after it returns.
 
 Option/Result: `(some x)` `none` `(ok x)` `(err e)` `(unwrap-or o default)` `(expect o "msg")`
 `(is-some o)` `(is-none o)` `(is-ok r)` `(is-err r)`.
@@ -172,6 +175,11 @@ Effects (first argument is the capability):
 are rejected with 400 automatically). `(http-respond net req status content-type body)` -> `(Result Unit Str)`.
 `(http-serve net port max-body-bytes state read write)` -> `(Result Unit Str)` runs a concurrent server
 forever (returns only if it cannot listen); see "Servers" below.
+`(http-request net method url headers body)` -> `(Result Reply Str)` sends one HTTP/1.1 request:
+method uppercase (`"GET"`), url `http://host:port/path?query` (no https yet), headers a
+`(Map Str Str)` (`(map)` for none). `ok` means an answer arrived, whatever its status: check
+`(. r status)`. Connections to the same host are kept alive and reused. To call many at once:
+`(par-run urls (lambda (u) (http-request net "GET" u (map) "")))`.
 
 ## Apps for the browser (games and pages)
 
@@ -216,9 +224,10 @@ Request `path` and `query` are URL-decoded; header names are lowercase. A server
 For real servers use `http-serve`: GET and HEAD requests go to `read`, which runs many requests at
 once and only reads the state; every other method goes to `write`, one request at a time, with the
 state as `mut`. `read` is a lambda or fn of `(req Request) (s State)` returning `Reply`; `write` must
-be the name of a fn `(params (req Request) (s (mut State))) (returns Reply)`. Neither can use
-capabilities (no printing inside handlers). A trap in `read` answers 500 and the server continues; a
-trap in `write` stops the program.
+be the name of a fn `(params (req Request) (s (mut State))) (returns Reply)`. A `read` lambda may use
+Net, Fs, Clock and Env from `main` (to call other services), never Console or Rand; `write` gets no
+capabilities, so no slow I/O happens while it holds the state. A trap in `read` answers 500 and the
+server continues; a trap in `write` stops the program.
 
 ```
 (struct Store (todos (Vec Str)))
