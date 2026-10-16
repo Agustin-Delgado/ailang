@@ -10,3 +10,10 @@ bench/web/rust/target/
 .playwright-mcp/
 bench/web/arena-web/
 __pycache__/
+# The hidden tests of the model experiments and the generators that produce them stay private,
+# so the tasks keep working as a held-out evaluation.
+experiment/tasks/*/tests/
+experiment/tasks_r3/*/tests/
+experiment/make_tasks.py
+experiment/heldout_tasks.py
+experiment/r3_tasks.py
