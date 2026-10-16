@@ -50,28 +50,29 @@
     (put (mut m) "error" (Json.Str msg))
     (json-str (Json.Obj m))))
 
-(fn handle (params (net Net) (s (mut Store)) (req Request)) (returns (Result Unit Str))
+; GET and HEAD requests: many run at once, and they cannot change the store.
+(fn read (params (req Request) (s Store)) (returns Reply)
+  (body
+    (match (. req path)
+      (case "/todos" (json-reply 200 (list-todos s (page-size req))))
+      (case _ (json-reply 404 (error-json (str "no route GET " (. req path))))))))
+
+; Every other method: one at a time, with the store all to itself.
+(fn write (params (req Request) (s (mut Store))) (returns Reply)
   (body
     (let route (str (. req method) " " (. req path)))
-    (match route
-      (case "GET /todos"
-        (http-respond net req 200 "application/json" (list-todos s (page-size req))))
-      (case "POST /todos"
-        (match (create-todo (mut s) (. req body))
-          (case (ok t) (http-respond net req 201 "application/json" (json-str (todo-json t))))
-          (case (err e) (http-respond net req 400 "application/json" (error-json e)))))
-      (case _ (http-respond net req 404 "application/json" (error-json (str "no route " route)))))))
+    (if (!= route "POST /todos") (return (json-reply 404 (error-json (str "no route " route)))))
+    (match (create-todo (mut s) (. req body))
+      (case (ok t) (json-reply 201 (json-str (todo-json t))))
+      (case (err e) (json-reply 400 (error-json e))))))
+
+(fn json-reply (params (status I64) (body Str)) (returns Reply)
+  (body (new Reply (status status) (content-type "application/json") (body body))))
 
 (fn main (params (con Console) (net Net)) (returns (Result Unit Str))
   (body
-    (var store (new Store (todos (vec)) (next-id 1)))
     (println con "listening on :8080")
-    (while true
-      (let req (try (http-next net 8080 MAX-BODY)))
-      (match (handle net (mut store) req)
-        (case (ok _) unit)
-        (case (err e) (eprintln con "error: " e))))
-    (ok unit)))
+    (http-serve net 8080 MAX-BODY (new Store (todos (vec)) (next-id 1)) read write)))
 
 (test "create and list"
   (var s (new Store (todos (vec)) (next-id 1)))

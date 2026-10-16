@@ -426,6 +426,83 @@ mod ail_http {
         Ok(R { id, method, path, query, headers, body })
     }
 
+    /// `http-serve`: the server loop, run by the runtime on many threads. GET and HEAD go to
+    /// `read`, which runs concurrently under a shared lock and cannot change the state (the
+    /// checker guarantees it); every other method goes to `write`, one at a time, with the
+    /// state exclusively. A trap in `read` answers 500; a trap in `write` stops the program,
+    /// since the state may be half-changed.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn serve<S: Send + Sync>(
+        port: i64,
+        max_body: i64,
+        state: S,
+        read: &(dyn Fn(&R, &S) -> super::U_Reply + Sync),
+        write: &(dyn Fn(&R, &mut S) -> super::U_Reply + Sync),
+    ) -> Result<(), String> {
+        super::ail_rt::flush();
+        let p = u16::try_from(port).map_err(|_| format!("invalid port {port}"))?;
+        let ls = TcpListener::bind(("0.0.0.0", p)).map_err(|e| format!("cannot listen on port {port}: {e}"))?;
+        let state = std::sync::RwLock::new(state);
+        let ids = AtomicI64::new(1);
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let mut listeners = Vec::new();
+        for _ in 0..(cores * 2).clamp(4, 64) {
+            listeners.push(ls.try_clone().map_err(|e| e.to_string())?);
+        }
+        std::thread::scope(|sc| {
+            for ls in listeners {
+                let (state, ids) = (&state, &ids);
+                sc.spawn(move || loop {
+                    let Ok((stream, _)) = ls.accept() else { continue };
+                    let _ = stream.set_nodelay(true);
+                    let (method, path, query, headers, body) = match read_request(&stream, max_body) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let _ = reply(&stream, 400, "text/plain", &format!("bad request: {e}"));
+                            continue;
+                        }
+                    };
+                    let head = method == "HEAD";
+                    let req = R { id: ids.fetch_add(1, Ordering::Relaxed), method, path, query, headers, body };
+                    let out = if head || req.method == "GET" {
+                        super::ail_rt::SOFT_TRAP.with(|s| s.set(true));
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let g = state.read().unwrap_or_else(|e| e.into_inner());
+                            read(&req, &g)
+                        }));
+                        super::ail_rt::SOFT_TRAP.with(|s| s.set(false));
+                        r.ok()
+                    } else {
+                        let mut g = state.write().unwrap_or_else(|e| e.into_inner());
+                        Some(write(&req, &mut g))
+                    };
+                    let _ = match out {
+                        Some(r) if (100..=999).contains(&r.status) => {
+                            reply_sized(&stream, r.status, &r.content_type, &r.body, head)
+                        }
+                        Some(r) => reply(&stream, 500, "text/plain", &format!("handler returned invalid status {}", r.status)),
+                        None => reply(&stream, 500, "text/plain", "internal error"),
+                    };
+                });
+            }
+        });
+        Ok(())
+    }
+
+    /// Like `reply`, but for HEAD sends the headers (with the real length) and no body.
+    fn reply_sized(s: &TcpStream, status: i64, content_type: &str, body: &str, head: bool) -> std::io::Result<()> {
+        if !head {
+            return reply(s, status, content_type, body);
+        }
+        let mut s = s;
+        write!(
+            s,
+            "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            reason(status),
+            body.len()
+        )
+    }
+
     fn reason(code: i64) -> &'static str {
         match code {
             200 => "OK", 201 => "Created", 204 => "No Content", 301 => "Moved Permanently", 302 => "Found",

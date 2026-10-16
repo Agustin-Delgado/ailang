@@ -107,7 +107,19 @@ in the same order, as `map`. The checker also forbids capabilities inside it, so
 deterministic: no interleaved output, no timing-dependent results. There are no locks, atomics or
 threads in the language to get wrong.
 
-## 11. Toolchain
+## 11. Servers: reads in parallel, writes alone
+
+A server is a state plus two handlers: `(http-serve net port max-body state read write)`. GET and
+HEAD go to `read`, which gets the state read-only and runs on many threads at once; every other
+method goes to `write`, a fn that takes the state as `mut` and runs one request at a time. The
+runtime holds the state behind a reader-writer lock, but the program never sees it. Two bad
+practices become unrepresentable: a GET that changes data does not type-check (E0330), and a data
+race between handlers cannot be written. Handlers get no capabilities: they compute a `Reply` and
+the runtime sends it. A trap in `read` answers 500 and the server keeps going, since a reader
+could not have changed anything; a trap in `write` stops the program, because the state may be
+half-changed.
+
+## 12. Toolchain
 
 `ail check` (instant), `ail fix`, `ail run`, `ail test`, `ail build`, `ail emit` (generated Rust),
 `ail spec` (the specification an agent should read, embedded in the binary).

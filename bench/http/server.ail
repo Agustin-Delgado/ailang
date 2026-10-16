@@ -6,6 +6,29 @@
 (const PORT I64 8101)
 (const MAX-BODY I64 65536)
 
+(const SEED I64 100000)
+
+; The store starts with SEED todos: "task i", tags t(i mod 10) and t(i/10 mod 10).
+(fn seed (params (s (mut Store)))
+  (body
+    (for i (range 0 SEED)
+      (let t (new Todo (id (. s next-id)) (title (str "task " i))
+        (done false) (tags (vec (str "t" (% i 10)) (str "t" (% (/ i 10) 10))))))
+      (push (mut (. s todos)) t)
+      (set (. s next-id) (+ (. s next-id) 1)))))
+
+; GET /search?q=..&tag=..: how many todos have the tag and contain q in the title. Scans the
+; whole store, so it is CPU-bound.
+(fn search (params (s Store) (q Str) (tag Str)) (returns Str)
+  (body
+    (var n 0)
+    (for t (. s todos)
+      (if (and (contains (. t tags) tag) (contains (. t title) q)) (set n (+ n 1))))
+    (str "{\"count\":" n "}")))
+
+(fn query-str (params (req Request) (key Str)) (returns Str)
+  (body (unwrap-or (get (. req query) key) "")))
+
 (fn todo-json (params (t Todo)) (returns Json)
   (body
     (var tags (Vec Json) (vec))
@@ -68,6 +91,8 @@
       (case "GET /todos"
         (let body (list-todos s (query-int req "limit" 20) (query-int req "offset" 0)))
         (http-respond net req 200 "application/json" body))
+      (case "GET /search"
+        (http-respond net req 200 "application/json" (search s (query-str req "q") (query-str req "tag"))))
       (case "POST /todos"
         (match (parse-new-todo (. req body))
           (case (some t)
@@ -82,6 +107,7 @@
 (fn main (params (con Console) (net Net)) (returns (Result Unit Str))
   (body
     (var store (new Store (todos (vec)) (next-id 1)))
+    (seed (mut store))
     (println con "ail listening on :" PORT)
     (while true
       (match (http-next net PORT MAX-BODY)

@@ -1,10 +1,15 @@
-"""Real-HTTP benchmark (bench/SPECS.md "http"): ail vs Rust std (same architecture) vs Rust axum+tokio.
+"""Real-HTTP benchmark (bench/SPECS.md "http"): ail vs Rust std vs Rust axum+tokio.
 
-Builds the three servers and the load generator, then for each server and each concurrency level:
-start the server alone (fresh store), wait until it answers, run loadgen (warmup + fixed duration,
-fresh connection per request, 30% POST / 70% GET limit=20), kill the server. Writes results.json.
+Servers: ail (`http-next` loop, single-threaded handlers), ail-par (`http-serve`: GET handlers in
+parallel, writes one at a time), std (Rust std::net, single-threaded) and axum (tokio, multi-threaded,
+RwLock store). Builds them and the load generator, then for each server and each concurrency level:
+start the server alone (fresh store of 100,000 seeded todos), wait until it answers, run loadgen
+(warmup + fixed duration, fresh connection per request), kill the server.
 
-usage: python run.py [--duration S] [--warmup S] [--conc 1,8,64] [--only ail,std,axum]
+Mixes: "todos" (30% POST, 70% GET /todos?limit=20; I/O-bound) writes results.json; "search" (10% POST,
+90% GET /search, which scans the whole store; CPU-bound) writes results_search.json.
+
+usage: python run.py [--mix todos|search] [--duration S] [--warmup S] [--conc 1,8,64] [--only ail,ail-par,std,axum]
 """
 import argparse, json, os, socket, subprocess, sys, time
 
@@ -17,14 +22,19 @@ SERVERS = {
     "ail": (8101, os.path.join(BIN, "server_ail.exe")),
     "std": (8102, os.path.join(REL, "server_std.exe")),
     "axum": (8103, os.path.join(REL, "server_axum.exe")),
+    "ail-par": (8104, os.path.join(BIN, "server_ail_par.exe")),
+}
+MIXES = {
+    "todos": ("results.json", "30% POST /todos, 70% GET /todos?limit=20&offset=0"),
+    "search": ("results_search.json", "10% POST /todos, 90% GET /search?q=<n mod 1000>&tag=t<n mod 10> over 100,000+ todos"),
 }
 
 
 def build():
     subprocess.run(["cargo", "build", "--release", "--quiet"], cwd=HERE, check=True)
     os.makedirs(BIN, exist_ok=True)
-    subprocess.run([AIL, "build", os.path.join(HERE, "server.ail"), "-o", SERVERS["ail"][1]],
-                   check=True, capture_output=True)
+    for name, src in (("ail", "server.ail"), ("ail-par", "server_par.ail")):
+        subprocess.run([AIL, "build", os.path.join(HERE, src), "-o", SERVERS[name][1]], check=True, capture_output=True)
 
 
 def port_open(port):
@@ -44,14 +54,14 @@ def wait_ready(port, proc, timeout=10.0):
     raise SystemExit(f"server on {port} did not start")
 
 
-def run_one(name, conc, duration, warmup):
+def run_one(name, conc, duration, warmup, mix):
     port, exe = SERVERS[name]
     if port_open(port):
         raise SystemExit(f"port {port} is already in use; stop whatever is listening there")
     proc = subprocess.Popen([exe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         wait_ready(port, proc)
-        out = subprocess.run([os.path.join(REL, "loadgen.exe"), str(port), str(conc), str(duration), str(warmup)],
+        out = subprocess.run([os.path.join(REL, "loadgen.exe"), str(port), str(conc), str(duration), str(warmup), mix],
                              capture_output=True, text=True, check=True)
         if out.stderr.strip():
             print(f"   loadgen: {out.stderr.strip()}", file=sys.stderr)
@@ -68,40 +78,43 @@ def main():
     ap.add_argument("--duration", type=float, default=10.0)
     ap.add_argument("--warmup", type=float, default=2.0)
     ap.add_argument("--conc", default="1,8,64")
-    ap.add_argument("--only", default="ail,std,axum")
+    ap.add_argument("--only", default="ail,ail-par,std,axum")
+    ap.add_argument("--mix", default="todos", choices=sorted(MIXES))
+    ap.add_argument("--repeat", type=int, default=2,
+                    help="rounds over every server; each cell keeps its best round (the machine is shared)")
     a = ap.parse_args()
     concs = [int(c) for c in a.conc.split(",")]
     names = a.only.split(",")
 
     build()
-    results = []
-    for conc in concs:
-        for name in names:
-            r = run_one(name, conc, a.duration, a.warmup)
-            results.append(r)
-            print(f"  {name:5s} c={conc:<3d} {r['rps']:9.0f} req/s  p50 {r['p50_us']/1000:7.2f} ms  "
-                  f"p99 {r['p99_us']/1000:7.2f} ms  errors {r['errors']}", flush=True)
+    best = {}
+    errors_all = 0
+    for rnd in range(a.repeat):
+        for conc in concs:
+            for name in names:
+                r = run_one(name, conc, a.duration, a.warmup, a.mix)
+                r["round"] = rnd + 1
+                errors_all += r["errors"]
+                if (name, conc) not in best or r["rps"] > best[(name, conc)]["rps"]:
+                    best[(name, conc)] = r
+                print(f"  r{rnd + 1} {name:7s} c={conc:<3d} {r['rps']:9.0f} req/s  p50 {r['p50_us']/1000:7.2f} ms  "
+                      f"p99 {r['p99_us']/1000:7.2f} ms  errors {r['errors']}", flush=True)
 
-    meta = {"duration_s": a.duration, "warmup_s": a.warmup, "mix": "30% POST /todos, 70% GET /todos?limit=20&offset=0",
+    results = [best[(n, c)] for c in concs for n in names]
+    meta = {"rounds": a.repeat, "kept": "best round per server and concurrency", "errors_all_rounds": errors_all,"duration_s": a.duration, "warmup_s": a.warmup, "mix": MIXES[a.mix][1],
             "connection": "new TCP connection per request, Connection: close", "platform": sys.platform}
-    with open(os.path.join(HERE, "results.json"), "w") as f:
+    with open(os.path.join(HERE, MIXES[a.mix][0]), "w") as f:
         json.dump({"meta": meta, "results": results}, f, indent=1)
 
     by = {(r["server"], r["concurrency"]): r for r in results}
     print()
-    print(f"{'conc':>4} | " + " | ".join(f"{n + ' req/s':>12} {'p50 ms':>7} {'p99 ms':>7}" for n in names)
-          + (" | ail/std  ail/axum" if "ail" in names else ""))
+    print(f"{'conc':>4} | " + " | ".join(f"{n + ' req/s':>14} {'p50 ms':>7} {'p99 ms':>7}" for n in names))
     for c in concs:
         row = f"{c:>4} | " + " | ".join(
-            f"{by[(n, c)]['rps']:>12.0f} {by[(n, c)]['p50_us'] / 1000:>7.2f} {by[(n, c)]['p99_us'] / 1000:>7.2f}"
+            f"{by[(n, c)]['rps']:>14.0f} {by[(n, c)]['p50_us'] / 1000:>7.2f} {by[(n, c)]['p99_us'] / 1000:>7.2f}"
             for n in names)
-        if "ail" in names:
-            ail = by[("ail", c)]["rps"]
-            ratios = [f"{ail / by[(n, c)]['rps']:7.2f}" if (n, c) in by else "      -" for n in ("std", "axum")]
-            row += " | " + "  ".join(ratios)
         print(row)
-    errs = sum(r["errors"] for r in results)
-    print(f"\ntotal errors: {errs}")
+    print(f"\nerrors in the kept rounds: {sum(r['errors'] for r in results)}; in all rounds: {errors_all}")
 
 
 if __name__ == "__main__":

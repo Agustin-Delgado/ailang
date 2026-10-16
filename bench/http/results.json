@@ -1,5 +1,8 @@
 {
  "meta": {
+  "rounds": 2,
+  "kept": "best round per server and concurrency",
+  "errors_all_rounds": 1,
   "duration_s": 10.0,
   "warmup_s": 2.0,
   "mix": "30% POST /todos, 70% GET /todos?limit=20&offset=0",
@@ -9,84 +12,123 @@
  "results": [
   {
    "concurrency": 1,
-   "rps": 1242.1,
-   "p50_us": 794,
-   "p99_us": 1291,
-   "ok": 12421,
+   "rps": 1410.6,
+   "p50_us": 651,
+   "p99_us": 1288,
+   "ok": 14106,
    "errors": 0,
-   "server": "ail"
+   "server": "ail",
+   "round": 2
   },
   {
    "concurrency": 1,
-   "rps": 1448.1,
-   "p50_us": 676,
-   "p99_us": 1065,
-   "ok": 14481,
+   "rps": 1503.8,
+   "p50_us": 608,
+   "p99_us": 1159,
+   "ok": 15038,
    "errors": 0,
-   "server": "std"
+   "server": "ail-par",
+   "round": 2
   },
   {
    "concurrency": 1,
-   "rps": 1274.5,
-   "p50_us": 763,
-   "p99_us": 1171,
-   "ok": 12745,
+   "rps": 1597.6,
+   "p50_us": 573,
+   "p99_us": 1121,
+   "ok": 15976,
    "errors": 0,
-   "server": "axum"
+   "server": "std",
+   "round": 2
+  },
+  {
+   "concurrency": 1,
+   "rps": 1201.8,
+   "p50_us": 762,
+   "p99_us": 1468,
+   "ok": 12018,
+   "errors": 0,
+   "server": "axum",
+   "round": 2
   },
   {
    "concurrency": 8,
-   "rps": 5601.9,
-   "p50_us": 1360,
-   "p99_us": 2629,
-   "ok": 56019,
+   "rps": 6554.8,
+   "p50_us": 1107,
+   "p99_us": 2445,
+   "ok": 65548,
    "errors": 0,
-   "server": "ail"
+   "server": "ail",
+   "round": 2
   },
   {
    "concurrency": 8,
-   "rps": 4635.3,
-   "p50_us": 1665,
-   "p99_us": 2783,
-   "ok": 46353,
-   "errors": 0,
-   "server": "std"
+   "rps": 9530.0,
+   "p50_us": 741,
+   "p99_us": 2025,
+   "ok": 95300,
+   "errors": 1,
+   "server": "ail-par",
+   "round": 2
   },
   {
    "concurrency": 8,
-   "rps": 5864.8,
-   "p50_us": 1315,
-   "p99_us": 2308,
-   "ok": 58648,
+   "rps": 4736.3,
+   "p50_us": 1590,
+   "p99_us": 2728,
+   "ok": 47363,
    "errors": 0,
-   "server": "axum"
+   "server": "std",
+   "round": 2
+  },
+  {
+   "concurrency": 8,
+   "rps": 6425.6,
+   "p50_us": 1150,
+   "p99_us": 2240,
+   "ok": 64256,
+   "errors": 0,
+   "server": "axum",
+   "round": 2
   },
   {
    "concurrency": 64,
-   "rps": 5324.1,
-   "p50_us": 11804,
-   "p99_us": 18590,
-   "ok": 53241,
+   "rps": 6485.8,
+   "p50_us": 9518,
+   "p99_us": 13759,
+   "ok": 64858,
    "errors": 0,
-   "server": "ail"
+   "server": "ail",
+   "round": 2
   },
   {
    "concurrency": 64,
-   "rps": 4595.0,
-   "p50_us": 13442,
-   "p99_us": 20973,
-   "ok": 45950,
+   "rps": 10829.3,
+   "p50_us": 5417,
+   "p99_us": 14770,
+   "ok": 108293,
    "errors": 0,
-   "server": "std"
+   "server": "ail-par",
+   "round": 2
   },
   {
    "concurrency": 64,
-   "rps": 5420.7,
-   "p50_us": 11536,
-   "p99_us": 16808,
-   "ok": 54207,
+   "rps": 4671.5,
+   "p50_us": 13565,
+   "p99_us": 17094,
+   "ok": 46715,
    "errors": 0,
-   "server": "axum"
+   "server": "std",
+   "round": 2
+  },
+  {
+   "concurrency": 64,
+   "rps": 6147.5,
+   "p50_us": 10272,
+   "p99_us": 13021,
+   "ok": 61475,
+   "errors": 0,
+   "server": "axum",
+   "round": 1
   }
  ]
 }

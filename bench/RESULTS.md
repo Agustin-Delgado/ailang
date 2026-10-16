@@ -48,18 +48,37 @@ of each entity is no longer a fresh String) closed most of the gap.
 
 ## Real HTTP server (`http/`)
 
-The todo API over TCP on localhost, one connection per request, 30% POST / 70% GET, 10 s after a
-2 s warmup, 0 errors.
+The todo API over TCP on localhost, one connection per request, 100,000 seeded todos. Each cell is
+the best of 2 rounds of 10 s after a 2 s warmup (the machine is shared). The servers:
 
-| clients | ail req/s | Rust std (1 thread) | Rust axum + tokio | ail/std | ail/axum |
+- **ail loop:** `http-next`, one handler at a time.
+- **ail serve:** `http-serve`, GET in parallel, writes one at a time.
+- **std:** Rust std::net, single-threaded.
+- **axum:** Rust axum + tokio, multi-threaded, with an RwLock store.
+
+I/O-bound mix (30% POST, 70% GET /todos?limit=20), in requests/s:
+
+| clients | ail loop | ail serve | Rust std | Rust axum | serve/axum |
 |---|---|---|---|---|---|
-| 1 | 1242 | 1448 | 1274 | 0.86 | 0.97 |
-| 8 | 5602 | 4635 | 5865 | 1.21 | 0.96 |
-| 64 | 5324 | 4595 | 5421 | 1.16 | 0.98 |
+| 1 | 1411 | 1504 | 1598 | 1202 | 1.25 |
+| 8 | 6555 | 9530 | 4736 | 6426 | 1.48 |
+| 64 | 6486 | 10829 | 4672 | 6148 | 1.76 |
 
-Before this round ail was at 0.45–0.60 of Rust std. The program is still single-threaded. The
-runtime now accepts and parses requests on a pool of I/O threads, so ail beats a hand-written
-Rust std server and matches axum without the program having to deal with concurrency.
+CPU-bound mix (10% POST, 90% GET /search, which scans the whole store), in requests/s:
+
+| clients | ail loop | ail serve | Rust std | Rust axum | serve/axum |
+|---|---|---|---|---|---|
+| 1 | 388 | 396 | 198 | 184 | 2.15 |
+| 8 | 479 | 1712 | 191 | 905 | 1.89 |
+| 64 | 467 | 1903 | 186 | 1040 | 1.83 |
+
+- **Every server gives the same counts.** I checked this on several queries.
+- **One thread, twice Rust's speed:** ail's size-class allocator puts the 200,000 small strings of
+  the store next to each other, while the system allocator that idiomatic Rust uses scatters them.
+- **The parallel gain:** `http-serve` comes from the 12 cores, minus the 10% of POSTs, which take
+  the state exclusively.
+- **Errors:** two requests failed, out of all rounds. Both failed in the load generator's
+  `connect` with Windows error 10055 (out of socket buffers). Neither was a server error.
 
 ## What changed in the compiler because of these benchmarks
 

@@ -29,6 +29,27 @@ struct Store {
     next_id: i64,
 }
 
+const SEED: i64 = 100_000;
+
+/// The store starts with SEED todos: "task i", tags t(i mod 10) and t(i/10 mod 10).
+fn seeded() -> Store {
+    let todos = (0..SEED)
+        .map(|i| Todo {
+            done: false,
+            id: i + 1,
+            tags: vec![format!("t{}", i % 10), format!("t{}", (i / 10) % 10)],
+            title: format!("task {i}"),
+        })
+        .collect();
+    Store { todos, next_id: SEED }
+}
+
+/// GET /search: how many todos have the tag and contain q in the title (scans the whole store).
+fn search(store: &Store, q: &str, tag: &str) -> String {
+    let n = store.todos.iter().filter(|t| t.tags.iter().any(|g| g == tag) && t.title.contains(q)).count();
+    format!("{{\"count\":{n}}}")
+}
+
 struct Request {
     method: String,
     path: String,
@@ -105,6 +126,10 @@ fn handle(store: &mut Store, req: &Request) -> Response {
             let page: Vec<&Todo> = store.todos.iter().skip(offset).take(limit).collect();
             Response { status: 200, body: serde_json::to_string(&page).expect("serializable") }
         }
+        ("GET", "/search") => {
+            let get = |k: &str| req.query.get(k).map(String::as_str).unwrap_or("");
+            Response { status: 200, body: search(store, get("q"), get("tag")) }
+        }
         ("POST", "/todos") => match serde_json::from_slice::<NewTodo>(&req.body) {
             Ok(new) => {
                 store.next_id += 1;
@@ -156,7 +181,7 @@ fn serve(store: &mut Store, stream: TcpStream) -> io::Result<()> {
 fn main() -> io::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:8102")?;
     println!("rust std listening on 127.0.0.1:8102");
-    let mut store = Store { todos: Vec::new(), next_id: 0 };
+    let mut store = seeded();
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {

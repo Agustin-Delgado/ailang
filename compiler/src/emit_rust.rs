@@ -1665,6 +1665,20 @@ impl<'a> Emitter<'a> {
                 self.rf(a(3)),
                 self.rf(a(4))
             ),
+            "http-serve" => {
+                let st = self.ty(a(3)).clone();
+                let sty = rty(&st);
+                let f = self.closure(a(4));
+                let ExprKind::Var(w) = &a(5).kind else { unreachable!("write handler") };
+                let c = self.conv_ref("__s", &st);
+                format!(
+                    "{{ let __f = {f}; ail_http::serve({}, {}, {}, &|__q: &U_Request, __s: &{sty}| __f(__q, {c}), &|__q: &U_Request, __s: &mut {sty}| {}(__q, __s)) }}",
+                    self.val(a(1)),
+                    self.val(a(2)),
+                    self.val(a(3)),
+                    fn_name(w)
+                )
+            }
             "fail" => format!("ail_rt::fail({})", self.msg(a(0))),
             "assert" => {
                 let c = self.val(a(0));

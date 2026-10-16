@@ -150,6 +150,7 @@ fn fill_sentinels(src: &str, diags: &mut [Diag]) {
 const PRELUDE: &str = "
 (enum Json (Null) (Bool Bool) (Num F64) (Str Str) (Arr (Vec Json)) (Obj (Map Str Json)))
 (struct Request (id I64) (method Str) (path Str) (query (Map Str Str)) (headers (Map Str Str)) (body Str))
+(struct Reply (status I64) (content-type Str) (body Str))
 (enum Event (Tick F64) (KeyDown Str) (KeyUp Str) (MouseDown F64 F64) (MouseUp F64 F64) (MouseMove F64 F64)
   (Click Str) (Input Str Str) (Resize F64 F64))
 ";
@@ -616,6 +617,9 @@ fn fnv(s: &str) -> u64 {
 }
 
 fn compile(rust: &str, test: bool, o: &Opts) -> Result<PathBuf, String> {
+    // A trap in a read handler of http-serve answers 500 and the server keeps going: that needs
+    // unwinding. Everything else stops at the first trap, so it can abort.
+    let unwinds = rust.contains("ail_http::serve(");
     let mut flags = vec![
         "--edition",
         "2021",
@@ -627,13 +631,13 @@ fn compile(rust: &str, test: bool, o: &Opts) -> Result<PathBuf, String> {
     if test {
         flags.extend(["-C", "opt-level=1", "-C", "panic=unwind"]);
     } else if o.fast {
-        flags.extend(["-C", "opt-level=0", "-C", "panic=abort"]);
+        flags.extend(["-C", "opt-level=0", "-C", if unwinds { "panic=unwind" } else { "panic=abort" }]);
     } else {
         flags.extend([
             "-C",
             "opt-level=3",
             "-C",
-            "panic=abort",
+            if unwinds { "panic=unwind" } else { "panic=abort" },
             "-C",
             "codegen-units=1",
             "-C",
