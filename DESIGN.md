@@ -107,6 +107,12 @@ in the same order, as `map`. The checker also forbids capabilities inside it, so
 deterministic: no interleaved output, no timing-dependent results. There are no locks, atomics or
 threads in the language to get wrong.
 
+Work that waits on the network or the disk uses `(par-run xs f)`: the same shape, up to 64 elements
+in flight, results in order. Its function may use Net, Fs, Clock and Env, because their effects do
+not depend on which thread runs first. Console and Rand stay out: output would interleave and the
+random sequence would depend on timing. `http-request` keeps connections alive and reuses them,
+so fanning out to a service costs one handshake per connection, not per request.
+
 ## 11. Servers: reads in parallel, writes alone
 
 A server is a state plus two handlers: `(http-serve net port max-body state read write)`. GET and
@@ -114,8 +120,9 @@ HEAD go to `read`, which gets the state read-only and runs on many threads at on
 method goes to `write`, a fn that takes the state as `mut` and runs one request at a time. The
 runtime holds the state behind a reader-writer lock, but the program never sees it. Two bad
 practices become unrepresentable: a GET that changes data does not type-check (E0330), and a data
-race between handlers cannot be written. Handlers get no capabilities: they compute a `Reply` and
-the runtime sends it. A trap in `read` answers 500 and the server keeps going, since a reader
+race between handlers cannot be written. A read handler may call other services (Net, Fs, Clock,
+Env), but the write handler gets no capabilities at all: slow I/O while holding the state
+exclusively, which stalls every other request, cannot be written either. A trap in `read` answers 500 and the server keeps going, since a reader
 could not have changed anything; a trap in `write` stops the program, because the state may be
 half-changed.
 

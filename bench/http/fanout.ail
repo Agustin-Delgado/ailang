@@ -1,0 +1,27 @@
+; fanout — N GET requests to a backend, many in flight at once (par-run), adding up what every
+; answer reports (bench/SPECS.md "fanout"). usage: fanout <port> <requests> <search|todos>
+; search: GET /search?q=<q>&tag=t<q mod 10>, adds the counts (the backend does real work).
+; todos: GET /todos?limit=1&offset=<q>, adds the body lengths (the client's own cost dominates).
+(fn value-of (params (net Net) (port Str) (search Bool) (q I64)) (returns I64)
+  (body
+    (let path (if search (str "/search?q=" q "&tag=t" (% q 10)) (str "/todos?limit=1&offset=" q)))
+    (match (http-request net "GET" (str "http://127.0.0.1:" port path) (map) "")
+      (case (ok r)
+        (if (!= (. r status) 200) (return -1))
+        (if search
+          (unwrap-or (parse-i64 (replace (replace (. r body) "{\"count\":" "") "}" "")) -1)
+          (len (. r body))))
+      (case (err _) -1))))
+
+(fn main (params (con Console) (net Net) (env Env) (clock Clock))
+  (body
+    (let a (args env))
+    (let port (at a 0))
+    (let n (expect (parse-i64 (at a 1)) "requests must be a number"))
+    (let search (== (at a 2) "search"))
+    (var qs (Vec I64) (vec))
+    (for q (range 0 n) (push (mut qs) q))
+    (let t0 (now-ms clock))
+    (let values (par-run qs (lambda (q) (value-of net port search q))))
+    (let ms (- (now-ms clock) t0))
+    (println con "sum " (sum (filter values (lambda (v) (>= v 0)))) " failed " (count values (lambda (v) (< v 0))) " ms " ms)))

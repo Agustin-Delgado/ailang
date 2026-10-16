@@ -209,6 +209,14 @@ Load generator (Rust, `bench/http/loadgen`): C concurrent clients for a fixed du
 requests/s, p50 and p99 latency. Mix `todos`: POST with probability 0.3, else GET /todos with limit 20
 and offset 0. Mix `search`: POST with probability 0.1, else `GET /search?q=<n mod 1000>&tag=t<n mod 10>`.
 
+## fanout — many requests to one service (lives in `bench/http/`)
+
+One client sends N GET requests (`q = 0..N-1`) to the axum server above, 64 in flight at a time, and
+adds up the answers. Mode `todos`: `GET /todos?limit=1&offset=<q>`, adds the body lengths (cheap
+answers: the client dominates). Mode `search`: `GET /search?q=<q>&tag=t<q mod 10>`, adds the counts
+(the backend dominates). ail: `bench/http/fanout.ail` (`par-run` + `http-request`). Rust: tokio +
+reqwest + `buffered(64)` (`bench/http/fanout`). Output `sum <S> failed <F> ms <T>`.
+
 ## interp — bytecode interpreter (enum dispatch in a hot loop)
 
 A stack VM. Instructions (an enum): `Push(i64)`, `Load(slot)`, `Store(slot)`, `Add`, `Sub`, `Mul`, `Div`,

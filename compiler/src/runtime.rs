@@ -314,6 +314,39 @@ mod ail_rt {
     pub fn upper_cow<'a>(s: std::borrow::Cow<'a, str>) -> std::borrow::Cow<'a, str> {
         if s.bytes().all(|b| b < 128 && !b.is_ascii_lowercase()) { s } else { std::borrow::Cow::Owned(upper_owned(s.into_owned())) }
     }
+    /// `par-run`: `f` over `xs` with up to 64 threads, one element at a time, for work that waits
+    /// on I/O (requests to other services, files). Results come back in order.
+    pub fn par_run<T: Sync, R: Send, F: Fn(&T) -> R + Sync>(xs: &[T], f: &F) -> Vec<R> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let n = xs.len();
+        let threads = n.min(64);
+        if threads <= 1 {
+            return xs.iter().map(f).collect();
+        }
+        flush();
+        let next = AtomicUsize::new(0);
+        let mut parts: Vec<(usize, R)> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..threads)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut mine = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= n {
+                                break;
+                            }
+                            mine.push((i, f(&xs[i])));
+                        }
+                        mine
+                    })
+                })
+                .collect();
+            hs.into_iter().flat_map(|h| h.join().unwrap_or_else(|_| std::process::exit(101))).collect()
+        });
+        parts.sort_unstable_by_key(|p| p.0);
+        parts.into_iter().map(|p| p.1).collect()
+    }
+
     /// `f` over `xs` on all cores; the result is in order, the same as a sequential map. Threads
     /// take small blocks from a shared counter, so uneven work still keeps every core busy. `f`
     /// cannot have effects (the checker forbids capabilities): the result never depends on timing.

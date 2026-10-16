@@ -80,6 +80,20 @@ CPU-bound mix (10% POST, 90% GET /search, which scans the whole store), in reque
 - **Errors:** two requests failed, out of all rounds. Both failed in the load generator's
   `connect` with Windows error 10055 (out of socket buffers). Neither was a server error.
 
+## Fan-out client (`http/fanout.py`)
+
+3,000 GET requests from one client to the Rust axum server, 64 in flight at a time. Rounds alternate
+ail and Rust, and the table keeps the median of 5. Both clients get the same sum, with 0 failed requests.
+
+| mode | ail (`par-run` + `http-request`) | Rust (tokio + reqwest) | ail/Rust |
+|---|---|---|---|
+| todos (cheap answers) | 106 ms | 165 ms | 0.64 |
+| search (backend scans 100,000 todos) | 1961 ms | 2115 ms | 0.93 |
+
+The first version of `http-request` opened a new connection for every request. It was 5 times slower
+than reqwest and ran Windows out of ephemeral ports. Keeping connections alive and reusing them
+closed the gap and then some.
+
 ## What changed in the compiler because of these benchmarks
 
 ail 0.4 (string views):

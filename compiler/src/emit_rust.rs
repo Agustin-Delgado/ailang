@@ -1428,11 +1428,12 @@ impl<'a> Emitter<'a> {
                 let c = self.conv_ref("__e", &self.elem_ty(a(0)));
                 format!("{{ let __f = {f}; {xs}.iter().map(|__e| __f({c})).collect::<Vec<_>>() }}")
             }
-            "par-map" => {
+            "par-map" | "par-run" => {
                 let (f, xs) = (self.closure(a(1)), self.pv(a(0)));
                 let el = self.elem_ty(a(0));
                 let c = self.conv_ref("__e", &el);
-                format!("{{ let __f = {f}; ail_rt::par_map(&{xs}[..], &|__e: &{}| __f({c})) }}", rty(&el))
+                let rt = if name == "par-map" { "par_map" } else { "par_run" };
+                format!("{{ let __f = {f}; ail_rt::{rt}(&{xs}[..], &|__e: &{}| __f({c})) }}", rty(&el))
             }
             "filter" | "any" | "all" | "count" | "find" | "find-index" => {
                 let (f, xs) = (self.closure(a(1)), self.pv(a(0)));
@@ -1662,6 +1663,13 @@ impl<'a> Emitter<'a> {
                 "ail_http::respond({}, {}, {}, {})",
                 self.rf(a(1)),
                 self.val(a(2)),
+                self.rf(a(3)),
+                self.rf(a(4))
+            ),
+            "http-request" => format!(
+                "ail_http::request({}, {}, {}, {})",
+                self.rf(a(1)),
+                self.rf(a(2)),
                 self.rf(a(3)),
                 self.rf(a(4))
             ),
