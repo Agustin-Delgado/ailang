@@ -130,6 +130,10 @@ at most one per model there. Both ail misses were compiler bugs (the checker was
 the spec), fixed since, after which those unchanged programs pass. TypeScript's miss was a real
 logic bug. Details are in [`experiment/RESULTS.md`](experiment/RESULTS.md).
 
+The task statements are public, in `experiment/tasks*/`. The hidden tests, and the Python
+generators that produce them, are not: published tests would end up in training data, and the
+tasks would stop measuring anything.
+
 ### Where ail still loses, and what comes next
 
 - **game and sieve (~1.1×):** bounds checks in the inner loops, and the ail game keeps its grid as
@@ -215,6 +219,11 @@ target/release/ail web ../examples/dodge.ail          # build for the browser an
 ## Status
 
 ail is an early research language: v0.3 is released and v0.4 (string views, functions as
-arguments, generics, programs split across files with `(use name)`, `par-map`, concurrent servers
-with `http-serve`) is in development on `main`. The pieces above work and are measured. Still to
+arguments, generics, programs split across files with `(use name)`, `par-map` and `par-run`,
+tasks and channels, concurrent servers with `http-serve`, an HTTP client) is in development on
+`main`. The pieces above work and are measured. Still to
 come: keep-alive on the server side, https, and tasks that live alongside a server.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).

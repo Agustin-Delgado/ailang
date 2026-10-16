@@ -11,6 +11,8 @@ no training data, as reliably as in Rust and TypeScript?
 - Each (language, task) pair is one fresh agent. It reads the task and, for ail, the full
   `SPEC.md`, then writes the program once. No compiling, no testing, no second look.
 - Graded by `grade.py`: compile, run every hidden test, compare stdout exactly.
+- The hidden tests and their generators (`make_tasks.py`, `heldout_tasks.py`, `r3_tasks.py`) are
+  not in the public repository, so the tasks remain a held-out evaluation.
 - Repair round: failing pairs get the compiler output or the first failing test, once.
 - Rust: `rustc -O`. TypeScript: `tsc --strict --lib es2022`, run on Node 25.
 
