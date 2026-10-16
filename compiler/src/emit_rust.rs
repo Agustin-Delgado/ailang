@@ -35,6 +35,9 @@ pub struct Emitter<'a> {
     /// Emitting the fast copy of a loop whose integer arithmetic records overflow in `__of`
     /// instead of trapping (see `for_unchecked`).
     defer: bool,
+    /// Index arithmetic `j + c` in the fast copy of a loop, tested before the loop to stay in
+    /// range of its type: emitted without a check, so LLVM sees plain affine addresses.
+    affine: HashSet<u32>,
     /// Emitting the body of a loop that runs in parallel chunks (see `for_par`).
     in_par: bool,
     /// Statements of a parallel body emitted differently: update id -> what to emit.
@@ -160,6 +163,7 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, file_lines: &[u
         epoch: 0,
         unchecked: HashMap::new(),
         defer: false,
+        affine: HashSet::new(),
         in_par: false,
         par_hooks: HashMap::new(),
         par_shared: HashMap::new(),
@@ -1342,6 +1346,10 @@ impl<'a> Emitter<'a> {
         let t = self.ty(e).clone();
         let a = |i: usize| args[i].expr();
         let at = |s: &Self, i: usize| s.ty(args[i].expr()).clone();
+        if self.affine.contains(&e.id) && args.len() == 2 && (name == "+" || name == "-") {
+            let op = if name == "+" { "add" } else { "sub" };
+            return format!("{}.unchecked_{op}({})", self.val(a(0)), self.val(a(1)));
+        }
         if self.defer && t.is_int() {
             if let Some(code) = self.deferred(name, &t, args) {
                 return code;
@@ -2946,6 +2954,7 @@ impl<'a> Emitter<'a> {
             lets: &HashMap<BindId, &'e Expr>,
             fixed: &dyn Fn(&Expr) -> bool,
             depth: usize,
+            rec: &mut Vec<(u32, Vec<(bool, &'e Expr)>)>,
         ) -> Option<Vec<(bool, &'e Expr)>> {
             if depth > 8 {
                 return None;
@@ -2953,7 +2962,7 @@ impl<'a> Emitter<'a> {
             match &e.kind {
                 ExprKind::Var(_) => match em.ck.res[e.id as usize] {
                     Res::Local(b) if b == lv => Some(Vec::new()),
-                    Res::Local(b) => offset(em, lets.get(&b)?, lv, lets, fixed, depth + 1),
+                    Res::Local(b) => offset(em, lets.get(&b)?, lv, lets, fixed, depth + 1, rec),
                     _ => None,
                 },
                 ExprKind::Call(n, _, xs)
@@ -2961,12 +2970,14 @@ impl<'a> Emitter<'a> {
                 {
                     let (x, y) = (xs[0].expr(), xs[1].expr());
                     if fixed(y) {
-                        let mut o = offset(em, x, lv, lets, fixed, depth + 1)?;
+                        let mut o = offset(em, x, lv, lets, fixed, depth + 1, rec)?;
                         o.push((n == "+", y));
+                        rec.push((e.id, o.clone()));
                         Some(o)
                     } else if n == "+" && fixed(x) {
-                        let mut o = offset(em, y, lv, lets, fixed, depth + 1)?;
+                        let mut o = offset(em, y, lv, lets, fixed, depth + 1, rec)?;
                         o.push((true, x));
+                        rec.push((e.id, o.clone()));
                         Some(o)
                     } else {
                         None
@@ -2999,12 +3010,13 @@ impl<'a> Emitter<'a> {
         // Each access: (id, vector, offset terms, index, write?, root).
         let mut plan: Vec<(u32, &Expr, Vec<(bool, &Expr)>, &Expr, bool, BindId)> = Vec::new();
         let mut row_tests: Vec<(&Expr, &Expr)> = Vec::new();
+        let mut aff_nodes: Vec<(u32, Vec<(bool, &Expr)>)> = Vec::new();
         for (rid, v, i) in accs {
             let root = path_ok(self, v, fixed_ref, &mut row_tests)?;
             if root == lv || inner.contains(&root) || !matches!(self.ty(v), Ty::Vec(_)) {
                 return None;
             }
-            let off = offset(self, i, lv, &lets, fixed_ref, 0)?;
+            let off = offset(self, i, lv, &lets, fixed_ref, 0, &mut aff_nodes)?;
             plan.push((rid, v, off, i, writes.contains(&rid), root));
         }
         // A written vector changes only through the planned element writes, and is reached
@@ -3131,6 +3143,25 @@ impl<'a> Emitter<'a> {
             codes.push((*rid, format!("__us{k}.{get}")));
             idxs.push(*i);
         }
+        // Every `j + c` node on the way to an index stays within its type for the iterations
+        // that run fast, so the fast copy computes it without a check.
+        let mut aff_ids: HashSet<u32> = HashSet::new();
+        let mut aff_t: Vec<String> = Vec::new();
+        for (id, terms) in &aff_nodes {
+            if !aff_ids.insert(*id) {
+                continue;
+            }
+            let Ty::Int(k) = self.ck.ty[*id as usize].clone() else { continue };
+            let mut o = String::from("0i128");
+            for (plus, c) in terms {
+                o.push_str(if *plus { " + " } else { " - " });
+                o.push_str(&wide(self, c));
+            }
+            let r = k.rust();
+            aff_t.push(format!("((__flo as i128) + ({o}) >= ({r}::MIN as i128) && (__fhi as i128) - 1 + ({o}) <= ({r}::MAX as i128))"));
+        }
+        let aff_ok = if aff_t.is_empty() { String::from("true") } else { aff_t.join(" && ") };
+        let was_aff = std::mem::replace(&mut self.affine, aff_ids);
         let was = self.defer;
         self.defer = defer;
         for ((_, c), i) in codes.iter_mut().zip(idxs) {
@@ -3152,6 +3183,7 @@ impl<'a> Emitter<'a> {
             self.unchecked.insert(id, c);
         }
         let fast = self.block(body);
+        self.affine = was_aff;
         self.defer = was;
         for (id, old) in saved {
             match old {
@@ -3184,8 +3216,9 @@ impl<'a> Emitter<'a> {
             let lo_b: String = lows.iter().map(|l| format!(".max({l})")).collect();
             let hi_b: String = highs.iter().map(|h| format!(".min({h})")).collect();
             return Some(format!(
-                "{{ let __ulo: i64 = {lo}; let __uhi: i64 = {hi};                  let (__flo, __fhi): (i64, i64) = if __ulo < __uhi && {row_ok} {{ let __a = (__ulo as i128){lo_b}; let __b = (__uhi as i128){hi_b}; if __a < __b {{ (__a as i64, __b as i64) }} else {{ (__uhi, __uhi) }} }} else {{ (__uhi, __uhi) }};                  {} if __flo < __fhi {{ {fast_run} }} {} }}",
+                "{{ let __ulo: i64 = {lo}; let __uhi: i64 = {hi};                  let (__flo, __fhi): (i64, i64) = if __ulo < __uhi && {row_ok} {{ let __a = (__ulo as i128){lo_b}; let __b = (__uhi as i128){hi_b}; if __a < __b {{ (__a as i64, __b as i64) }} else {{ (__uhi, __uhi) }} }} else {{ (__uhi, __uhi) }};                  {} if __flo < __fhi {{ if {aff_ok} {{ {fast_run} }} else {{ {} }} }} {} }}",
                 slow_in("__ulo", "__flo"),
+                slow_in("__flo", "__fhi"),
                 slow_in("__fhi", "__uhi")
             ));
         }
@@ -3205,7 +3238,7 @@ impl<'a> Emitter<'a> {
             format!("{take}for {var} in __ulo..__uhi {{ let _ = unsafe {{ {fast} }}; }}")
         };
         Some(format!(
-            "{{ let __ulo: i64 = {lo}; let __uhi: i64 = {hi}; if __ulo < __uhi && {} {{ {fast_run} }} else {{ {slow_loop} }} }}",
+            "{{ let __ulo: i64 = {lo}; let __uhi: i64 = {hi}; let (__flo, __fhi) = (__ulo, __uhi); if __ulo < __uhi && {} && {aff_ok} {{ {fast_run} }} else {{ {slow_loop} }} }}",
             tests.join(" && ")
         ))
     }
