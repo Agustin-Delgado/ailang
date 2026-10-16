@@ -170,6 +170,8 @@ Effects (first argument is the capability):
 `(now-ms clock)` `(now-ns clock)` `(rand-int rng low high)` (high exclusive) `(rand-f64 rng)` `(args env)` -> `(Vec Str)`.
 `(http-next net port max-body-bytes)` -> `(Result Request Str)` waits for the next HTTP request (larger bodies
 are rejected with 400 automatically). `(http-respond net req status content-type body)` -> `(Result Unit Str)`.
+`(http-serve net port max-body-bytes state read write)` -> `(Result Unit Str)` runs a concurrent server
+forever (returns only if it cannot listen); see "Servers" below.
 
 ## Apps for the browser (games and pages)
 
@@ -191,6 +193,7 @@ Drawing (pixels as F64, colors as CSS strings): `(draw-clear g color)` `(draw-re
 ```
 (enum Json (Null) (Bool Bool) (Num F64) (Str Str) (Arr (Vec Json)) (Obj (Map Str Json)))
 (struct Request (id I64) (method Str) (path Str) (query (Map Str Str)) (headers (Map Str Str)) (body Str))
+(struct Reply (status I64) (content-type Str) (body Str))
 (enum Event (Tick F64) (KeyDown Str) (KeyUp Str) (MouseDown F64 F64) (MouseUp F64 F64) (MouseMove F64 F64)
   (Click Str) (Input Str Str) (Resize F64 F64))      ; Tick carries seconds since the last frame
 ```
@@ -208,6 +211,28 @@ Request `path` and `query` are URL-decoded; header names are lowercase. A server
   (match (str (. req method) " " (. req path))
     (case "GET /health" (try (http-respond net req 200 "text/plain" "ok")))
     (case _ (try (http-respond net req 404 "text/plain" "not found")))))
+```
+
+For real servers use `http-serve`: GET and HEAD requests go to `read`, which runs many requests at
+once and only reads the state; every other method goes to `write`, one request at a time, with the
+state as `mut`. `read` is a lambda or fn of `(req Request) (s State)` returning `Reply`; `write` must
+be the name of a fn `(params (req Request) (s (mut State))) (returns Reply)`. Neither can use
+capabilities (no printing inside handlers). A trap in `read` answers 500 and the server continues; a
+trap in `write` stops the program.
+
+```
+(struct Store (todos (Vec Str)))
+(fn read (params (req Request) (s Store)) (returns Reply)
+  (body
+    (match (. req path)
+      (case "/todos" (new Reply (status 200) (content-type "application/json") (body (json-str (. s todos)))))
+      (case _ (new Reply (status 404) (content-type "text/plain") (body "not found"))))))
+(fn write (params (req Request) (s (mut Store))) (returns Reply)
+  (body
+    (push (mut (. s todos)) (. req body))
+    (new Reply (status 201) (content-type "text/plain") (body "created"))))
+(fn main (params (net Net)) (returns (Result Unit Str))
+  (body (http-serve net 8080 65536 (new Store (todos (vec))) read write)))
 ```
 
 Other: `(fail "msg")` stops the program (type Never, fits anywhere). `(assert cond)` `(assert cond "msg")`.

@@ -396,6 +396,7 @@ pub const BUILTINS: &[&str] = &[
     "json-str",
     "http-next",
     "http-respond",
+    "http-serve",
     "read-all",
     "lines",
     "is-digit",
@@ -4050,6 +4051,63 @@ impl Checker {
                 }
                 Ty::Res(Box::new(Ty::Unit), Box::new(Ty::Str))
             }
+            "http-serve" => {
+                let reply = Ty::User("Reply".into());
+                let request = Ty::User("Request".into());
+                if let Some(rest) = self.need_cap(Cap::Net, args, nspan, span) {
+                    if rest.len() != 5 {
+                        self.err(
+                            Diag::error("E0211", span, "(http-serve net port max-body-bytes state read-handler write-handler)")
+                                .note("GET and HEAD requests go to the read handler, which runs many at once and cannot change the state")
+                                .note("every other method goes to the write handler, a fn that takes (req Request) (s (mut State)), one request at a time"),
+                        );
+                        for a in rest {
+                            let x = self.arg_val(a);
+                            self.check(x, None);
+                        }
+                    } else {
+                        for a in &rest[..2] {
+                            let x = self.arg_val(a);
+                            self.check_expect(x, &Ty::Int(IntK::I64));
+                        }
+                        let sx = self.arg_val(&rest[2]);
+                        let st = self.check(sx, None);
+                        let rf = self.arg_val(&rest[3]);
+                        let mutating = match &rf.kind {
+                            ExprKind::Var(n) if self.lookup(n).is_none() => {
+                                self.info.fns.get(n).is_some_and(|sig| sig.params.iter().any(|p| p.2))
+                            }
+                            _ => false,
+                        };
+                        if mutating {
+                            self.err(
+                                Diag::error("E0330", rf.span, "the read handler cannot change the state: GET and HEAD requests must not have side effects")
+                                    .note("pass a fn that takes (req Request) (s State) without mut; changes go in the write handler (POST, PUT, DELETE, ...)"),
+                            );
+                        } else {
+                            self.check_fn_arg(rf, &Ty::Fn(vec![request.clone(), st.clone()], Box::new(reply.clone())));
+                        }
+                        // Read handlers run on several threads at once: no effects inside.
+                        let mut caps = Vec::new();
+                        walk(rf, &mut |x| {
+                            if let (ExprKind::Var(_), Res::Local(b)) = (&x.kind, &self.res[x.id as usize]) {
+                                if let Ty::Cap(c) = self.bindings[*b].ty {
+                                    caps.push((x.span, c));
+                                }
+                            }
+                        });
+                        for (sp, c) in caps {
+                            self.err(
+                                Diag::error("E0328", sp, &format!("the read handler runs on several threads at once, so it cannot use {}", c.name()))
+                                    .note("a handler computes its Reply from the request and the state; the server sends it"),
+                            );
+                        }
+                        let wf = self.arg_val(&rest[4]);
+                        self.check_write_handler(wf, &request, &st, &reply);
+                    }
+                }
+                Ty::Res(Box::new(Ty::Unit), Box::new(Ty::Str))
+            }
             "fail" => {
                 ar!(1, "(fail \"message\")");
                 let x = self.arg_val(&args[0]);
@@ -4079,6 +4137,46 @@ impl Checker {
 
     /// The Vec and the function of a higher-order builtin: (name vec f). Catches the Lisp
     /// argument order (name f vec).
+    /// The write handler of http-serve must be a fn that takes the request and the state as
+    /// `mut`: the only place where a server changes its state, one request at a time.
+    fn check_write_handler(&mut self, x: &Expr, request: &Ty, state: &Ty, reply: &Ty) {
+        let want = format!("(fn name (params (req Request) (s (mut {state}))) (returns Reply))");
+        let ExprKind::Var(name) = &x.kind else {
+            if !matches!(x.kind, ExprKind::Lambda(..)) {
+                self.check(x, None);
+            }
+            self.err(
+                Diag::error("E0329", x.span, "the write handler must be the name of a fn")
+                    .note(format!("declare {want} and pass its name")),
+            );
+            return;
+        };
+        let Some(sig) = self.info.fns.get(name).cloned().filter(|_| self.lookup(name).is_none()) else {
+            self.check(x, None);
+            self.err(Diag::error("E0329", x.span, &format!("'{name}' is not a fn; the write handler must be {want}")));
+            return;
+        };
+        self.res[x.id as usize] = Res::UserFn(name.clone());
+        let ok = sig.params.len() == 2
+            && !sig.params[0].2
+            && Self::compat(&sig.params[0].1, request)
+            && sig.params[1].2
+            && (state.is_err() || (Self::compat(&sig.params[1].1, state) && Self::compat(state, &sig.params[1].1)))
+            && Self::compat(&sig.ret, reply);
+        if !ok {
+            let found: Vec<String> = sig
+                .params
+                .iter()
+                .map(|(n, t, m)| if *m { format!("({n} (mut {t}))") } else { format!("({n} {t})") })
+                .collect();
+            self.err(
+                Diag::error("E0329", x.span, &format!("the write handler must be {want}"))
+                    .note(format!("'{name}' takes (params {}) and returns {}", found.join(" "), sig.ret)),
+            );
+        }
+        self.set_ty(x, Ty::Unit);
+    }
+
     fn hof_head<'a>(&mut self, name: &str, args: &'a [Arg]) -> (Ty, &'a Expr) {
         let xs = self.arg_val(&args[0]);
         let f = self.arg_val(&args[1]);

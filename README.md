@@ -21,6 +21,9 @@ the first attempt?
   checked and compiled as its own copy, so there is no trait syntax and no runtime cost.
 - **Parallelism that cannot race.** `(par-map xs f)` runs on every core and returns exactly what
   `map` would: values are never shared, lambdas only read, and no effects are allowed inside.
+- **Servers where GET cannot write.** `(http-serve net port max-body state read write)` runs GET
+  handlers in parallel with read-only access to the state, and every other method one at a time
+  with `mut` access. A GET with side effects does not compile, and handlers cannot race.
 - **Effects are capabilities.** A function can print, read files or open sockets only if it was
   given that capability, and capabilities come down from `main`.
 - **No undefined behavior.** Integer overflow, out-of-bounds access and failed `expect` stop the
@@ -64,13 +67,34 @@ interleaved so that load from other programs hits both equally.
 
 ### Real HTTP server
 
-![HTTP requests per second](docs/charts/http.svg)
+![HTTP requests per second, I/O-bound](docs/charts/http.svg)
 
-The same todo REST API runs over TCP on localhost, against a hand-written Rust `std` server and
-against `axum` on `tokio`. Every request opens a new connection. The mix is 30% `POST` and 70%
-`GET`, measured for 10 s after a 2 s warmup, with zero errors. The ail program itself is
-single-threaded: the runtime accepts and parses requests on a pool of I/O threads. With that,
-ail beats the `std` server by 16 to 21% under load and stays within 2 to 4% of axum.
+![HTTP requests per second, CPU-bound](docs/charts/http_search.svg)
+
+The same todo REST API runs over TCP on localhost, against a hand-written single-threaded Rust
+`std` server and against `axum` on `tokio`, multi-threaded, with the store in an `RwLock`. Every
+request opens a new connection, and every server starts with 100,000 todos. Each cell is the best
+of two 10 s rounds after a 2 s warmup.
+
+There are two ail servers:
+
+- **`http-next` loop:** the program takes one request at a time. The runtime accepts and parses
+  requests on a pool of I/O threads.
+- **`http-serve`:** GET handlers run in parallel and only read the state. Writes run one at a time.
+  The language makes data races and side-effecting GETs impossible to write.
+
+Results:
+
+- **I/O-bound mix** (30% `POST`, 70% `GET` of 20 todos): `http-serve` does 9,530 to 10,829
+  requests/s with 8 and 64 clients, which is 1.5 to 1.8 times axum.
+- **CPU-bound mix** (90% `GET /search`, each scanning the whole store): 1,712 to 1,903 requests/s,
+  which is 1.8 to 1.9 times axum and 3.6 to 4 times the one-at-a-time ail loop.
+
+Even on one thread, ail's scan runs twice as fast as Rust's. ail's allocator keeps the small
+strings of the store contiguous, so the scan stays in cache.
+
+Two requests out of about a million failed. Both were client-side `connect` errors (Windows
+error 10055, out of socket buffers), not server errors.
 
 ### Browser game (WebAssembly)
 
@@ -180,6 +204,6 @@ target/release/ail web ../examples/dodge.ail          # build for the browser an
 ## Status
 
 ail is an early research language: v0.3 is released and v0.4 (string views, functions as
-arguments, generics, programs split across files with `(use name)`, `par-map`) is in development
-on `main`. The pieces above work and are measured. Concurrency beyond `par-map` (tasks, channels,
-parallel request handling in user code) is not built yet.
+arguments, generics, programs split across files with `(use name)`, `par-map`, concurrent servers
+with `http-serve`) is in development on `main`. The pieces above work and are measured. General
+concurrency (tasks, channels, outbound I/O while serving) is not built yet.

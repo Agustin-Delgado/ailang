@@ -161,10 +161,19 @@ mod ail_rt {
         match at { Some(a) => format!("{msg}\n  at {a}"), None => msg }
     }
 
+    // Set while a read handler of http-serve runs: a trap there answers that request with 500
+    // and the server keeps going (the handler could not have changed anything).
+    #[cfg(not(target_arch = "wasm32"))]
+    thread_local! { pub static SOFT_TRAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn init(lines: &'static [(u32, u32, u32)], file: &'static str) {
         unsafe { LINES = lines; FILE = file; }
         std::panic::set_hook(Box::new(|info| {
+            if SOFT_TRAP.with(|s| s.get()) {
+                eprintln!("trap in a read handler (answered 500): {}", describe(info));
+                return;
+            }
             flush();
             eprintln!("trap: {}", describe(info));
             std::process::exit(101);

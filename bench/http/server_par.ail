@@ -1,0 +1,127 @@
+; http — the todo API (bench/SPECS.md "api") over real HTTP: GET /todos?limit&offset, POST /todos.
+; Concurrent: GET requests run in parallel (read), POST one at a time (write). Port 8104.
+(struct Todo (id I64) (title Str) (done Bool) (tags (Vec Str)))
+(struct Store (todos (Vec Todo)) (next-id I64))
+
+(const PORT I64 8104)
+(const MAX-BODY I64 65536)
+
+(const SEED I64 100000)
+
+; The store starts with SEED todos: "task i", tags t(i mod 10) and t(i/10 mod 10).
+(fn seed (params (s (mut Store)))
+  (body
+    (for i (range 0 SEED)
+      (let t (new Todo (id (. s next-id)) (title (str "task " i))
+        (done false) (tags (vec (str "t" (% i 10)) (str "t" (% (/ i 10) 10))))))
+      (push (mut (. s todos)) t)
+      (set (. s next-id) (+ (. s next-id) 1)))))
+
+; GET /search?q=..&tag=..: how many todos have the tag and contain q in the title. Scans the
+; whole store, so it is CPU-bound.
+(fn search (params (s Store) (q Str) (tag Str)) (returns Str)
+  (body
+    (var n 0)
+    (for t (. s todos)
+      (if (and (contains (. t tags) tag) (contains (. t title) q)) (set n (+ n 1))))
+    (str "{\"count\":" n "}")))
+
+(fn query-str (params (req Request) (key Str)) (returns Str)
+  (body (unwrap-or (get (. req query) key) "")))
+
+(fn todo-json (params (t Todo)) (returns Json)
+  (body
+    (var tags (Vec Json) (vec))
+    (for tag (. t tags) (push (mut tags) (Json.Str tag)))
+    (var m (Map Str Json) (map))
+    (put (mut m) "done" (Json.Bool (. t done)))
+    (put (mut m) "id" (Json.Num (as F64 (. t id))))
+    (put (mut m) "tags" (Json.Arr tags))
+    (put (mut m) "title" (Json.Str (. t title)))
+    (Json.Obj m)))
+
+(fn error-json (params (msg Str)) (returns Str)
+  (body
+    (var m (Map Str Json) (map))
+    (put (mut m) "error" (Json.Str msg))
+    (json-str (Json.Obj m))))
+
+(fn query-int (params (req Request) (key Str) (default I64)) (returns I64)
+  (body
+    (match (get (. req query) key)
+      (case (some s) (unwrap-or (parse-i64 s) default))
+      (case none default))))
+
+(fn list-todos (params (s Store) (limit I64) (offset I64)) (returns Str)
+  (body
+    (let n (len (. s todos)))
+    (let start (min n (max 0 offset)))
+    (let end (min n (+ start (max 0 limit))))
+    (var items (Vec Json) (vec))
+    (for i (range start end)
+      (push (mut items) (todo-json (at (. s todos) i))))
+    (json-str (Json.Arr items))))
+
+(fn parse-new-todo (params (body Str)) (returns (Option Todo))
+  (body
+    (let parsed
+      (match (json-parse body)
+        (case (ok j) j)
+        (case (err _) (return none))))
+    (match parsed
+      (case (Json.Obj m)
+        (let title
+          (match (get m "title")
+            (case (some (Json.Str t)) t)
+            (case _ (return none))))
+        (var tags (Vec Str) (vec))
+        (match (get m "tags")
+          (case (some (Json.Arr items))
+            (for item items
+              (match item
+                (case (Json.Str t) (push (mut tags) t))
+                (case _ (return none)))))
+          (case _ (return none)))
+        (some (new Todo (id 0) (title title) (done false) (tags tags))))
+      (case _ none))))
+
+(fn read (params (req Request) (s Store)) (returns Reply)
+  (body
+    (match (. req path)
+      (case "/todos"
+        (new Reply (status 200) (content-type "application/json")
+          (body (list-todos s (query-int req "limit" 20) (query-int req "offset" 0)))))
+      (case "/search"
+        (new Reply (status 200) (content-type "application/json")
+          (body (search s (query-str req "q") (query-str req "tag")))))
+      (case _ (new Reply (status 404) (content-type "application/json") (body (error-json "not found")))))))
+
+(fn write (params (req Request) (s (mut Store))) (returns Reply)
+  (body
+    (if (!= (str (. req method) " " (. req path)) "POST /todos")
+      (return (new Reply (status 404) (content-type "application/json") (body (error-json "not found")))))
+    (match (parse-new-todo (. req body))
+      (case (some t)
+        (let todo (with t (id (. s next-id))))
+        (set (. s next-id) (+ (. s next-id) 1))
+        (let body (json-str (todo-json todo)))
+        (push (mut (. s todos)) todo)
+        (new Reply (status 201) (content-type "application/json") (body body)))
+      (case none (new Reply (status 400) (content-type "application/json") (body (error-json "invalid body")))))))
+
+(fn main (params (con Console) (net Net)) (returns (Result Unit Str))
+  (body
+    (println con "ail (http-serve) listening on :" PORT)
+    (var store (new Store (todos (vec)) (next-id 1)))
+    (seed (mut store))
+    (http-serve net PORT MAX-BODY store read write)))
+
+(test "create and list"
+  (assert (is-some (parse-new-todo "{\"title\":\"a\",\"tags\":[\"x\"]}")))
+  (assert (is-none (parse-new-todo "{\"title\":3,\"tags\":[]}")))
+  (assert (is-none (parse-new-todo "{\"title\":\"a\",\"tags\":[1]}")))
+  (assert (is-none (parse-new-todo "nope")))
+  (var s (new Store (todos (vec)) (next-id 1)))
+  (push (mut (. s todos)) (new Todo (id 1) (title "a") (done false) (tags (vec "t1" "t2"))))
+  (assert (== (list-todos s 20 0) "[{\"done\":false,\"id\":1,\"tags\":[\"t1\",\"t2\"],\"title\":\"a\"}]"))
+  (assert (== (list-todos s 20 5) "[]")))

@@ -1,0 +1,134 @@
+{
+ "meta": {
+  "rounds": 2,
+  "kept": "best round per server and concurrency",
+  "errors_all_rounds": 1,
+  "duration_s": 10.0,
+  "warmup_s": 2.0,
+  "mix": "10% POST /todos, 90% GET /search?q=<n mod 1000>&tag=t<n mod 10> over 100,000+ todos",
+  "connection": "new TCP connection per request, Connection: close",
+  "platform": "win32"
+ },
+ "results": [
+  {
+   "concurrency": 1,
+   "rps": 388.5,
+   "p50_us": 2569,
+   "p99_us": 4260,
+   "ok": 3885,
+   "errors": 0,
+   "server": "ail",
+   "round": 2
+  },
+  {
+   "concurrency": 1,
+   "rps": 395.5,
+   "p50_us": 2547,
+   "p99_us": 4155,
+   "ok": 3955,
+   "errors": 0,
+   "server": "ail-par",
+   "round": 1
+  },
+  {
+   "concurrency": 1,
+   "rps": 198.3,
+   "p50_us": 5289,
+   "p99_us": 8031,
+   "ok": 1983,
+   "errors": 0,
+   "server": "std",
+   "round": 1
+  },
+  {
+   "concurrency": 1,
+   "rps": 183.7,
+   "p50_us": 5778,
+   "p99_us": 8579,
+   "ok": 1837,
+   "errors": 0,
+   "server": "axum",
+   "round": 2
+  },
+  {
+   "concurrency": 8,
+   "rps": 479.3,
+   "p50_us": 16654,
+   "p99_us": 22857,
+   "ok": 4793,
+   "errors": 0,
+   "server": "ail",
+   "round": 2
+  },
+  {
+   "concurrency": 8,
+   "rps": 1712.1,
+   "p50_us": 4243,
+   "p99_us": 9280,
+   "ok": 17121,
+   "errors": 1,
+   "server": "ail-par",
+   "round": 2
+  },
+  {
+   "concurrency": 8,
+   "rps": 190.9,
+   "p50_us": 41770,
+   "p99_us": 56289,
+   "ok": 1909,
+   "errors": 0,
+   "server": "std",
+   "round": 2
+  },
+  {
+   "concurrency": 8,
+   "rps": 905.1,
+   "p50_us": 8051,
+   "p99_us": 19524,
+   "ok": 9051,
+   "errors": 0,
+   "server": "axum",
+   "round": 2
+  },
+  {
+   "concurrency": 64,
+   "rps": 467.4,
+   "p50_us": 134277,
+   "p99_us": 179080,
+   "ok": 4674,
+   "errors": 0,
+   "server": "ail",
+   "round": 1
+  },
+  {
+   "concurrency": 64,
+   "rps": 1903.1,
+   "p50_us": 27066,
+   "p99_us": 194899,
+   "ok": 19031,
+   "errors": 0,
+   "server": "ail-par",
+   "round": 2
+  },
+  {
+   "concurrency": 64,
+   "rps": 186.5,
+   "p50_us": 330109,
+   "p99_us": 373162,
+   "ok": 1865,
+   "errors": 0,
+   "server": "std",
+   "round": 1
+  },
+  {
+   "concurrency": 64,
+   "rps": 1039.9,
+   "p50_us": 59024,
+   "p99_us": 128496,
+   "ok": 10399,
+   "errors": 0,
+   "server": "axum",
+   "round": 1
+  }
+ ]
+}

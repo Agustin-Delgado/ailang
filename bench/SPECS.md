@@ -197,12 +197,17 @@ Output: `checksum <sum of all channel values of all pixels>` and `center <r> <g>
 
 The todo API from `api`, but only `GET /todos?limit=<l>&offset=<o>` and `POST /todos` (body
 `{"title":"...","tags":[...]}`), served over real TCP on localhost, `Connection: close` (one request per
-connection), max body 65536 bytes. Implementations:
-- ail: `bench/http/server.ail` (`http-next` / `http-respond`, single-threaded like every ail program today).
-- Rust std: `std::net::TcpListener`, single-threaded, same architecture as ail (the like-for-like comparison).
-- Rust axum + tokio, multi-threaded (the reference a Rust developer would actually deploy).
-Load generator (Rust, `bench/http/loadgen`): C concurrent clients for a fixed duration; each request
-is POST with probability 0.3 else GET with limit 20 and offset 0; reports requests/s, p50 and p99 latency.
+connection), max body 65536 bytes. Every server starts with 100,000 seeded todos: todo `i` (0-based)
+has id `i + 1`, title `task <i>` and tags `t<i mod 10>`, `t<(i / 10) mod 10>`. A third route,
+`GET /search?q=<q>&tag=<tag>`, answers `{"count":N}`, where N is the number of todos that have the tag
+and contain `q` in the title: it scans the whole store, so it is CPU-bound. Implementations:
+- ail: `bench/http/server.ail` (`http-next` / `http-respond` loop: handlers one at a time).
+- ail: `bench/http/server_par.ail` (`http-serve`: GET handlers in parallel, POST one at a time).
+- Rust std: `std::net::TcpListener`, single-threaded.
+- Rust axum + tokio, multi-threaded, store in an `RwLock` (the reference a Rust developer would deploy).
+Load generator (Rust, `bench/http/loadgen`): C concurrent clients for a fixed duration; reports
+requests/s, p50 and p99 latency. Mix `todos`: POST with probability 0.3, else GET /todos with limit 20
+and offset 0. Mix `search`: POST with probability 0.1, else `GET /search?q=<n mod 1000>&tag=t<n mod 10>`.
 
 ## interp — bytecode interpreter (enum dispatch in a hot loop)
 

@@ -1,6 +1,6 @@
 """Render the benchmark charts used by the top-level README.
 
-Reads bench/results.json, bench/http/results.json and bench/web/results.txt, and writes SVGs to
+Reads bench/results.json, bench/http/results*.json and bench/web/results.txt, and writes SVGs to
 docs/charts/. Run from anywhere: python bench/charts.py
 """
 import json
@@ -63,26 +63,36 @@ def native():
     save(fig, "native.svg")
 
 
-def http():
-    data = json.loads((ROOT / "bench" / "http" / "results.json").read_text())["results"]
-    servers = [("ail", "ail", AIL), ("std", "Rust std", RUST), ("axum", "Rust axum + tokio", AXUM)]
+def http_chart(results, out, title):
+    data = json.loads((ROOT / "bench" / "http" / results).read_text())["results"]
+    servers = [("ail-par", "ail http-serve", AIL), ("ail", "ail http-next loop", "#8fb3ef"),
+               ("axum", "Rust axum + tokio", AXUM), ("std", "Rust std, 1 thread", RUST)]
     conc = sorted({r["concurrency"] for r in data})
     rps = {(r["server"], r["concurrency"]): r["rps"] for r in data}
+    servers = [s for s in servers if (s[0], conc[0]) in rps]
 
     fig, ax = plt.subplots(figsize=(8.5, 4.4))
-    width = 0.26
+    width = 0.8 / len(servers)
+    top = max(rps.values())
     for i, (key, label, color) in enumerate(servers):
-        xs = [c + (i - 1) * width for c in range(len(conc))]
+        xs = [c + (i - (len(servers) - 1) / 2) * width for c in range(len(conc))]
         vals = [rps[(key, c)] for c in conc]
         bars = ax.bar(xs, vals, width, label=label, color=color)
         for b, v in zip(bars, vals):
-            ax.text(b.get_x() + b.get_width() / 2, v + 60, f"{v:,.0f}", ha="center", fontsize=8.5)
+            ax.text(b.get_x() + b.get_width() / 2, v + top * 0.012, f"{v:,.0f}", ha="center", fontsize=7.5)
     ax.set_xticks(range(len(conc)))
     ax.set_xticklabels([f"{c} client{'s' if c > 1 else ''}" for c in conc])
     ax.set_ylabel("requests / second (higher is better)")
-    ax.set_title("Real HTTP server: todo REST API over TCP, 0 errors", fontsize=12, loc="left")
-    ax.legend(frameon=False, loc="upper left")
-    save(fig, "http.svg")
+    ax.set_title(title, fontsize=12, loc="left")
+    ax.legend(frameon=False, loc="upper left", fontsize=9)
+    save(fig, out)
+
+
+def http():
+    http_chart("results.json", "http.svg",
+               "Real HTTP server, I/O-bound: todo REST API over TCP\n30% POST, 70% GET of 20 todos")
+    http_chart("results_search.json", "http_search.svg",
+               "Real HTTP server, CPU-bound: every GET scans 100,000 todos\n10% POST, 90% GET /search")
 
 
 def web():

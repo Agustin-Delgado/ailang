@@ -1,10 +1,11 @@
 //! HTTP load generator for bench/http.
 //!
-//! usage: loadgen <port> <concurrency> [duration_s=10] [warmup_s=2]
+//! usage: loadgen <port> <concurrency> [duration_s=10] [warmup_s=2] [mix=todos|search]
 //!
 //! C client threads, each in a closed loop: open a fresh TCP connection, send one request with
 //! `Connection: close`, read the response to EOF, verify the status, close. 30% POST /todos with a
-//! small body, 70% GET /todos?limit=20&offset=0. Only requests that *start* after the warmup and
+//! small body, 70% GET /todos?limit=20&offset=0. Mix "search" is CPU-bound instead: 10% POST, 90%
+//! GET /search?q=<n mod 1000>&tag=t<n mod 10>, each of which scans the whole store. Only requests that *start* after the warmup and
 //! *finish* before the deadline are counted. The client closes with SO_LINGER=0 (RST) so the
 //! ephemeral port range is not exhausted by TIME_WAIT sockets over many back-to-back runs.
 //! Prints one JSON line: {"rps":..,"p50_us":..,"p99_us":..,"ok":..,"errors":..}.
@@ -38,13 +39,15 @@ fn connect(addr: &SocketAddr) -> std::io::Result<TcpStream> {
 }
 
 /// Sends one request on a fresh connection; returns Ok(()) if the status and body shape are right.
-fn one_request(addr: &SocketAddr, port: u16, post: bool, n: u64, buf: &mut Vec<u8>) -> Result<(), String> {
+fn one_request(addr: &SocketAddr, port: u16, post: bool, search: bool, n: u64, buf: &mut Vec<u8>) -> Result<(), String> {
     let req = if post {
         let body = format!(r#"{{"title":"task {n}","tags":["t{}","t{}"]}}"#, n % 10, (n / 10) % 10);
         format!(
             "POST /todos HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    } else if search {
+        format!("GET /search?q={}&tag=t{} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n", n % 1000, n % 10)
     } else {
         format!("GET /todos?limit=20&offset=0 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
     };
@@ -58,7 +61,13 @@ fn one_request(addr: &SocketAddr, port: u16, post: bool, n: u64, buf: &mut Vec<u
         return Err(format!("unexpected status line: {:?}", text.lines().next().unwrap_or("")));
     }
     let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
-    let ok_shape = if post { body.starts_with("{\"done\":false,\"id\":") } else { body.starts_with('[') && body.ends_with(']') };
+    let ok_shape = if post {
+        body.starts_with("{\"done\":false,\"id\":")
+    } else if search {
+        body.starts_with("{\"count\":") && body.ends_with('}')
+    } else {
+        body.starts_with('[') && body.ends_with(']')
+    };
     if !ok_shape {
         return Err(format!("unexpected body: {:?}", &body[..body.len().min(80)]));
     }
@@ -75,6 +84,11 @@ fn main() {
     let conc: usize = args[2].parse().expect("concurrency");
     let duration = Duration::from_secs_f64(args.get(3).map_or(10.0, |s| s.parse().expect("duration")));
     let warmup = Duration::from_secs_f64(args.get(4).map_or(2.0, |s| s.parse().expect("warmup")));
+    let search = match args.get(5).map(String::as_str) {
+        None | Some("todos") => false,
+        Some("search") => true,
+        Some(m) => panic!("unknown mix {m}"),
+    };
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
     let start = Instant::now();
@@ -97,8 +111,8 @@ fn main() {
                         break;
                     }
                     let r = rng.next();
-                    let post = r % 100 < 30;
-                    let res = one_request(&addr, port, post, r >> 8, &mut buf);
+                    let post = r % 100 < if search { 10 } else { 30 };
+                    let res = one_request(&addr, port, post, search, r >> 8, &mut buf);
                     let t1 = Instant::now();
                     let counted = t0 >= measure_from && t1 <= deadline;
                     match res {
