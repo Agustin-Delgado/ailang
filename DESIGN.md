@@ -63,7 +63,11 @@ machine lines to source lines that is read only when a trap happens.
 - Small allocations come from a size-class allocator with per-class free lists.
 - Output is buffered and flushed at exit, before reading input, and on traps.
 - Overflow and bounds checks stay on; they are the price of having no UB and are measured in the
-  benchmarks as such.
+  benchmarks as such. In an innermost loop whose vector indices are `j + c`, one test before the
+  loop finds the iterations where every access is in range; those run without bounds checks and
+  the edges run checked. If that loop only computes, its integer operations record overflow in a
+  flag instead of branching, so LLVM can vectorize it; on overflow that part runs again checked
+  and traps where it would have.
 
 ## 7. Strings are values, read in place
 
@@ -112,6 +116,30 @@ in flight, results in order. Its function may use Net, Fs, Clock and Env, becaus
 not depend on which thread runs first. Console and Rand stay out: output would interleave and the
 random sequence would depend on timing. `http-request` keeps connections alive and reuses them,
 so fanning out to a service costs one handshake per connection, not per request.
+
+### Loops that parallelize themselves
+
+Models rarely ask for parallelism unless the task mentions cores; they write a plain `for`. Since
+values are never shared and effects are capabilities, the compiler can see what an iteration
+touches outside itself, and when the iterations are independent it runs the loop in chunks on the
+thread pool, with no change to the program:
+
+- variables declared in the body are private to the iteration;
+- `(set x (+ x e))` on an outside integer is summed privately per chunk; the total is taken only
+  if the magnitudes of the terms prove that no partial sum, in program order, could have
+  overflowed (otherwise the loop runs sequentially); the same for elements of a vector (a
+  histogram) and for sums modulo a constant;
+- a running maximum or minimum with its position (`(if (> e best) (do (set best e) (set at i)))`)
+  combines chunk by chunk in order, so ties resolve as in the sequential loop;
+- an outside variable that the body only assigns takes the value of the last assignment;
+- `(set (at v k) x)` is allowed when each iteration writes its own elements: `k` is the loop index,
+  or `i * w + j` with `j` from an inner range no wider than `w` (checked before the loop);
+- a scratch vector that every iteration overwrites before reading gets one copy per chunk;
+- `push` and `print` collect per chunk and are appended in iteration order.
+
+If any chunk traps, the parallel run is thrown away and the loop runs again sequentially, so the
+output and the trap are exactly the sequential ones. A loop that already uses `par-map` keeps that
+parallelism, and loops inside a parallel one stay sequential.
 
 ## 11. Servers: reads in parallel, writes alone
 

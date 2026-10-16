@@ -453,7 +453,9 @@ fn main() -> ExitCode {
             if !opts.json {
                 report(&f.warnings, &src, &srcs, false);
             }
-            let mode = if cmd == "test" {
+            // `emit` of a file with tests and no main shows the test build.
+            let test_file = !f.ck.info.fns.contains_key("main") && f.prog.items.iter().any(|i| matches!(i, ast::Item::Test(_)));
+            let mode = if cmd == "test" || (cmd == "emit" && test_file) {
                 emit_rust::Mode::Test
             } else if opts.web {
                 if !f.ck.info.fns.contains_key("init") {

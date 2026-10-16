@@ -162,6 +162,14 @@ depends on timing; lambdas cannot change variables, so there are no data races t
 `(par-run v f)` is the same for work that waits on I/O (requests to other services, files): up to 64
 elements at once, results in order. Its function may use Net, Fs, Clock and Env, but not Console or
 Rand: print after it returns.
+A plain `for` loop whose iterations are independent also runs on all cores, with no change to the
+program: the body may compute with its own variables, add to an outside integer (`(set total (+ total
+x))`, also modulo a constant), add to elements of an outside vector (a histogram), keep a running
+maximum or minimum with its position, assign an outside variable it never reads, write `(at v i)`
+for the loop's own index `i` (also `(+ (* i width) j)` over a row), use a scratch vector it fills
+completely at the start of each iteration, `push`, and print. The result, the output order and any
+trap are exactly those of the sequential loop. Write the simple loop; use `par-map` when the work
+is already shaped as a list of independent items.
 
 Option/Result: `(some x)` `none` `(ok x)` `(err e)` `(unwrap-or o default)` `(expect o "msg")`
 `(is-some o)` `(is-none o)` `(is-ok r)` `(is-err r)`.

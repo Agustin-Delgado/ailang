@@ -156,3 +156,60 @@ What the run showed:
    segments that fit in cache; its ail uses 2 MB ones. In matmul, Rust sums `u64` products with
    unchecked arithmetic that LLVM vectorizes; ail checks every `*` and `+`, and the model wrote the
    inner loop as a `while`.
+
+## Run r5: the code models write when nobody mentions cores (2026-10-17)
+
+r4 told the models that the machine has 12 cores, and they answered with threads in Rust and
+`par-map` in ail. r5 asks what they write without that hint: the same seven tasks and hidden tests,
+with the performance note reduced to "the program is timed on one input at the limits stated
+here". Opus and Sonnet wrote each task once in ail and Rust, with no compiling and no testing.
+
+**Correctness: 27 of 28.** Every Rust program and 13 of 14 ail programs passed every hidden test.
+The miss: Sonnet named a variable `as`, which is an ail keyword, so the program did not compile.
+
+**What they wrote:** no Rust program uses threads. Two ail programs (Opus's matmul and primes)
+use `par-map`; the rest are plain loops.
+
+**Speed:** ail time divided by the Rust time of the same model and task, best of 3 interleaved
+runs. Same programs in both columns; only the ail compiler changes. The second column is the
+compiler that parallelizes independent `for` loops on its own (see DESIGN.md, "Loops that
+parallelize themselves"), splits loop ranges into checked edges and an unchecked middle, and
+defers overflow checks in innermost loops that only compute.
+
+| model | task | before | automatic parallel loops |
+|---|---|---|---|
+| Opus | bigrams | 1.25 | 0.98 |
+| Opus | collatz | 1.42 | 1.54 |
+| Opus | heat | 5.04 | 1.33 |
+| Opus | kmeans | 1.47 | 0.38 |
+| Opus | matmul | 0.65 | 0.57 |
+| Opus | paths | 1.42 | 1.28 |
+| Opus | primes | 0.23 | 0.26 |
+| Sonnet | bigrams | 1.46 | 1.41 |
+| Sonnet | heat | 5.25 | 1.30 |
+| Sonnet | kmeans | 1.31 | 0.42 |
+| Sonnet | matmul | 2.02 | 0.58 |
+| Sonnet | paths | 1.25 | 1.85 |
+| Sonnet | primes | 0.84 | 0.52 |
+| | **geometric mean** | **1.37** | **0.81** |
+
+The machine was busier during the second column, so absolute times rose for both languages; the
+ratios are interleaved and hold. Runs of 0.1 to 0.3 s (paths, collatz) move by a few tenths.
+
+What the run showed:
+
+1. **Without the hint, the Rust is sequential, and so is most of the ail.** That is where
+   automatic parallelism pays: kmeans (a histogram and a running minimum per point) and Sonnet's
+   matmul (a scratch row reused across iterations) now run on every core without a change to the
+   source, and are 1.7 to 2.6 times faster than the Rust.
+2. **The losses that remain are sequential by nature.** paths is a dynamic program where each cell
+   needs its left neighbor; collatz fills a table where each entry needs a smaller one; bigrams
+   builds a hash map word by word. Here ail is 1 to 1.9 times slower than Rust: checked
+   arithmetic, 64-bit values where the Rust uses `u32`, and per-line strings.
+3. **heat is limited by memory, not arithmetic.** The Rust stores the grid as `u32` and reads half
+   the bytes ail's `I64` grid needs. Parallel rows cut ail from 5 times slower to 1.3.
+4. **An explicit `par-map` keeps priority.** The first version also parallelized the loop over
+   queries around Opus's `par-map` over segments, which made the inner `par-map` sequential and
+   primes 3.5 times slower. Loops whose body uses `par-map` (directly or through a function) now
+   stay sequential.
+

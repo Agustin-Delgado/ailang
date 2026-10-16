@@ -32,6 +32,39 @@ pub struct Emitter<'a> {
     /// `(at v i)` calls proven in range before the loop that contains them: id -> the element,
     /// read without a bounds check (see `for_unchecked`).
     unchecked: HashMap<u32, String>,
+    /// Emitting the fast copy of a loop whose integer arithmetic records overflow in `__of`
+    /// instead of trapping (see `for_unchecked`).
+    defer: bool,
+    /// Emitting the body of a loop that runs in parallel chunks (see `for_par`).
+    in_par: bool,
+    /// Statements of a parallel body emitted differently: update id -> what to emit.
+    par_hooks: HashMap<u32, ParHook>,
+    /// Vectors a parallel loop writes from several threads: root -> its `SharedSlice`.
+    par_shared: HashMap<BindId, String>,
+    /// Set while emitting the sequential copy of a loop that has a parallel one: loops inside
+    /// it stay sequential (the outer loop already is the parallel one, and the code stays small).
+    no_par: bool,
+    /// Fns that loop, directly or through the fns they call, or call themselves: a loop body
+    /// calling one is worth spreading even over few iterations.
+    heavy_fns: HashSet<String>,
+    /// Fns that use par-map, directly or through the fns they call.
+    par_fns: HashSet<String>,
+}
+
+/// How a statement of a parallel loop body is emitted (see `for_par`).
+#[derive(Clone)]
+enum ParHook {
+    /// `(set x (+ x e))`: add to the chunk's private sum and to its magnitude bound.
+    Sum(String),
+    /// `(set (at h k) (+ (at h k) e))`: the same on the chunk's private copy of `h`.
+    Hist(String),
+    /// The `if` of a running maximum or minimum: also note that it fired.
+    Flag(String),
+    /// `(set x (% (+ x e) m))`: a sum modulo `m` on the chunk's private copy; notes the
+    /// largest term and any negative one (then the parallel result would differ).
+    ModSum(String),
+    /// A plain `(set x v)` of a variable the body never reads: note that it happened.
+    Last(String),
 }
 
 struct StructName {
@@ -126,8 +159,17 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, file_lines: &[u
         subst: HashMap::new(),
         epoch: 0,
         unchecked: HashMap::new(),
+        defer: false,
+        in_par: false,
+        par_hooks: HashMap::new(),
+        par_shared: HashMap::new(),
+        no_par: false,
+        heavy_fns: HashSet::new(),
+        par_fns: HashSet::new(),
     };
     em.infer_view_fns(prog);
+    em.heavy_fns = fns_reaching(prog, |e| matches!(e.kind, ExprKind::For(..) | ExprKind::While(..)), true);
+    em.par_fns = fns_reaching(prog, |e| matches!(&e.kind, ExprKind::Call(n, _, _) if n == "par-map" || n == "par-run"), false);
     let mut out = String::new();
     out.push_str("#![allow(warnings)]\n#![allow(unconditional_panic, arithmetic_overflow)]\n");
     for it in &prog.items {
@@ -911,12 +953,22 @@ impl<'a> Emitter<'a> {
             },
             ExprKind::Let { .. } => format!("{{ {} }}", self.block(std::slice::from_ref(e))),
             ExprKind::Set(place, value) => {
+                if let Some(h) = self.par_hooks.get(&e.id).cloned() {
+                    return self.par_update(h, place, value);
+                }
                 if let Some(code) = self.append_in_place(place, value) {
                     return code;
                 }
                 let v = self.val(value);
                 let p = self.place(place).expect("checked place");
                 format!("{{ let __v = {v}; {p} = __v; }}")
+            }
+            ExprKind::If(c, th, el) if matches!(self.par_hooks.get(&e.id), Some(ParHook::Flag(_))) => {
+                let Some(ParHook::Flag(flag)) = self.par_hooks.get(&e.id).cloned() else { unreachable!() };
+                let _ = el;
+                let c = self.val(c);
+                let tb = self.block_as(std::slice::from_ref(th), true);
+                format!("if {c} {{ let _ = {tb}; {flag} = true; }}")
             }
             ExprKind::If(c, th, el) => {
                 let c = self.val(c);
@@ -939,23 +991,15 @@ impl<'a> Emitter<'a> {
             ExprKind::For(_, _, it, body) => {
                 let b = self.ck.decl[&id];
                 let var = self.local_name(&self.ck.bindings[b].name);
+                if !self.in_par && !self.defer && !self.no_par {
+                    if let Some(code) = self.for_par(b, &var, e, it, body) {
+                        return code;
+                    }
+                }
                 if let ForIter::Range(a, z) = it {
-                    // Bounds evaluated once, as Rust's a..z would; vectors the body pushes to on
-                    // every iteration get their room up front.
                     let lo = self.val(a);
                     let hi = self.val(z);
-                    let mut pre = format!("let __rlo: i64 = {lo}; let __rhi: i64 = {hi}; ");
-                    for p in self.push_targets(body) {
-                        pre.push_str(&format!("if __rhi > __rlo {{ let _ = {p}.try_reserve(((__rhi - __rlo) as u64).min(1 << 22) as usize); }} "));
-                    }
-                    let lp = match self.for_unchecked(b, &var, "__rlo", "__rhi", a, body) {
-                        Some(code) => code,
-                        None => {
-                            let bd = self.block(body);
-                            format!("for {var} in __rlo..__rhi {{ let _ = {bd}; }}")
-                        }
-                    };
-                    return format!("{{ {pre}{lp} }}");
+                    return self.for_range_seq(b, &var, &lo, &hi, a, body);
                 }
                 let head = match it {
                     ForIter::Range(a, z) => {
@@ -1298,6 +1342,11 @@ impl<'a> Emitter<'a> {
         let t = self.ty(e).clone();
         let a = |i: usize| args[i].expr();
         let at = |s: &Self, i: usize| s.ty(args[i].expr()).clone();
+        if self.defer && t.is_int() {
+            if let Some(code) = self.deferred(name, &t, args) {
+                return code;
+            }
+        }
         match name {
             "+" | "*" => {
                 let parts: Vec<String> = args.iter().map(|x| self.val(x.expr())).collect();
@@ -1373,6 +1422,11 @@ impl<'a> Emitter<'a> {
             }
             "atan2" => format!("({}).atan2({})", self.val(a(0)), self.val(a(1))),
             "str" => self.format(args),
+            "print" | "println" if self.in_par => {
+                let f = self.format(&args[1..]);
+                let nl = if name == "println" { " __pout.push('\\n');" } else { "" };
+                format!("{{ __pout.push_str(&{f});{nl} }}")
+            }
             "print" | "println" | "eprintln" => {
                 let f = self.format(&args[1..]);
                 format!("ail_rt::{}(&{f})", name)
@@ -1904,33 +1958,961 @@ impl<'a> Emitter<'a> {
         out
     }
 
-    /// An innermost `(for j (range a b) ...)` whose `(at v i)` reads all have an index `j`,
-    /// `j + c` or `j - c` (c fixed during the loop) on a Vec the loop does not change: one test
-    /// before the loop shows every index in range, and then the loop runs without bounds checks
-    /// (so LLVM can also vectorize it). If the test fails, the ordinary checked loop runs and
-    /// traps exactly where it would have.
-    fn for_unchecked(&mut self, lv: BindId, var: &str, lo: &str, hi: &str, a: &Expr, body: &[Expr]) -> Option<String> {
-        let mut nested = false;
-        let mut reads: Vec<(u32, &Expr, &Expr)> = Vec::new();
+    /// `(for v (range lo hi) body)` run in order on this thread; `lo` and `hi` are code.
+    fn for_range_seq(&mut self, b: BindId, var: &str, lo: &str, hi: &str, a: &Expr, body: &[Expr]) -> String {
+        // Bounds evaluated once, as Rust's a..z would; vectors the body pushes to on every
+        // iteration get their room up front.
+        let mut pre = format!("let __rlo: i64 = {lo}; let __rhi: i64 = {hi}; ");
+        for p in self.push_targets(body) {
+            pre.push_str(&format!("if __rhi > __rlo {{ let _ = {p}.try_reserve(((__rhi - __rlo) as u64).min(1 << 22) as usize); }} "));
+        }
+        let lp = match self.for_unchecked(b, var, "__rlo", "__rhi", a, body) {
+            Some(code) => code,
+            None => {
+                let bd = self.block(body);
+                format!("for {var} in __rlo..__rhi {{ let _ = {bd}; }}")
+            }
+        };
+        format!("{{ {pre}{lp} }}")
+    }
+
+    /// A statement of a parallel body that updates a private accumulator.
+    fn par_update(&mut self, h: ParHook, place: &Expr, value: &Expr) -> String {
+        if let ParHook::Last(flag) = &h {
+            let v = self.val(value);
+            let pl = self.place(place).unwrap();
+            return format!("{{ let __v = {v}; {pl} = __v; {flag} = true; }}");
+        }
+        let ExprKind::Call(op, _, xs) = &value.kind else { unreachable!("parallel update") };
+        match h {
+            ParHook::Sum(abs) => {
+                let x = self.root_of(place).unwrap();
+                let pl = self.place(place).unwrap();
+                // The terms other than the accumulator itself.
+                let mut terms = Vec::new();
+                let mut skipped = false;
+                for a in xs {
+                    let is_x = !skipped
+                        && matches!((&a.expr().kind, &self.ck.res[a.expr().id as usize]), (ExprKind::Var(_), Res::Local(b)) if *b == x);
+                    if is_x {
+                        skipped = true;
+                    } else {
+                        terms.push(self.val(a.expr()));
+                    }
+                }
+                let e = terms.join(" + ");
+                let sign = if op == "-" { "-" } else { "+" };
+                format!("{{ let __e = {e}; {abs} = {abs}.saturating_add(ail_rt::UAbs::uabs(__e)); {pl} = {pl} {sign} __e; }}")
+            }
+            ParHook::Hist(abs) => {
+                let ExprKind::Call(_, _, pa) = &place.kind else { unreachable!() };
+                let k = self.val(pa[1].expr());
+                let base = self.place(pa[0].expr()).unwrap();
+                let at_src = self.src_of(place).to_string();
+                let mut terms = Vec::new();
+                let mut skipped = false;
+                for a in xs {
+                    if !skipped && self.src_of(a.expr()) == at_src {
+                        skipped = true;
+                    } else {
+                        terms.push(self.val(a.expr()));
+                    }
+                }
+                let e = terms.join(" + ");
+                format!(
+                    "{{ let __k = ail_rt::ix({k}); let __e = {e}; {abs} = {abs}.saturating_add(ail_rt::UAbs::uabs(__e)); {base}[__k] = {base}[__k] + __e; }}"
+                )
+            }
+            ParHook::ModSum(k) => {
+                let ExprKind::Call(_, _, ys) = &xs[0].expr().kind else { unreachable!() };
+                let x = self.root_of(place).unwrap();
+                let pl = self.place(place).unwrap();
+                let m = self.val(xs[1].expr());
+                let mut terms = Vec::new();
+                let mut skipped = false;
+                for a in ys {
+                    let is_x = !skipped
+                        && matches!((&a.expr().kind, &self.ck.res[a.expr().id as usize]), (ExprKind::Var(_), Res::Local(b)) if *b == x);
+                    if is_x {
+                        skipped = true;
+                    } else {
+                        terms.push(self.val(a.expr()));
+                    }
+                }
+                let e = terms.join(" + ");
+                format!(
+                    "{{ let __e = {e}; if __e < 0 {{ __neg{k} = true; }} if __e > __mx{k} {{ __mx{k} = __e; }} {pl} = ({pl} + __e) % {m}; }}"
+                )
+            }
+            ParHook::Last(flag) => {
+                let v = self.val(value);
+                let pl = self.place(place).unwrap();
+                format!("{{ let __v = {v}; {pl} = __v; {flag} = true; }}")
+            }
+            ParHook::Flag(_) => unreachable!("flag hooks are on ifs"),
+        }
+    }
+
+    /// A `(for v (range lo hi) ...)` whose iterations are independent, run in parallel chunks.
+    /// The body may read anything; besides its own variables it may only
+    /// - add to an integer variable: `(set x (+ x e))` (each chunk sums privately; the total is
+    ///   used only if the sizes of the terms prove that no partial sum in program order could
+    ///   have overflowed, else the loop runs sequentially),
+    /// - add to elements of an integer vector the same way, a histogram,
+    /// - keep a running maximum or minimum: `(if (> e m) (do (set m e) (set at i)))`,
+    /// - write elements `(at v k)` where `k` is `i`, or `i * s + j` with `j` from an inner
+    ///   `(range a b)` and `b - a <= s` (checked before the loop), and not read `v`,
+    /// - push to a vector, and print to the console (both kept in iteration order).
+    /// Chunks run on the thread pool and combine in order, so the result is the sequential one.
+    /// A trap in any chunk discards the parallel run and the loop runs again sequentially,
+    /// trapping where the program order says.
+    fn for_par(&mut self, lv: BindId, var: &str, whole: &Expr, it: &ForIter, body: &[Expr]) -> Option<String> {
+        // Over a range, the loop variable is an index; over the elements of a vector (or the
+        // lines or pieces of a string, collected first), it is the element.
+        let (range, each): (Option<(&Expr, &Expr)>, Option<&Expr>) = match it {
+            ForIter::Range(a, z) => (Some((a, z)), None),
+            ForIter::Each(v) => (None, Some(v)),
+        };
+        if let Some(v) = each {
+            let ok = match &v.kind {
+                ExprKind::Call(n, _, args) if (n == "lines" && args.len() == 1) || (n == "split" && args.len() == 2) => {
+                    matches!(self.ck.res.get(v.id as usize), Some(Res::Builtin(_)))
+                        && self.place(args[0].expr()).is_some()
+                        && args.iter().skip(1).all(|x| matches!(x.expr().kind, ExprKind::Str(_)))
+                        && !self.body_mutates(body, args[0].expr())
+                }
+                _ => matches!(self.ty(v), Ty::Vec(_)) && self.place(v).is_some() && !self.body_mutates(body, v),
+            };
+            if !ok {
+                return None;
+            }
+        }
+        // Everything declared inside the body, `let`s to look through, inner range loops.
+        let mut inner: HashSet<BindId> = HashSet::new();
+        let mut lets: HashMap<BindId, &Expr> = HashMap::new();
+        let mut ranges: HashMap<BindId, (&Expr, &Expr)> = HashMap::new();
+        let mut heavy = false;
+        let mut bad = false;
+        let mut prints = false;
+        let mut cap_ok: HashSet<u32> = HashSet::new();
+        for x in body {
+            walk_ref(x, &mut |e| {
+                if let Some(b) = self.ck.decl.get(&(e.id as usize)) {
+                    inner.insert(*b);
+                    if let ExprKind::Let { mutable: false, value, .. } = &e.kind {
+                        lets.insert(*b, value);
+                    }
+                    if let ExprKind::For(_, _, ForIter::Range(lo, hi), _) = &e.kind {
+                        ranges.insert(*b, (lo, hi));
+                    }
+                }
+                match &e.kind {
+                    ExprKind::For(..) | ExprKind::While(..) => heavy = true,
+                    ExprKind::Return(_) | ExprKind::Try(_) | ExprKind::Tasks(..) => bad = true,
+                    ExprKind::Match(_, arms) => {
+                        for arm in arms {
+                            pat_binds(&arm.pat, self.ck, self.epoch, &mut inner);
+                        }
+                    }
+                    ExprKind::Call(n, _, args) => match self.ck.res.get(e.id as usize) {
+                        Some(Res::UserFn(f)) => {
+                            heavy |= self.heavy_fns.contains(f) || !self.ck.info.fns.contains_key(f);
+                            bad |= self.par_fns.contains(f);
+                        }
+                        Some(Res::LocalFn(_)) => bad = true,
+                        Some(Res::Builtin(_)) => match n.as_str() {
+                            "print" | "println" => {
+                                prints = true;
+                                if matches!(self.ty(args[0].expr()), Ty::Cap(crate::types::Cap::Console)) {
+                                    cap_ok.insert(args[0].expr().id);
+                                }
+                            }
+                            // The body already spreads its work: keep that parallelism.
+                            "par-map" => bad = true,
+                            "sort-by" | "map" | "filter" => heavy = true,
+                            "par-run" | "http-serve" | "http-request" | "send" | "recv" | "eprintln" => bad = true,
+                            _ => {}
+                        },
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            });
+        }
+        if bad || breaks_out(body) {
+            return None;
+        }
+        // Scratch variables: from outside the body, but every iteration overwrites them before
+        // reading them, with `(set v ...)` or `(for j (range 0 n) (set (at v j) x))` where n is
+        // the length of v (checked before the loop). Each chunk then works on its own copy.
+        let mut scratch: Vec<(BindId, Option<(&Expr, &Expr)>)> = Vec::new();
+        {
+            let locals_in = |e: &Expr| {
+                let mut out = HashSet::new();
+                walk_ref(e, &mut |x| {
+                    if let (ExprKind::Var(_), Some(Res::Local(b))) = (&x.kind, self.ck.res.get(x.id as usize)) {
+                        out.insert(*b);
+                    }
+                });
+                out
+            };
+            let is_len_of = |e: &Expr, v: BindId| {
+                matches!(&e.kind, ExprKind::Call(n, _, xs) if n == "len" && xs.len() == 1
+                    && matches!((&xs[0].expr().kind, self.ck.res.get(xs[0].expr().id as usize)), (ExprKind::Var(_), Some(Res::Local(b))) if *b == v))
+            };
+            let mut before: HashSet<BindId> = HashSet::new();
+            for st in body {
+                let refs = locals_in(st);
+                match &st.kind {
+                    ExprKind::Set(pl, v) => {
+                        if let (ExprKind::Var(_), Some(Res::Local(b))) = (&pl.kind, self.ck.res.get(pl.id as usize)) {
+                            if !inner.contains(b) && *b != lv && !before.contains(b) && !locals_in(v).contains(b) {
+                                scratch.push((*b, None));
+                            }
+                        }
+                    }
+                    ExprKind::For(_, _, ForIter::Range(flo, fhi), fb) if fb.len() == 1 => {
+                        let j = self.ck.decl.get(&(st.id as usize)).copied();
+                        if let ExprKind::Set(pl, x) = &fb[0].kind {
+                            if let ExprKind::Call(n, _, pa) = &pl.kind {
+                                let v = match (&pa[0].expr().kind, self.ck.res.get(pa[0].expr().id as usize)) {
+                                    (ExprKind::Var(_), Some(Res::Local(b))) => Some(*b),
+                                    _ => None,
+                                };
+                                let jx = match (&pa[1].expr().kind, self.ck.res.get(pa[1].expr().id as usize)) {
+                                    (ExprKind::Var(_), Some(Res::Local(b))) => Some(*b),
+                                    _ => None,
+                                };
+                                if let (Some(v), Some(_)) = (v, j) {
+                                    if n == "at"
+                                        && jx == j
+                                        && !inner.contains(&v)
+                                        && v != lv
+                                        && !before.contains(&v)
+                                        && !locals_in(x).contains(&v)
+                                        && !locals_in(flo).contains(&v)
+                                        && (!locals_in(fhi).contains(&v) || is_len_of(fhi, v))
+                                    {
+                                        scratch.push((v, Some((flo, fhi))));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                before.extend(refs);
+            }
+            // A vector killed element by element must keep its length in the body: it is only
+            // read and written element by element.
+            scratch.retain(|(v, kill)| {
+                if kill.is_none() {
+                    return true;
+                }
+                let mut ok = true;
+                for x in body {
+                    walk_ref(x, &mut |e| match &e.kind {
+                        ExprKind::Set(pl, _) => {
+                            if matches!((&pl.kind, self.ck.res.get(pl.id as usize)), (ExprKind::Var(_), Some(Res::Local(b))) if b == v) {
+                                ok = false;
+                            }
+                        }
+                        ExprKind::Call(_, _, args) => {
+                            for a in args {
+                                if let Arg::Mut(m, _) = a {
+                                    if self.root_of(m) == Some(*v) {
+                                        ok = false;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    });
+                }
+                ok
+            });
+            for (v, _) in &scratch {
+                inner.insert(*v);
+            }
+        }
+        // Capabilities: only the console, only to print, and not inside a lambda.
+        let mut caps_bad = false;
+        for x in body {
+            walk_ref(x, &mut |e| {
+                if matches!(e.kind, ExprKind::Var(_)) && matches!(self.ty(e), Ty::Cap(_)) && !cap_ok.contains(&e.id) {
+                    caps_bad = true;
+                }
+                if let ExprKind::Lambda(_, lb) = &e.kind {
+                    for y in lb {
+                        walk_ref(y, &mut |f| {
+                            if let ExprKind::Call(n, _, _) = &f.kind {
+                                if n == "print" || n == "println" {
+                                    caps_bad = true;
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+        }
+        if caps_bad {
+            return None;
+        }
+        let is_local = |e: &Expr, b: BindId| matches!((&e.kind, &self.ck.res[e.id as usize]), (ExprKind::Var(_), Res::Local(x)) if *x == b);
+        let local_of = |e: &Expr| match (&e.kind, &self.ck.res[e.id as usize]) {
+            (ExprKind::Var(_), Res::Local(x)) => Some(*x),
+            _ => None,
+        };
+        let builtin = |e: &Expr| matches!(self.ck.res.get(e.id as usize), Some(Res::Builtin(_)));
+        // Classify every change to a variable from outside the body.
+        let mut sums: Vec<(BindId, Vec<u32>)> = Vec::new();
+        let mut hists: Vec<(BindId, Vec<u32>)> = Vec::new();
+        let mut writes: Vec<(BindId, Vec<(u32, &Expr)>)> = Vec::new();
+        let mut pushes: Vec<BindId> = Vec::new();
+        let mut plain_sets: Vec<(BindId, u32)> = Vec::new();
+        let mut modsums: Vec<(BindId, Vec<u32>, &Expr)> = Vec::new();
+        let mut ifs: Vec<&Expr> = Vec::new();
+        let mut fail = false;
+        let add = |v: &mut Vec<(BindId, Vec<u32>)>, b: BindId, id: u32| match v.iter_mut().find(|x| x.0 == b) {
+            Some(x) => x.1.push(id),
+            None => v.push((b, vec![id])),
+        };
         for x in body {
             walk_ref(x, &mut |e| match &e.kind {
-                ExprKind::For(..) | ExprKind::While(..) | ExprKind::Lambda(..) | ExprKind::Tasks(..) => nested = true,
-                ExprKind::Call(n, _, args)
-                    if n == "at"
-                        && args.len() == 2
-                        && !matches!(self.ck.res.get(e.id as usize), Some(Res::UserFn(_))) =>
-                {
-                    reads.push((e.id, args[0].expr(), args[1].expr()));
+                ExprKind::If(_, _, None) => ifs.push(e),
+                ExprKind::Call(n, _, args) => {
+                    for (i, arg) in args.iter().enumerate() {
+                        let Arg::Mut(m, _) = arg else { continue };
+                        let Some(r) = self.root_of(m) else {
+                            fail = true;
+                            continue;
+                        };
+                        if inner.contains(&r) {
+                            continue;
+                        }
+                        if n == "push" && i == 0 && builtin(e) && local_of(m) == Some(r) {
+                            if !pushes.contains(&r) {
+                                pushes.push(r);
+                            }
+                        } else {
+                            fail = true;
+                        }
+                    }
+                }
+                ExprKind::Set(pl, v) => {
+                    let Some(r) = self.root_of(pl) else {
+                        fail = true;
+                        return;
+                    };
+                    if inner.contains(&r) {
+                        return;
+                    }
+                    if r == lv {
+                        fail = true;
+                        return;
+                    }
+                    match &pl.kind {
+                        ExprKind::Var(_) => {
+                            let sum = match &v.kind {
+                                ExprKind::Call(op, _, xs) if builtin(v) && self.ty(pl).is_int() => {
+                                    (op == "+" && xs.iter().filter(|a| is_local(a.expr(), r)).count() == 1)
+                                        || (op == "-" && xs.len() == 2 && is_local(xs[0].expr(), r) && !self.unsigned(self.ty(pl)))
+                                }
+                                _ => false,
+                            };
+                            let modsum = match &v.kind {
+                                ExprKind::Call(op, _, xs) if op == "%" && xs.len() == 2 && builtin(v) && self.ty(pl).is_int() && !self.unsigned(self.ty(pl)) => {
+                                    matches!(&xs[0].expr().kind, ExprKind::Call(op2, _, ys) if op2 == "+" && builtin(xs[0].expr())
+                                        && ys.iter().filter(|a| is_local(a.expr(), r)).count() == 1)
+                                }
+                                _ => false,
+                            };
+                            if sum {
+                                add(&mut sums, r, e.id);
+                            } else if modsum {
+                                let ExprKind::Call(_, _, xs) = &v.kind else { unreachable!() };
+                                match modsums.iter_mut().find(|x| x.0 == r) {
+                                    Some(x) => {
+                                        if self.src_of(x.2) != self.src_of(xs[1].expr()) {
+                                            fail = true;
+                                        }
+                                        x.1.push(e.id);
+                                    }
+                                    None => modsums.push((r, vec![e.id], xs[1].expr())),
+                                }
+                            } else {
+                                plain_sets.push((r, e.id));
+                            }
+                        }
+                        ExprKind::Call(n, _, pa) if n == "at" && pa.len() == 2 => {
+                            let at_src = self.src_of(pl);
+                            let hist = local_of(pa[0].expr()) == Some(r)
+                                && self.ty(pl).is_int()
+                                && !self.unsigned(self.ty(pl))
+                                && matches!(&v.kind, ExprKind::Call(op, _, xs) if op == "+" && builtin(v)
+                                    && xs.iter().filter(|a| self.src_of(a.expr()) == at_src).count() == 1);
+                            if hist {
+                                add(&mut hists, r, e.id);
+                                return;
+                            }
+                            // A write: the at directly on the variable decides which element.
+                            let mut first = &**pl;
+                            loop {
+                                let ExprKind::Call(n2, _, p2) = &first.kind else {
+                                    fail = true;
+                                    return;
+                                };
+                                if n2 != "at" || p2.len() != 2 {
+                                    fail = true;
+                                    return;
+                                }
+                                if local_of(p2[0].expr()) == Some(r) {
+                                    break;
+                                }
+                                first = p2[0].expr();
+                            }
+                            let ExprKind::Call(_, _, p2) = &first.kind else { unreachable!() };
+                            match writes.iter_mut().find(|x| x.0 == r) {
+                                Some(x) => x.1.push((first.id, p2[1].expr())),
+                                None => writes.push((r, vec![(first.id, p2[1].expr())])),
+                            }
+                        }
+                        _ => fail = true,
+                    }
                 }
                 _ => {}
             });
         }
-        if nested || reads.is_empty() {
+        if fail {
+            return None;
+        }
+        // Running maxima and minima: `(if (op e m) (do (set m e) (set w x)...))`.
+        let mut maxes: Vec<(u32, Vec<BindId>, bool)> = Vec::new(); // if id, [m, w...], m on the left
+        let mut grouped: HashSet<u32> = HashSet::new();
+        for &f in &ifs {
+            let ExprKind::If(c, th, None) = &f.kind else { continue };
+            let ExprKind::Call(op, _, cx) = &c.kind else { continue };
+            if !builtin(c) || !matches!(op.as_str(), "<" | ">" | "<=" | ">=") || cx.len() != 2 {
+                continue;
+            }
+            let sets: Vec<&Expr> = match &th.kind {
+                ExprKind::Set(..) => vec![&**th],
+                ExprKind::Do(es) => es.iter().collect(),
+                _ => continue,
+            };
+            if !sets.iter().all(|x| matches!(&x.kind, ExprKind::Set(p, _) if local_of(p).is_some_and(|b| !inner.contains(&b)))) {
+                continue;
+            }
+            for (left, (mx, ev)) in [(true, (cx[0].expr(), cx[1].expr())), (false, (cx[1].expr(), cx[0].expr()))] {
+                let Some(m) = local_of(mx) else { continue };
+                if inner.contains(&m) || m == lv {
+                    continue;
+                }
+                let ev_src = self.src_of(ev);
+                let mut group = vec![m];
+                let mut ok = false;
+                for x in &sets {
+                    let ExprKind::Set(p, v) = &x.kind else { unreachable!() };
+                    let b = local_of(p).unwrap();
+                    if b == m {
+                        ok |= self.src_of(v) == ev_src;
+                    } else if !group.contains(&b) {
+                        group.push(b);
+                    }
+                }
+                if ok && group.iter().all(|b| self.is_copy(&self.ck.bindings[*b].ty)) {
+                    maxes.push((f.id, group, left));
+                    for x in &sets {
+                        grouped.insert(x.id);
+                    }
+                    break;
+                }
+            }
+        }
+        let mut lasts: Vec<(BindId, Vec<u32>)> = Vec::new();
+        for (b, id) in &plain_sets {
+            if grouped.contains(id) {
+                continue;
+            }
+            if !self.is_copy(&self.ck.bindings[*b].ty) {
+                return None;
+            }
+            add(&mut lasts, *b, *id);
+        }
+        // Each changed variable in one role only, and used nowhere else in the body.
+        let mut uses_allowed: HashMap<BindId, usize> = HashMap::new();
+        let mut claim = |b: BindId, uses: usize| {
+            *uses_allowed.entry(b).or_insert(0) += uses;
+        };
+        let mut roles: Vec<BindId> = Vec::new();
+        for (b, ids) in &sums {
+            roles.push(*b);
+            claim(*b, 2 * ids.len());
+        }
+        for (b, ids) in &hists {
+            roles.push(*b);
+            claim(*b, 2 * ids.len());
+        }
+        for (b, ws) in &writes {
+            roles.push(*b);
+            claim(*b, ws.len());
+        }
+        for b in &pushes {
+            roles.push(*b);
+            claim(*b, 0);
+        }
+        for (b, ids, _) in &modsums {
+            roles.push(*b);
+            claim(*b, 2 * ids.len());
+        }
+        for (b, ids) in &lasts {
+            roles.push(*b);
+            claim(*b, ids.len());
+        }
+        let mut push_uses: HashMap<BindId, usize> = HashMap::new();
+        for x in body {
+            walk_ref(x, &mut |e| {
+                if let ExprKind::Call(n, _, args) = &e.kind {
+                    if n == "push" {
+                        if let Some(Arg::Mut(m, _)) = args.first() {
+                            if let Some(r) = local_of(m) {
+                                *push_uses.entry(r).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        for b in &pushes {
+            claim(*b, push_uses.get(b).copied().unwrap_or(0));
+        }
+        for (fid, group, _) in &maxes {
+            let ExprKind::If(_, th, _) = &find_expr(body, *fid)?.kind else { unreachable!() };
+            let n_sets = match &th.kind {
+                ExprKind::Do(es) => es.len(),
+                _ => 1,
+            };
+            for (k, b) in group.iter().enumerate() {
+                roles.push(*b);
+                let sets_of_b = match &th.kind {
+                    ExprKind::Do(es) => es.iter().filter(|x| matches!(&x.kind, ExprKind::Set(p, _) if local_of(p) == Some(*b))).count(),
+                    _ => 1,
+                };
+                let _ = n_sets;
+                claim(*b, sets_of_b + if k == 0 { 1 } else { 0 });
+            }
+        }
+        let mut seen = HashSet::new();
+        if !roles.iter().all(|b| seen.insert(*b)) {
+            return None;
+        }
+        let mut counts: HashMap<BindId, usize> = HashMap::new();
+        for x in body {
+            walk_ref(x, &mut |e| {
+                if let Some(b) = local_of(e) {
+                    if roles.contains(&b) {
+                        *counts.entry(b).or_insert(0) += 1;
+                    }
+                }
+            });
+        }
+        if roles.iter().any(|b| counts.get(b).copied().unwrap_or(0) != uses_allowed[b]) {
+            return None;
+        }
+        // Nothing worth parallelizing.
+        if sums.is_empty() && hists.is_empty() && writes.is_empty() && pushes.is_empty() && maxes.is_empty() && modsums.is_empty() && !prints && !heavy {
+            return None;
+        }
+        // Elements, not indices: no index-based writes.
+        if each.is_some() && !writes.is_empty() {
+            return None;
+        }
+        let changed: HashSet<BindId> = roles.iter().copied().collect();
+        let fixed = |e: &Expr| -> bool {
+            let mut ok = true;
+            walk_ref(e, &mut |x| match (&x.kind, self.ck.res.get(x.id as usize)) {
+                (ExprKind::Var(_), Some(Res::Local(b))) => {
+                    if *b == lv || inner.contains(b) || changed.contains(b) {
+                        ok = false;
+                    }
+                }
+                (ExprKind::Var(_), _) | (ExprKind::Int(_), _) => {}
+                (ExprKind::Call(n, _, _), Some(Res::Builtin(_))) if matches!(n.as_str(), "+" | "-" | "*" | "len") => {}
+                _ => ok = false,
+            });
+            ok
+        };
+        if !modsums.iter().all(|x| fixed(x.2) || matches!(x.2.kind, ExprKind::Var(_) if matches!(self.ck.res[x.2.id as usize], Res::Const(_)))) {
+            return None;
+        }
+        // Disjoint writes: per vector, the windows each iteration writes.
+        let mut win_tests: Vec<String> = Vec::new();
+        for (_, ws) in &writes {
+            let mut stride: Option<Option<&Expr>> = None;
+            let mut wins: Vec<String> = Vec::new();
+            for (_, idx) in ws {
+                let mut af = Aff::default();
+                if !aff(self, idx, lv, &lets, &ranges, &fixed, true, &mut af, 0) || !af.lv {
+                    return None;
+                }
+                let s_src = af.stride.map(|e| self.src_of(e).to_string());
+                match &stride {
+                    None => stride = Some(af.stride),
+                    Some(prev) => {
+                        if prev.map(|e| self.src_of(e).to_string()) != s_src {
+                            return None;
+                        }
+                    }
+                }
+                let mut c = String::from("0i128");
+                for (plus, t) in &af.consts {
+                    c.push_str(if *plus { " + " } else { " - " });
+                    c.push_str(&wide_of(self, t));
+                }
+                match af.j {
+                    Some(j) => {
+                        let (jl, jh) = ranges[&j];
+                        if !fixed(jl) || !fixed(jh) {
+                            return None;
+                        }
+                        let (jl, jh) = (wide_of(self, jl), wide_of(self, jh));
+                        wins.push(format!("({c} + {jl}, {c} + {jh} - 1)"));
+                    }
+                    None => wins.push(format!("({c}, {c})")),
+                }
+            }
+            let s = match stride.flatten() {
+                Some(e) => wide_of(self, e),
+                None => "1i128".to_string(),
+            };
+            win_tests.push(format!("ail_rt::disjoint({s}, &[{}])", wins.join(", ")));
+        }
+        // Emit.
+        let (mut pre, head) = match (range, each) {
+            (Some((a, z)), _) => {
+                let lo = self.val(a);
+                let hi = self.val(z);
+                (format!("let __plo: i64 = {lo}; let __phi: i64 = {hi}; let mut __pdone = false; "), format!("for {var} in __a..__b {{"))
+            }
+            (_, Some(v)) => match &v.kind {
+                ExprKind::Call(n, _, args) if n == "lines" || n == "split" => {
+                    let sv = self.rf(args[0].expr());
+                    let it = if n == "lines" {
+                        format!("ail_rt::lines_iter({sv})")
+                    } else {
+                        let sep = self.rf(args[1].expr());
+                        format!("ail_rt::split_iter({sv}, {sep})")
+                    };
+                    (
+                        format!("let __pxs: Vec<&str> = if {sv}.len() >= 4096 {{ {it}.collect() }} else {{ Vec::new() }}; let __plo: i64 = 0; let __phi: i64 = __pxs.len() as i64; let mut __pdone = false; "),
+                        format!("for __pi in __a..__b {{ let {var}: &str = __pxs[__pi as usize];"),
+                    )
+                }
+                _ => {
+                    let xs = self.pv(v);
+                    (
+                        format!("let __plo: i64 = 0; let __phi: i64 = {xs}.len() as i64; let mut __pdone = false; "),
+                        format!("for __pi in __a..__b {{ let {var} = &{xs}[__pi as usize];"),
+                    )
+                }
+            },
+            _ => unreachable!(),
+        };
+        let mut setup = String::new();
+        let mut privs = String::new();
+        let mut ret: Vec<String> = Vec::new();
+        let mut combine_check = String::new();
+        let mut combine_ref = String::new();
+        let mut combine_own = String::new();
+        let mut hooks: Vec<(u32, ParHook)> = Vec::new();
+        let mut shared: Vec<(BindId, String)> = Vec::new();
+        let mut unchecked: Vec<(u32, String)> = Vec::new();
+        let mut tests: Vec<String> = win_tests;
+        let mut chunks = "0";
+        // A private variable shadowing `b` inside the chunk, initialized with `init`; returns
+        // the owned name to hand back.
+        let shadow = |em: &Self, b: BindId, ty: &str, init: &str, k: &str, out: &mut String| -> String {
+            let pl = em.bind_place(b);
+            let name = em.local_name(&em.ck.bindings[b].name);
+            if pl.starts_with("(*") {
+                out.push_str(&format!("let mut __pv{k}: {ty} = {init}; let {name} = &mut __pv{k}; "));
+                format!("__pv{k}")
+            } else {
+                out.push_str(&format!("let mut {name}: {ty} = {init}; "));
+                name
+            }
+        };
+        for (i, (b, ids)) in sums.iter().enumerate() {
+            let ty = rty(&self.ck.bindings[*b].ty);
+            let k = format!("s{i}");
+            let own = shadow(self, *b, &ty, &format!("0 as {ty}"), &k, &mut privs);
+            privs.push_str(&format!("let mut __abs{k}: u64 = 0; "));
+            let (pi, ai) = (ret.len(), ret.len() + 1);
+            ret.push(own);
+            ret.push(format!("__abs{k}"));
+            for id in ids {
+                hooks.push((*id, ParHook::Sum(format!("__abs{k}"))));
+            }
+            let pl = self.bind_place(*b);
+            combine_check.push_str(&format!(
+                "if ail_rt::UAbs::uabs({pl}) as i128 + __parts.iter().map(|p| p.{ai} as i128).sum::<i128>() > {ty}::MAX as i128 {{ __ok = false; }} "
+            ));
+            combine_ref.push_str(&format!(
+                "{pl} = (ail_rt::UAbs::wide({pl}) + __parts.iter().map(|p| ail_rt::UAbs::wide(p.{pi})).sum::<i128>()) as {ty}; "
+            ));
+        }
+        for (i, (b, ids)) in hists.iter().enumerate() {
+            let vty = rty(&self.ck.bindings[*b].ty);
+            let Ty::Vec(et) = &self.ck.bindings[*b].ty else { return None };
+            let ety = rty(et);
+            let k = format!("h{i}");
+            let pl = self.bind_place(*b);
+            pre.push_str(&format!("let __hlen{k} = {pl}.len(); "));
+            tests.push(format!("__hlen{k} <= (1 << 18)"));
+            let own = shadow(self, *b, &vty, &format!("vec![0 as {ety}; __hlen{k}]"), &k, &mut privs);
+            privs.push_str(&format!("let mut __abs{k}: u64 = 0; "));
+            let (pi, ai) = (ret.len(), ret.len() + 1);
+            ret.push(own);
+            ret.push(format!("__abs{k}"));
+            for id in ids {
+                hooks.push((*id, ParHook::Hist(format!("__abs{k}"))));
+            }
+            combine_check.push_str(&format!(
+                "if {pl}.iter().map(|x| ail_rt::UAbs::uabs(*x) as i128).max().unwrap_or(0) + __parts.iter().map(|p| p.{ai} as i128).sum::<i128>() > {ety}::MAX as i128 {{ __ok = false; }} "
+            ));
+            combine_ref.push_str(&format!(
+                "for __p in __parts.iter() {{ for (__d, __s) in {pl}.iter_mut().zip(__p.{pi}.iter()) {{ *__d += *__s; }} }} "
+            ));
+            chunks = "1";
+        }
+        for (i, (fid, group, left)) in maxes.iter().enumerate() {
+            let k = format!("m{i}");
+            let mut fields = Vec::new();
+            for (gi, b) in group.iter().enumerate() {
+                let ty = rty(&self.ck.bindings[*b].ty);
+                let pl = self.bind_place(*b);
+                setup.push_str(&format!("let __sn{k}_{gi}: {ty} = {pl}; "));
+                let own = shadow(self, *b, &ty, &format!("__sn{k}_{gi}"), &format!("{k}_{gi}"), &mut privs);
+                fields.push(ret.len());
+                ret.push(own);
+            }
+            privs.push_str(&format!("let mut __upd{k} = false; "));
+            let ui = ret.len();
+            ret.push(format!("__upd{k}"));
+            hooks.push((*fid, ParHook::Flag(format!("__upd{k}"))));
+            let ExprKind::If(c, _, _) = &find_expr(body, *fid)?.kind else { unreachable!() };
+            let ExprKind::Call(op, _, _) = &c.kind else { unreachable!() };
+            let mpl = self.bind_place(group[0]);
+            let cond = if *left { format!("{mpl} {op} __p.{}", fields[0]) } else { format!("__p.{} {op} {mpl}", fields[0]) };
+            let mut assign = String::new();
+            for (gi, b) in group.iter().enumerate() {
+                assign.push_str(&format!("{} = __p.{}; ", self.bind_place(*b), fields[gi]));
+            }
+            combine_ref.push_str(&format!("for __p in __parts.iter() {{ if __p.{ui} && {cond} {{ {assign}}} }} "));
+        }
+        for (i, (b, kill)) in scratch.iter().enumerate() {
+            let ty = rty(&self.ck.bindings[*b].ty);
+            let k = format!("w{i}");
+            let pl = self.bind_place(*b);
+            if let Some((flo, fhi)) = kill {
+                let whole = matches!(&fhi.kind, ExprKind::Call(n, _, xs) if n == "len" && xs.len() == 1 && self.root_of(xs[0].expr()) == Some(*b));
+                if !fixed(flo) || (!whole && !fixed(fhi)) {
+                    return None;
+                }
+                let wl = wide_of(self, flo);
+                if whole {
+                    tests.push(format!("{wl} == 0"));
+                } else {
+                    let wh = wide_of(self, fhi);
+                    tests.push(format!("{wl} == 0 && {wh} == ({pl}.len() as i128)"));
+                }
+            }
+            let own = shadow(self, *b, &ty, &format!("{pl}.clone()"), &k, &mut privs);
+            let pi = ret.len();
+            ret.push(own);
+            combine_ref.push_str(&format!("if let Some(__l) = __parts.last() {{ {pl} = __l.{pi}.clone(); }} "));
+        }
+        for (i, (b, ids, m)) in modsums.iter().enumerate() {
+            let ty = rty(&self.ck.bindings[*b].ty);
+            let k = format!("r{i}");
+            let own = shadow(self, *b, &ty, &format!("0 as {ty}"), &k, &mut privs);
+            privs.push_str(&format!("let mut __neg{k} = false; let mut __mx{k}: {ty} = 0; "));
+            let (pi, ni, mi) = (ret.len(), ret.len() + 1, ret.len() + 2);
+            ret.push(own);
+            ret.push(format!("__neg{k}"));
+            ret.push(format!("__mx{k}"));
+            for id in ids {
+                hooks.push((*id, ParHook::ModSum(k.clone())));
+            }
+            let pl = self.bind_place(*b);
+            let mc = self.val(m);
+            // In order, x becomes (x + e) % m at every step; with nothing negative that is
+            // (x0 + all the terms) mod m, and no step overflows if no term is near the top.
+            combine_check.push_str(&format!(
+                "{{ let __m: {ty} = {mc}; if {pl} < 0 || __m <= 0 || __parts.iter().any(|p| p.{ni} || p.{mi} as i128 + __m as i128 > {ty}::MAX as i128) {{ __ok = false; }} }} "
+            ));
+            combine_ref.push_str(&format!(
+                "{{ let __m = ({mc}) as i128; {pl} = ((({pl} as i128) + __parts.iter().map(|p| p.{pi} as i128).sum::<i128>()) % __m) as {ty}; }} "
+            ));
+        }
+        for (i, (b, ids)) in lasts.iter().enumerate() {
+            let ty = rty(&self.ck.bindings[*b].ty);
+            let k = format!("l{i}");
+            let pl = self.bind_place(*b);
+            setup.push_str(&format!("let __snl{k}: {ty} = {pl}; "));
+            let own = shadow(self, *b, &ty, &format!("__snl{k}"), &k, &mut privs);
+            privs.push_str(&format!("let mut __set{k} = false; "));
+            let (pi, fi) = (ret.len(), ret.len() + 1);
+            ret.push(own);
+            ret.push(format!("__set{k}"));
+            for id in ids {
+                hooks.push((*id, ParHook::Last(format!("__set{k}"))));
+            }
+            combine_ref.push_str(&format!("for __p in __parts.iter() {{ if __p.{fi} {{ {pl} = __p.{pi}; }} }} "));
+        }
+        for (i, b) in pushes.iter().enumerate() {
+            let ty = rty(&self.ck.bindings[*b].ty);
+            let k = format!("p{i}");
+            let own = shadow(self, *b, &ty, "Vec::new()", &k, &mut privs);
+            let pi = ret.len();
+            ret.push(own);
+            combine_own.push_str(&format!("{}.append(&mut __p.{pi}); ", self.bind_place(*b)));
+        }
+        if prints {
+            privs.push_str("let mut __pout = String::new(); ");
+            let pi = ret.len();
+            ret.push("__pout".into());
+            combine_own.push_str(&format!("ail_rt::print(&__p.{pi}); "));
+        }
+        for (i, (b, ws)) in writes.iter().enumerate() {
+            let pl = self.bind_place(*b);
+            let name = format!("__pw{i}");
+            setup.push_str(&format!("let {name} = ail_rt::SharedSlice::new(&mut {pl}[..]); "));
+            shared.push((*b, name.clone()));
+            for (fid, idx) in ws {
+                let ic = self.val(idx);
+                unchecked.push((*fid, format!("(*{name}.at({ic}))")));
+            }
+        }
+        // The chunk body, with the hooks and shared vectors in place.
+        let saved_hooks = std::mem::take(&mut self.par_hooks);
+        let saved_shared = std::mem::take(&mut self.par_shared);
+        self.par_hooks = hooks.into_iter().collect();
+        self.par_shared = shared.into_iter().collect();
+        let mut saved_unchecked = Vec::new();
+        for (id, c) in &unchecked {
+            saved_unchecked.push((*id, self.unchecked.insert(*id, c.clone())));
+        }
+        self.in_par = true;
+        let pbody = self.block(body);
+        self.in_par = false;
+        self.par_hooks = saved_hooks;
+        self.par_shared = saved_shared;
+        for (id, old) in saved_unchecked {
+            match old {
+                Some(c) => self.unchecked.insert(id, c),
+                None => self.unchecked.remove(&id),
+            };
+        }
+        let was = self.no_par;
+        self.no_par = true;
+        let seq = match range {
+            Some((a, _)) => self.for_range_seq(lv, var, "__plo", "__phi", a, body),
+            None => format!("{{ {} }}", self.rvalue(whole)),
+        };
+        self.no_par = was;
+        let tuple = if ret.is_empty() { "()".to_string() } else { format!("({},)", ret.join(", ")) };
+        let worth = format!("ail_rt::par_worth(__plo, __phi, {heavy})");
+        let cond = std::iter::once(worth).chain(tests).collect::<Vec<_>>().join(" && ");
+        pre.push_str(&format!(
+            "if {cond} {{ {setup}let __pr = ail_rt::par_for(__plo, __phi, {chunks}, &|__a: i64, __b: i64| {{ {privs}{head} let _ = {pbody}; }} {tuple} }}); \
+             if let Some(mut __parts) = __pr {{ let mut __ok = true; {combine_check}if __ok {{ {combine_ref}for __p in __parts.iter_mut() {{ let _ = &__p; {combine_own}}} __pdone = true; }} }} }} "
+        ));
+        Some(format!("{{ {pre}if !__pdone {seq} }}"))
+    }
+
+    fn unsigned(&self, t: &Ty) -> bool {
+        matches!(t, Ty::Int(k) if matches!(k, IntK::U8 | IntK::U16 | IntK::U32 | IntK::U64))
+    }
+
+    /// Integer arithmetic in the fast copy of a loop: wraps and records overflow in `__of`.
+    fn deferred(&mut self, name: &str, t: &Ty, args: &[Arg]) -> Option<String> {
+        let unsigned = matches!(t, Ty::Int(k) if matches!(k, IntK::U8 | IntK::U16 | IntK::U32 | IntK::U64));
+        let op = match (name, args.len()) {
+            ("+", _) => "dadd",
+            ("*", _) => "dmul",
+            ("-", 1) => return Some(format!("ail_rt::Dov::dneg({}, &mut __of)", self.val(args[0].expr()))),
+            ("-", 2) => "dsub",
+            ("/", 2) => "ddiv",
+            ("%", 2) => "drem",
+            ("abs", 1) if !unsigned => return Some(format!("ail_rt::Dov::dabs({}, &mut __of)", self.val(args[0].expr()))),
+            _ => return None,
+        };
+        let lit = |e: &Expr| matches!(e.kind, ExprKind::Int(_));
+        if op == "dmul" && args.len() == 2 && (lit(args[0].expr()) || lit(args[1].expr())) {
+            let (x, c) = if lit(args[1].expr()) { (args[0].expr(), args[1].expr()) } else { (args[1].expr(), args[0].expr()) };
+            let (x, c) = (self.val(x), self.val(c));
+            return Some(format!("ail_rt::Dov::dmulc({x}, {c}, &mut __of)"));
+        }
+        let mut acc = self.val(args[0].expr());
+        for x in &args[1..] {
+            let v = self.val(x.expr());
+            acc = format!("ail_rt::Dov::{op}({acc}, {v}, &mut __of)");
+        }
+        Some(acc)
+    }
+
+    /// An innermost `(for j (range a b) ...)` whose vector accesses `(at v i)` (reads, and
+    /// writes `(set (at v i) x)`) all have an index `j + c`, with `c` fixed during the loop
+    /// (seen through the body's `let`s, so `(let k (+ row j))` then `(at v (- k n))` counts).
+    /// One test before the loop shows every index in range, and then the loop runs without
+    /// bounds checks. If the body is plain arithmetic and the vectors it writes are not read,
+    /// the integer operations also defer their overflow check to the end of the loop, so LLVM
+    /// can vectorize it; on overflow the loop runs again with every check and traps where it
+    /// would have. If the test fails, the ordinary checked loop runs.
+    fn for_unchecked(&mut self, lv: BindId, var: &str, lo: &str, hi: &str, a: &Expr, body: &[Expr]) -> Option<String> {
+        let mut nested = false;
+        let mut accs: Vec<(u32, &Expr, &Expr)> = Vec::new();
+        let mut writes: HashSet<u32> = HashSet::new();
+        let mut inner: HashSet<BindId> = HashSet::new();
+        let mut lets: HashMap<BindId, &Expr> = HashMap::new();
+        for x in body {
+            walk_ref(x, &mut |e| {
+                if let Some(b) = self.ck.decl.get(&(e.id as usize)) {
+                    inner.insert(*b);
+                    if let ExprKind::Let { mutable: false, value, .. } = &e.kind {
+                        lets.insert(*b, value);
+                    }
+                }
+                match &e.kind {
+                    ExprKind::For(..) | ExprKind::While(..) | ExprKind::Lambda(..) | ExprKind::Tasks(..) => nested = true,
+                    ExprKind::Match(_, arms) => {
+                        for arm in arms {
+                            pat_binds(&arm.pat, self.ck, self.epoch, &mut inner);
+                        }
+                    }
+                    ExprKind::Set(p, _) => {
+                        if let ExprKind::Call(n, _, xs) = &p.kind {
+                            if n == "at" && xs.len() == 2 {
+                                writes.insert(p.id);
+                            }
+                        }
+                    }
+                    ExprKind::Call(n, _, args)
+                        if n == "at" && args.len() == 2 && !matches!(self.ck.res.get(e.id as usize), Some(Res::UserFn(_))) =>
+                    {
+                        accs.push((e.id, args[0].expr(), args[1].expr()));
+                    }
+                    _ => {}
+                }
+            });
+        }
+        if nested || accs.is_empty() {
             return None;
         }
         let arm = Arm { pat: Pat::Wild(a.span), body: body.to_vec(), span: a.span };
         let changes = |em: &Self, b: BindId| em.arms_mutate(std::slice::from_ref(&arm), b);
-        // Vars read by an expression; None if it calls anything but arithmetic.
+        // Vars read by an expression; false if it calls anything but arithmetic.
         fn vars_of(em: &Emitter, e: &Expr, out: &mut Vec<BindId>) -> bool {
             match &e.kind {
                 ExprKind::Int(_) => true,
@@ -1951,77 +2933,226 @@ impl<'a> Emitter<'a> {
                 _ => false,
             }
         }
-        let fixed = |em: &Self, e: &Expr| -> bool {
+        // Fixed during the loop: reads only variables that exist before it and do not change.
+        let fixed = |e: &Expr| -> bool {
             let mut vs = Vec::new();
-            vars_of(em, e, &mut vs) && vs.iter().all(|b| *b != lv && !changes(em, *b))
+            vars_of(self, e, &mut vs) && vs.iter().all(|b| *b != lv && !inner.contains(b) && !changes(self, *b))
         };
-        let is_lv = |em: &Self, e: &Expr| matches!((&e.kind, &em.ck.res[e.id as usize]), (ExprKind::Var(_), Res::Local(b)) if *b == lv);
-        // Each read: (id, vector, offset sign and expression).
-        let mut plan: Vec<(u32, &Expr, Option<(bool, &Expr)>, &Expr)> = Vec::new();
-        for (rid, v, i) in reads {
-            let root_ok = match &v.kind {
-                ExprKind::Var(_) | ExprKind::Field(..) => self.root_of(v).is_some_and(|b| !changes(self, b) && b != lv),
-                _ => false,
-            };
-            if !root_ok || !matches!(self.ty(v), Ty::Vec(_)) {
+        // `j + c1 - c2 ...` as its terms (sign, fixed expression), looking through `let`s.
+        fn offset<'e>(
+            em: &Emitter,
+            e: &'e Expr,
+            lv: BindId,
+            lets: &HashMap<BindId, &'e Expr>,
+            fixed: &dyn Fn(&Expr) -> bool,
+            depth: usize,
+        ) -> Option<Vec<(bool, &'e Expr)>> {
+            if depth > 8 {
                 return None;
             }
-            let off = if is_lv(self, i) {
-                None
-            } else {
-                match &i.kind {
-                    ExprKind::Call(n, _, xs) if xs.len() == 2 && (n == "+" || n == "-") && !matches!(self.ck.res.get(i.id as usize), Some(Res::UserFn(_))) => {
-                        let (x, y) = (xs[0].expr(), xs[1].expr());
-                        if is_lv(self, x) && fixed(self, y) {
-                            Some((n == "+", y))
-                        } else if n == "+" && is_lv(self, y) && fixed(self, x) {
-                            Some((true, x))
-                        } else {
-                            return None;
+            match &e.kind {
+                ExprKind::Var(_) => match em.ck.res[e.id as usize] {
+                    Res::Local(b) if b == lv => Some(Vec::new()),
+                    Res::Local(b) => offset(em, lets.get(&b)?, lv, lets, fixed, depth + 1),
+                    _ => None,
+                },
+                ExprKind::Call(n, _, xs)
+                    if xs.len() == 2 && (n == "+" || n == "-") && !matches!(em.ck.res.get(e.id as usize), Some(Res::UserFn(_))) =>
+                {
+                    let (x, y) = (xs[0].expr(), xs[1].expr());
+                    if fixed(y) {
+                        let mut o = offset(em, x, lv, lets, fixed, depth + 1)?;
+                        o.push((n == "+", y));
+                        Some(o)
+                    } else if n == "+" && fixed(x) {
+                        let mut o = offset(em, y, lv, lets, fixed, depth + 1)?;
+                        o.push((true, x));
+                        Some(o)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        }
+        // The vector an access reads: a variable or field, or a row `(at m r)` of one with `r`
+        // fixed (its own index is tested before the loop too). Returns the root.
+        fn path_ok<'e>(em: &Emitter, v: &'e Expr, fixed: &dyn Fn(&Expr) -> bool, rows: &mut Vec<(&'e Expr, &'e Expr)>) -> Option<BindId> {
+            match &v.kind {
+                ExprKind::Var(_) => match em.ck.res[v.id as usize] {
+                    Res::Local(b) => Some(b),
+                    _ => None,
+                },
+                ExprKind::Field(base, _, _) => path_ok(em, base, fixed, rows),
+                ExprKind::Call(n, _, xs)
+                    if n == "at" && xs.len() == 2 && !matches!(em.ck.res.get(v.id as usize), Some(Res::UserFn(_))) && fixed(xs[1].expr()) =>
+                {
+                    // The prefix is tested first, then this row index.
+                    let root = path_ok(em, xs[0].expr(), fixed, rows)?;
+                    rows.push((xs[0].expr(), xs[1].expr()));
+                    Some(root)
+                }
+                _ => None,
+            }
+        }
+        let fixed_ref: &dyn Fn(&Expr) -> bool = &fixed;
+        // Each access: (id, vector, offset terms, index, write?, root).
+        let mut plan: Vec<(u32, &Expr, Vec<(bool, &Expr)>, &Expr, bool, BindId)> = Vec::new();
+        let mut row_tests: Vec<(&Expr, &Expr)> = Vec::new();
+        for (rid, v, i) in accs {
+            let root = path_ok(self, v, fixed_ref, &mut row_tests)?;
+            if root == lv || inner.contains(&root) || !matches!(self.ty(v), Ty::Vec(_)) {
+                return None;
+            }
+            let off = offset(self, i, lv, &lets, fixed_ref, 0)?;
+            plan.push((rid, v, off, i, writes.contains(&rid), root));
+        }
+        // A written vector changes only through the planned element writes, and is reached
+        // through one path only (it is borrowed mutably for the whole loop).
+        let written: HashSet<BindId> = plan.iter().filter(|x| x.4).map(|x| x.5).collect();
+        for x in &plan {
+            if !written.contains(&x.5) && changes(self, x.5) {
+                return None;
+            }
+        }
+        if !written.is_empty() {
+            let mut paths: HashMap<BindId, String> = HashMap::new();
+            for x in &plan {
+                if written.contains(&x.5) {
+                    let pl = self.pv(x.1);
+                    if paths.insert(x.5, pl.clone()).is_some_and(|old| old != pl) {
+                        return None;
+                    }
+                }
+            }
+            // Root occurrences allowed: the ones inside planned accesses' vector paths.
+            let mut allowed: HashSet<u32> = HashSet::new();
+            for x in &plan {
+                walk_ref(x.1, &mut |e| {
+                    allowed.insert(e.id);
+                });
+            }
+            let planned_writes: HashSet<u32> = plan.iter().filter(|x| x.4).map(|x| x.0).collect();
+            let mut bad = false;
+            for x in body {
+                walk_ref(x, &mut |e| match &e.kind {
+                    ExprKind::Var(_) => {
+                        if let Res::Local(b) = self.ck.res[e.id as usize] {
+                            if written.contains(&b) && !allowed.contains(&e.id) {
+                                bad = true;
+                            }
                         }
                     }
-                    _ => return None,
+                    ExprKind::Set(p, _) => {
+                        if self.root_of(p).is_some_and(|b| written.contains(&b)) && !planned_writes.contains(&p.id) {
+                            bad = true;
+                        }
+                    }
+                    _ => {}
+                });
+            }
+            if bad {
+                return None;
+            }
+        }
+        // Deferred overflow: the body only computes, the vectors it writes are not read, and
+        // outer variables it sets are plain values restored before the checked run.
+        let reads_written = plan.iter().any(|x| !x.4 && written.contains(&x.5));
+        let mut outer_sets: Vec<BindId> = Vec::new();
+        let defer = !reads_written && body.iter().all(|e| self.defer_ok(e, &inner, &mut outer_sets));
+        let defer = defer && outer_sets.iter().all(|b| self.is_copy(&self.ck.bindings[*b].ty));
+        // i128 form of a fixed expression, for tests that cannot overflow themselves.
+        fn wide(em: &mut Emitter, e: &Expr) -> String {
+            match &e.kind {
+                ExprKind::Call(n, _, xs) if matches!(n.as_str(), "+" | "-" | "*") && !xs.is_empty() => {
+                    if n == "-" && xs.len() == 1 {
+                        return format!("(-{})", wide(em, xs[0].expr()));
+                    }
+                    let parts: Vec<String> = xs.iter().map(|x| wide(em, x.expr())).collect();
+                    format!("({})", parts.join(&format!(" {n} ")))
                 }
-            };
-            plan.push((rid, v, off, i));
+                ExprKind::Call(n, _, xs) if n == "len" => format!("({}.len() as i128)", em.pv(xs[0].expr())),
+                _ => format!("(({}) as i128)", em.val(e)),
+            }
         }
         // One slice per vector, taken once; a test per distinct (vector, offset).
-        let mut slices: Vec<(String, String)> = Vec::new();
+        // (place, element type, written, shared by a parallel loop: a raw pointer)
+        let mut slices: Vec<(String, String, bool, bool)> = Vec::new();
         let mut tests: Vec<String> = Vec::new();
-        let mut codes: Vec<(u32, String)> = Vec::new();
-        for (rid, v, off, i) in &plan {
-            let place = self.pv(v);
-            let elem = rty(&self.elem_ty(v));
-            let sname = match slices.iter().position(|s| s.0 == place) {
-                Some(k) => format!("__us{k}"),
-                None => {
-                    slices.push((place.clone(), elem));
-                    format!("__us{}", slices.len() - 1)
-                }
-            };
-            let o = match off {
-                None => "0i128".to_string(),
-                Some((plus, c)) => {
-                    let c = self.val(c);
-                    if *plus { format!("({c}) as i128") } else { format!("-(({c}) as i128)") }
-                }
-            };
-            let t = format!("((__ulo as i128) + ({o}) >= 0 && (__uhi as i128) - 1 + ({o}) < ({sname}.len() as i128))");
+        for (m, r) in &row_tests {
+            let t = format!("({} >= 0 && {} < ({}.len() as i128))", wide(self, r), wide(self, r), self.pv(m));
             if !tests.contains(&t) {
                 tests.push(t);
             }
-            let idx = self.val(i);
-            codes.push((*rid, format!("(*{sname}.get_unchecked(({idx}) as usize))")));
         }
-        let mut out = format!("{{ let __ulo: i64 = {lo}; let __uhi: i64 = {hi}; ");
-        for (k, (place, elem)) in slices.iter().enumerate() {
-            out.push_str(&format!("let __us{k}: &[{elem}] = &{place}[..]; "));
+        let row_t: Vec<String> = tests.clone();
+        let mut codes: Vec<(u32, String)> = Vec::new();
+        let mut idxs: Vec<&Expr> = Vec::new();
+        // The iterations whose accesses are all in range: j >= -o and j < len - o for each.
+        let mut lows: Vec<String> = Vec::new();
+        let mut highs: Vec<String> = Vec::new();
+        for (rid, v, off, i, _, root) in &plan {
+            let shared = match &v.kind {
+                ExprKind::Var(_) => self.par_shared.get(root).cloned(),
+                _ => None,
+            };
+            let place = match &shared {
+                Some(n) => n.clone(),
+                None => self.pv(v),
+            };
+            let elem = rty(&self.elem_ty(v));
+            let w = written.contains(root);
+            let k = match slices.iter().position(|s| s.0 == place) {
+                Some(k) => k,
+                None => {
+                    slices.push((place.clone(), elem, w, shared.is_some()));
+                    slices.len() - 1
+                }
+            };
+            let mut o = String::from("0i128");
+            for (plus, c) in off {
+                let c = wide(self, c);
+                o.push_str(if *plus { " + " } else { " - " });
+                o.push_str(&c);
+            }
+            let t = format!("((__ulo as i128) + ({o}) >= 0 && (__uhi as i128) - 1 + ({o}) < ({place}.len() as i128))");
+            if !tests.contains(&t) {
+                tests.push(t);
+            }
+            let l = format!("-({o})");
+            if !lows.contains(&l) {
+                lows.push(l);
+            }
+            let h = format!("({place}.len() as i128) - ({o})");
+            if !highs.contains(&h) {
+                highs.push(h);
+            }
+            let get = if slices[k].3 { "add" } else if w { "get_unchecked_mut" } else { "get_unchecked" };
+            codes.push((*rid, format!("__us{k}.{get}")));
+            idxs.push(*i);
+        }
+        let was = self.defer;
+        self.defer = defer;
+        for ((_, c), i) in codes.iter_mut().zip(idxs) {
+            let idx = self.val(i);
+            *c = format!("(*{c}(({idx}) as usize))");
+        }
+        let mut take = String::new();
+        for (k, (place, elem, w, sh)) in slices.iter().enumerate() {
+            if *sh {
+                take.push_str(&format!("let __us{k}: *mut {elem} = {place}.ptr(); "));
+            } else if *w {
+                take.push_str(&format!("let __us{k}: &mut [{elem}] = &mut {place}[..]; "));
+            } else {
+                take.push_str(&format!("let __us{k}: &[{elem}] = &{place}[..]; "));
+            }
         }
         let saved: Vec<(u32, Option<String>)> = codes.iter().map(|(id, _)| (*id, self.unchecked.get(id).cloned())).collect();
         for (id, c) in codes {
             self.unchecked.insert(id, c);
         }
         let fast = self.block(body);
+        self.defer = was;
         for (id, old) in saved {
             match old {
                 Some(c) => self.unchecked.insert(id, c),
@@ -2029,11 +3160,111 @@ impl<'a> Emitter<'a> {
             };
         }
         let slow = self.block(body);
-        out.push_str(&format!(
-            "if __ulo < __uhi && {} {{ for {var} in __ulo..__uhi {{ let _ = unsafe {{ {fast} }}; }} }} else {{ for {var} in __ulo..__uhi {{ let _ = {slow}; }} }} }}",
+        if !breaks_out(body) {
+            // Split the range: checked iterations at the edges, where some access would be out
+            // of range (an `(at v (- j 1))` guarded by `(> j 0)`, say), unchecked in between.
+            let slow_in = |a: &str, b: &str| format!("for {var} in {a}..{b} {{ let _ = {slow}; }}");
+            let fast_loop = format!("for {var} in __flo..__fhi {{ let _ = unsafe {{ {fast} }}; }}");
+            let fast_run = if defer {
+                let mut snap = String::new();
+                let mut restore = String::new();
+                for (k, b) in outer_sets.iter().enumerate() {
+                    let pl = self.bind_place(*b);
+                    snap.push_str(&format!("let __sn{k} = {pl}; "));
+                    restore.push_str(&format!("{pl} = __sn{k}; "));
+                }
+                format!(
+                    "{snap}let __of = {{ {take}let mut __of = false; {fast_loop} __of }}; if __of {{ {restore}{} }}",
+                    slow_in("__flo", "__fhi")
+                )
+            } else {
+                format!("{{ {take}{fast_loop} }}")
+            };
+            let row_ok = if row_t.is_empty() { String::from("true") } else { row_t.join(" && ") };
+            let lo_b: String = lows.iter().map(|l| format!(".max({l})")).collect();
+            let hi_b: String = highs.iter().map(|h| format!(".min({h})")).collect();
+            return Some(format!(
+                "{{ let __ulo: i64 = {lo}; let __uhi: i64 = {hi};                  let (__flo, __fhi): (i64, i64) = if __ulo < __uhi && {row_ok} {{ let __a = (__ulo as i128){lo_b}; let __b = (__uhi as i128){hi_b}; if __a < __b {{ (__a as i64, __b as i64) }} else {{ (__uhi, __uhi) }} }} else {{ (__uhi, __uhi) }};                  {} if __flo < __fhi {{ {fast_run} }} {} }}",
+                slow_in("__ulo", "__flo"),
+                slow_in("__fhi", "__uhi")
+            ));
+        }
+        let slow_loop = format!("for {var} in __ulo..__uhi {{ let _ = {slow}; }}");
+        let fast_run = if defer {
+            let mut snap = String::new();
+            let mut restore = String::new();
+            for (k, b) in outer_sets.iter().enumerate() {
+                let pl = self.bind_place(*b);
+                snap.push_str(&format!("let __sn{k} = {pl}; "));
+                restore.push_str(&format!("{pl} = __sn{k}; "));
+            }
+            format!(
+                "{snap}let __of = {{ {take}let mut __of = false; for {var} in __ulo..__uhi {{ let _ = unsafe {{ {fast} }}; }} __of }}; if __of {{ {restore}{slow_loop} }}"
+            )
+        } else {
+            format!("{take}for {var} in __ulo..__uhi {{ let _ = unsafe {{ {fast} }}; }}")
+        };
+        Some(format!(
+            "{{ let __ulo: i64 = {lo}; let __uhi: i64 = {hi}; if __ulo < __uhi && {} {{ {fast_run} }} else {{ {slow_loop} }} }}",
             tests.join(" && ")
-        ));
-        Some(out)
+        ))
+    }
+
+    /// True if `e` only computes (arithmetic, comparisons, planned vector accesses, `let`,
+    /// `set` of locals and of planned elements, `if`, `do`), so running it twice changes
+    /// nothing but the variables `outer` collects (set here, declared before the loop).
+    fn defer_ok(&self, e: &Expr, inner: &HashSet<BindId>, outer: &mut Vec<BindId>) -> bool {
+        match &e.kind {
+            ExprKind::Int(_) | ExprKind::Float(_) => true,
+            ExprKind::Var(_) => true,
+            ExprKind::Let { value, .. } => self.defer_ok(value, inner, outer),
+            ExprKind::Set(p, v) => {
+                let p_ok = match &p.kind {
+                    ExprKind::Var(_) => match self.ck.res[p.id as usize] {
+                        Res::Local(b) if inner.contains(&b) => true,
+                        Res::Local(b) => {
+                            // Outside variables only as sums (a reduction LLVM vectorizes); a
+                            // running minimum or the like cannot vectorize, and there the
+                            // deferred checks only cost.
+                            let sum = matches!(&v.kind, ExprKind::Call(op, _, xs) if (op == "+" || op == "-")
+                                && matches!((&xs[0].expr().kind, &self.ck.res[xs[0].expr().id as usize]), (ExprKind::Var(_), Res::Local(x)) if *x == b));
+                            if sum && !outer.contains(&b) {
+                                outer.push(b);
+                            }
+                            sum
+                        }
+                        _ => false,
+                    },
+                    ExprKind::Call(n, _, _) => n == "at",
+                    _ => false,
+                };
+                p_ok && self.defer_ok(v, inner, outer)
+            }
+            ExprKind::If(c, t, f) => {
+                self.defer_ok(c, inner, outer)
+                    && self.defer_ok(t, inner, outer)
+                    && f.as_ref().map_or(true, |f| self.defer_ok(f, inner, outer))
+            }
+            ExprKind::Do(es) => es.iter().all(|x| self.defer_ok(x, inner, outer)),
+            ExprKind::Field(b, _, _) => self.defer_ok(b, inner, outer),
+            ExprKind::As(_, x) => {
+                let from = self.ty(x);
+                let to = self.ty(e);
+                let plain = !(matches!(to, Ty::Int(_)) && (from.is_int() || from.is_float()) && from != to);
+                plain && self.defer_ok(x, inner, outer)
+            }
+            ExprKind::Call(n, _, args) => {
+                if !matches!(self.ck.res.get(e.id as usize), Some(Res::Builtin(_))) {
+                    return false;
+                }
+                let ok_name = matches!(
+                    n.as_str(),
+                    "+" | "-" | "*" | "/" | "%" | "==" | "!=" | "<" | "<=" | ">" | ">=" | "and" | "or" | "not" | "min" | "max" | "abs" | "bit-and" | "bit-or" | "bit-xor"
+                ) || n == "at";
+                ok_name && args.iter().all(|a| matches!(a, Arg::Val(_)) && self.defer_ok(a.expr(), inner, outer))
+            }
+            _ => false,
+        }
     }
 
     /// `(set s (str s a b ...))` appends to `s` in place instead of rebuilding it, so building
@@ -2704,5 +3935,178 @@ fn walk_ref<'e>(e: &'e Expr, f: &mut dyn FnMut(&'e Expr)) {
         ExprKind::Try(x) | ExprKind::As(_, x) | ExprKind::Copy(x) => walk_ref(x, f),
         ExprKind::Lambda(_, b) => b.iter().for_each(|x| walk_ref(x, f)),
         ExprKind::Tasks(_, ts) => ts.iter().for_each(|t| t.body.iter().for_each(|x| walk_ref(x, f))),
+    }
+}
+
+/// True if a `break` in `es` would leave the loop whose body `es` is (not an inner loop).
+fn breaks_out(es: &[Expr]) -> bool {
+    fn go(e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Break => true,
+            ExprKind::For(..) | ExprKind::While(..) | ExprKind::Lambda(..) => false,
+            ExprKind::Let { value, .. } => go(value),
+            ExprKind::Set(a, b) => go(a) || go(b),
+            ExprKind::If(c, t, f) => go(c) || go(t) || f.as_ref().is_some_and(|f| go(f)),
+            ExprKind::Do(es) => es.iter().any(go),
+            ExprKind::Match(s, arms) => go(s) || arms.iter().any(|a| a.body.iter().any(go)),
+            ExprKind::Call(_, _, args) => args.iter().any(|a| go(a.expr())),
+            _ => false,
+        }
+    }
+    es.iter().any(go)
+}
+
+/// The expression with this id inside `es`.
+fn find_expr(es: &[Expr], id: u32) -> Option<&Expr> {
+    let mut found = None;
+    for x in es {
+        walk_ref(x, &mut |e| {
+            if e.id == id {
+                found = Some(e);
+            }
+        });
+    }
+    found
+}
+
+/// An index as `i * stride + j + consts` (see `aff`).
+#[derive(Default)]
+struct Aff<'e> {
+    lv: bool,
+    stride: Option<&'e Expr>,
+    j: Option<BindId>,
+    consts: Vec<(bool, &'e Expr)>,
+}
+
+/// Splits `e` (seen through the body's `let`s) into the loop variable `lv` times a fixed
+/// stride, at most one inner range variable, and fixed terms. False if it has another form.
+#[allow(clippy::too_many_arguments)]
+fn aff<'e>(
+    em: &Emitter,
+    e: &'e Expr,
+    lv: BindId,
+    lets: &HashMap<BindId, &'e Expr>,
+    ranges: &HashMap<BindId, (&'e Expr, &'e Expr)>,
+    fixed: &dyn Fn(&Expr) -> bool,
+    plus: bool,
+    out: &mut Aff<'e>,
+    depth: usize,
+) -> bool {
+    if depth > 12 {
+        return false;
+    }
+    let builtin = |x: &Expr| matches!(em.ck.res.get(x.id as usize), Some(Res::Builtin(_)));
+    let local = |x: &Expr| match (&x.kind, &em.ck.res[x.id as usize]) {
+        (ExprKind::Var(_), Res::Local(b)) => Some(*b),
+        _ => None,
+    };
+    if fixed(e) {
+        out.consts.push((plus, e));
+        return true;
+    }
+    if let Some(b) = local(e) {
+        if b == lv {
+            if out.lv || !plus {
+                return false;
+            }
+            out.lv = true;
+            return true;
+        }
+        if ranges.contains_key(&b) {
+            if out.j.is_some() || !plus {
+                return false;
+            }
+            out.j = Some(b);
+            return true;
+        }
+        return match lets.get(&b) {
+            Some(v) => aff(em, v, lv, lets, ranges, fixed, plus, out, depth + 1),
+            None => false,
+        };
+    }
+    let ExprKind::Call(n, _, xs) = &e.kind else { return false };
+    if !builtin(e) {
+        return false;
+    }
+    match (n.as_str(), xs.len()) {
+        ("+", _) => xs.iter().all(|x| aff(em, x.expr(), lv, lets, ranges, fixed, plus, out, depth + 1)),
+        ("-", 2) => {
+            aff(em, xs[0].expr(), lv, lets, ranges, fixed, plus, out, depth + 1)
+                && fixed(xs[1].expr())
+                && {
+                    out.consts.push((!plus, xs[1].expr()));
+                    true
+                }
+        }
+        ("*", 2) => {
+            let (x, y) = (xs[0].expr(), xs[1].expr());
+            let (v, s) = if local(x) == Some(lv) && fixed(y) {
+                (x, y)
+            } else if local(y) == Some(lv) && fixed(x) {
+                (y, x)
+            } else {
+                return false;
+            };
+            let _ = v;
+            if out.lv || !plus {
+                return false;
+            }
+            out.lv = true;
+            out.stride = Some(s);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// i128 form of a fixed expression, for tests that cannot overflow themselves.
+fn wide_of(em: &mut Emitter, e: &Expr) -> String {
+    match &e.kind {
+        ExprKind::Call(n, _, xs) if matches!(n.as_str(), "+" | "-" | "*") && !xs.is_empty() => {
+            if n == "-" && xs.len() == 1 {
+                return format!("(-{})", wide_of(em, xs[0].expr()));
+            }
+            let parts: Vec<String> = xs.iter().map(|x| wide_of(em, x.expr())).collect();
+            format!("({})", parts.join(&format!(" {n} ")))
+        }
+        ExprKind::Call(n, _, xs) if n == "len" => format!("({}.len() as i128)", em.pv(xs[0].expr())),
+        _ => format!("(({}) as i128)", em.val(e)),
+    }
+}
+
+/// Names of the fns whose body has an expression `hit` matches, directly or through the fns
+/// they call; `recursive` also counts fns that call themselves.
+fn fns_reaching(prog: &Program, hit: impl Fn(&Expr) -> bool, recursive: bool) -> HashSet<String> {
+    let mut calls: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut heavy: HashSet<String> = HashSet::new();
+    for it in &prog.items {
+        let Item::Fn(f) = it else { continue };
+        let mut cs = HashSet::new();
+        let mut loops = false;
+        for x in &f.body {
+            walk_ref(x, &mut |e| {
+                if hit(e) {
+                    loops = true;
+                }
+                if let ExprKind::Call(n, _, _) = &e.kind {
+                    cs.insert(n.clone());
+                }
+            });
+        }
+        if loops || (recursive && cs.contains(&f.name)) {
+            heavy.insert(f.name.clone());
+        }
+        calls.insert(f.name.clone(), cs);
+    }
+    loop {
+        let before = heavy.len();
+        for (f, cs) in &calls {
+            if !heavy.contains(f) && cs.iter().any(|c| heavy.contains(c)) {
+                heavy.insert(f.clone());
+            }
+        }
+        if heavy.len() == before {
+            return heavy;
+        }
     }
 }

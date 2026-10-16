@@ -27,7 +27,7 @@ def grade(src):
     rel = os.path.relpath(src, ROOT).replace("\\", "/")
     task = rel.split("/")[-2]
     run = rel.split("/")[2]
-    env = dict(os.environ, AIL=AIL, EXP_TASKS="tasks_" + run[:2] if run[:2] in ("r3", "r4") else "tasks")
+    env = dict(os.environ, AIL=AIL, EXP_TASKS="tasks_" + run[:2] if run[:2] in ("r3", "r4", "r5") else "tasks")
     p = subprocess.run([sys.executable, os.path.join(ROOT, "experiment", "grade.py"), "ail", task, src],
                        capture_output=True, text=True, env=env)
     r = json.loads(p.stdout)

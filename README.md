@@ -21,6 +21,10 @@ the first attempt?
   checked and compiled as its own copy, so there is no trait syntax and no runtime cost.
 - **Parallelism that cannot race.** `(par-map xs f)` runs on every core and returns exactly what
   `map` would: values are never shared, lambdas only read, and no effects are allowed inside.
+- **Loops that parallelize themselves.** A plain `for` whose iterations are independent (sums,
+  histograms, running maxima, writes to its own elements, pushes, prints) runs on every core with
+  no change to the source. Results, output order and traps are exactly those of the sequential
+  loop.
 - **Concurrent I/O.** `(par-run xs f)` runs `f` on up to 64 elements at once for work that waits
   on the network or the disk, and `http-request` is an HTTP client with kept-alive connections.
 - **Tasks and channels without deadlocks.** `(tasks (channel c T) (task (out c) ...) (task (in c) ...))`
@@ -129,6 +133,13 @@ interpreter that must detect overflow, a CPU scheduler, JSON queries, hashing. E
 at most one per model there. Both ail misses were compiler bugs (the checker was stricter than
 the spec), fixed since, after which those unchanged programs pass. TypeScript's miss was a real
 logic bug. Details are in [`experiment/RESULTS.md`](experiment/RESULTS.md).
+
+**Speed of the code models write.** r4 and r5 time the ail and the Rust that the same model wrote
+for seven compute-heavy tasks. When the statement mentions 12 cores (r4), the models write threaded
+Rust and ail is 1.3 times slower on average. When it does not (r5), they write sequential code in
+both languages, and ail's self-parallelizing loops make it faster on average (0.81 of the Rust
+time): 1.7 to 2.6 times faster on kmeans and matrix product, and still 1.3 to 1.9 times slower on
+tasks that are sequential by nature.
 
 The task statements are public, in `experiment/tasks*/`. The hidden tests, and the Python
 generators that produce them, are not: published tests would end up in training data, and the
