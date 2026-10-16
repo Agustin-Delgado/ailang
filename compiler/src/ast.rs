@@ -163,6 +163,26 @@ pub enum ExprKind {
     Copy(Box<Expr>),
     /// `(lambda (x (y T)) body...)`: only valid as an argument for a `(Fn ...)` parameter.
     Lambda(Vec<LambdaParam>, Vec<Expr>),
+    /// `(tasks (channel c T)... (task (in c) (out d) (mut x) body...)...)`: tasks that run at
+    /// the same time, connected by channels; the block ends when every task has finished.
+    Tasks(Vec<ChanDecl>, Vec<TaskDef>),
+}
+
+#[derive(Clone, Debug)]
+pub struct ChanDecl {
+    pub name: String,
+    pub span: Span,
+    pub ty: TypeExpr,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskDef {
+    pub span: Span,
+    /// Channels this task receives from, sends to, and outer variables it owns (may change).
+    pub ins: Vec<(String, Span)>,
+    pub outs: Vec<(String, Span)>,
+    pub owns: Vec<(String, Span)>,
+    pub body: Vec<Expr>,
 }
 
 #[derive(Clone, Debug)]
@@ -789,6 +809,68 @@ impl Lower {
                 }
                 ExprKind::Lambda(params, self.exprs(&args[1..]))
             }
+            "tasks" => {
+                let shape = "(tasks (channel name Type)... (task (in c) (out d) (mut x) body...)...)";
+                let mut chans = Vec::new();
+                let mut tasks = Vec::new();
+                for a in args {
+                    let Some(l) = a.list() else {
+                        self.err("E0029", a.span, shape);
+                        return None;
+                    };
+                    match a.head() {
+                        Some("channel") => {
+                            if l.len() != 3 {
+                                self.err("E0029", a.span, "a channel is declared as (channel name Type)");
+                                return None;
+                            }
+                            chans.push(ChanDecl { name: self.ident(&l[1])?, span: l[1].span, ty: self.type_expr(&l[2])? });
+                        }
+                        Some("task") => {
+                            let (mut ins, mut outs, mut owns) = (Vec::new(), Vec::new(), Vec::new());
+                            let mut i = 1;
+                            while let Some(h) = l.get(i) {
+                                let list = match h.head() {
+                                    Some("in") => &mut ins,
+                                    Some("out") => &mut outs,
+                                    Some("mut") => &mut owns,
+                                    _ => break,
+                                };
+                                let names = h.list().unwrap();
+                                if names.len() < 2 {
+                                    self.err("E0029", h.span, "(in c...), (out c...) and (mut x...) name at least one channel or variable");
+                                    return None;
+                                }
+                                for n in &names[1..] {
+                                    list.push((self.ident(n)?, n.span));
+                                }
+                                i += 1;
+                            }
+                            if i >= l.len() {
+                                self.err("E0029", a.span, "a task needs a body: (task (in c) (out d) body...)");
+                                return None;
+                            }
+                            tasks.push(TaskDef { span: a.span, ins, outs, owns, body: self.exprs(&l[i..]) });
+                        }
+                        _ => {
+                            self.err("E0029", a.span, &format!("inside (tasks ...) only (channel ...) and (task ...) are allowed; the shape is {shape}"));
+                            return None;
+                        }
+                    }
+                }
+                if tasks.is_empty() {
+                    self.err("E0029", span, shape);
+                    return None;
+                }
+                ExprKind::Tasks(chans, tasks)
+            }
+            "break" | "continue" if args.is_empty() => {
+                self.diags.push(
+                    Diag::error("E0029", span, &format!("{head} is written without parentheses"))
+                        .with_fix_replace(span, head, &format!("write {head}")),
+                );
+                return None;
+            }
             "fn" => {
                 // An anonymous function written the way other languages spell it.
                 self.diags.push(
@@ -955,5 +1037,6 @@ fn renumber(e: &mut Expr, next: &mut u32) {
             renumber(x, next)
         }
         ExprKind::Lambda(_, b) => b.iter_mut().for_each(|x| renumber(x, next)),
+        ExprKind::Tasks(_, ts) => ts.iter_mut().for_each(|t| t.body.iter_mut().for_each(|x| renumber(x, next))),
     }
 }

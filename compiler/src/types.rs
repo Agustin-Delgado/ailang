@@ -122,6 +122,9 @@ pub enum Ty {
     /// applied to arguments that still mention parameters. Checked code never sees these.
     Param(String),
     App(String, Vec<Ty>),
+    /// One end of a channel inside (tasks ...): true for the sending end. Only usable with
+    /// send, recv and for, by the task that declared it with (in c) or (out c).
+    Chan(Box<Ty>, bool),
     /// Poison type after an error; compatible with everything to avoid cascades.
     Err,
 }
@@ -220,6 +223,8 @@ impl fmt::Display for Ty {
                 }
                 write!(f, ")")
             }
+            Ty::Chan(t, true) => write!(f, "(sending end of a channel of {t})"),
+            Ty::Chan(t, false) => write!(f, "(receiving end of a channel of {t})"),
             Ty::Err => write!(f, "?"),
         }
     }

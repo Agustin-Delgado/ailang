@@ -23,6 +23,10 @@ the first attempt?
   `map` would: values are never shared, lambdas only read, and no effects are allowed inside.
 - **Concurrent I/O.** `(par-run xs f)` runs `f` on up to 64 elements at once for work that waits
   on the network or the disk, and `http-request` is an HTTP client with kept-alive connections.
+- **Tasks and channels without deadlocks.** `(tasks (channel c T) (task (out c) ...) (task (in c) ...))`
+  runs tasks at the same time. Every channel has one sender and one receiver, the tasks form no
+  cycle, and a variable is changed by at most one task. A deadlock or a data race cannot be
+  written, and the output does not depend on timing.
 - **Servers where GET cannot write.** `(http-serve net port max-body state read write)` runs GET
   handlers in parallel with read-only access to the state, and every other method one at a time
   with `mut` access. A GET with side effects does not compile, and handlers cannot race.
@@ -44,9 +48,9 @@ written by its own AI agent, working without seeing the other: one idiomatic Rus
 the best of 5 to 9 whole-process runs on a Ryzen 5 2600 under Windows 11, with ail and Rust runs
 interleaved so that load from other programs hits both equally.
 
-### Native: 14 tasks
+### Native: 15 tasks
 
-![ail vs Rust on 14 native tasks](docs/charts/native.svg)
+![ail vs Rust on 15 native tasks](docs/charts/native.svg)
 
 | task | what it exercises | ail | Rust | ail/Rust time |
 |---|---|---|---|---|
@@ -58,6 +62,7 @@ interleaved so that load from other programs hits both equally.
 | fannkuch | permutations, array indexing | 2.69 s | 3.45 s | **0.78** |
 | interp | bytecode VM, enum dispatch | 2.30 s | 2.87 s | **0.80** |
 | wordfreq | tokenize 3M words, count, sort | 0.31 s | 0.34 s | **0.92** |
+| pipeline | 3 stages on 3 threads joined by channels (`tasks` vs std mpsc) | 0.88 s | 0.95 s | **0.93** |
 | api | REST handlers: routing, JSON in and out, store | 2.78 s | 3.00 s | **0.93** |
 | nbody | f64 struct math | 2.92 s | 2.85 s | 1.02 |
 | raytrace | f64 vector math, enum shapes | 0.024 s | 0.024 s | 1.04 * |
@@ -212,4 +217,4 @@ target/release/ail web ../examples/dodge.ail          # build for the browser an
 ail is an early research language: v0.3 is released and v0.4 (string views, functions as
 arguments, generics, programs split across files with `(use name)`, `par-map`, concurrent servers
 with `http-serve`) is in development on `main`. The pieces above work and are measured. Still to
-come: long-lived tasks and channels, keep-alive on the server side, and https.
+come: keep-alive on the server side, https, and tasks that live alongside a server.

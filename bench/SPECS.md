@@ -244,6 +244,16 @@ After `Halt`, print `total <slot 2>` and `executed <number of instructions execu
 
 ---
 
+## pipeline — three stages joined by channels
+
+Three concurrent stages. The producer makes `N = 2,000,000` lines `GET /item/<i mod 1000> <status> <ms>`,
+with `status` = 500 if `i mod 13 = 0`, else 404 if `i mod 7 = 0`, else 200, and `ms = (i * 7919) mod 1000`.
+The parser splits each line on spaces into a record (path, status, ms). The aggregator counts
+status >= 500 (errors), status 404 (missing), and per path the hits and the sum of ms. Each stage
+runs on its own thread, and values go one at a time over channels (ail: `tasks`; Rust:
+`std::thread` + `std::sync::mpsc`). Output: `hits <total> errors <e> missing <m>`,
+`paths <distinct> ms <sum>`, `slowest <path> <ms>` (largest ms; ties go to the smallest path).
+
 ## mandel — Mandelbrot set, parallel over rows (the parallel benchmark)
 
 Image `W = 2000` by `H = 2000` pixels, `MAX_ITER = 1000`. Rows are independent: **compute them in

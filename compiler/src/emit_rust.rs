@@ -321,6 +321,8 @@ pub fn rty(t: &Ty) -> String {
         Ty::Res(a, b) => format!("Result<{}, {}>", rty(a), rty(b)),
         Ty::User(n) => ty_name(n),
         Ty::Cap(c) => format!("ail_rt::{}", c.name()),
+        Ty::Chan(t, true) => format!("std::sync::mpsc::Sender<{}>", rty(t)),
+        Ty::Chan(t, false) => format!("std::sync::mpsc::Receiver<{}>", rty(t)),
         Ty::Fn(..) | Ty::Param(_) | Ty::App(..) => "_".into(),
         Ty::Err => "_".into(),
     }
@@ -431,6 +433,7 @@ pub fn compute_moves(body: &[Expr], ck: &Checked) -> HashSet<u32> {
                 expr(x, ck, uses, next, path, depth)
             }
             ExprKind::Lambda(_, b) => block(b, ck, uses, next, path, depth + 1),
+            ExprKind::Tasks(_, ts) => ts.iter().for_each(|t| block(&t.body, ck, uses, next, path, depth + 1)),
         }
     }
     block(body, ck, &mut uses, &mut next_stmt, &mut path, 0);
@@ -774,6 +777,37 @@ impl<'a> Emitter<'a> {
     }
 
     /// A block; when `unit` is set, a non-Unit final value is discarded so the block is `()`.
+    /// `(tasks ...)`: one scoped thread per task, std channels between them. A sender moves into
+    /// its task, so the channel closes when that task ends and the receiver's loop finishes.
+    fn emit_tasks(&mut self, id: u32, chans: &[ChanDecl], tasks: &[TaskDef]) -> String {
+        let mut out = String::from("{ ail_rt::flush();
+");
+        for (i, c) in chans.iter().enumerate() {
+            let ct = rty(&self.ck.chan_types[&id][i]);
+            let m = mangle(&c.name);
+            out.push_str(&format!("let (__tx_{m}, __rx_{m}) = std::sync::mpsc::channel::<{ct}>();
+"));
+        }
+        out.push_str("std::thread::scope(|__s| {
+");
+        let saved = self.cur_view.take();
+        for t in tasks {
+            let mut ends = String::new();
+            for (n, _) in &t.outs {
+                ends.push_str(&format!("let {} = __tx_{}; ", self.local_name(n), mangle(n)));
+            }
+            for (n, _) in &t.ins {
+                ends.push_str(&format!("let {} = __rx_{}; ", self.local_name(n), mangle(n)));
+            }
+            let body = self.block_as(&t.body, true);
+            out.push_str(&format!("__s.spawn(|| {{ {ends}let _ = {body}; ail_rt::flush(); }});
+"));
+        }
+        self.cur_view = saved;
+        out.push_str("}); }");
+        out
+    }
+
     pub fn block_as(&mut self, es: &[Expr], unit: bool) -> String {
         self.block_tail(es, if unit { Tail::Unit } else { Tail::Val })
     }
@@ -998,6 +1032,7 @@ impl<'a> Emitter<'a> {
                 None => self.rvalue(inner),
             },
             ExprKind::Lambda(..) => unreachable!("lambdas are emitted where they are passed"),
+            ExprKind::Tasks(chans, tasks) => self.emit_tasks(id as u32, chans, tasks),
             ExprKind::Call(name, _, args) => match self.ck.res[id].clone() {
                 Res::LocalFn(b) => {
                     let f = self.local_name(&self.ck.bindings[b].name);
@@ -1428,6 +1463,8 @@ impl<'a> Emitter<'a> {
                 let c = self.conv_ref("__e", &self.elem_ty(a(0)));
                 format!("{{ let __f = {f}; {xs}.iter().map(|__e| __f({c})).collect::<Vec<_>>() }}")
             }
+            "send" => format!("{{ let _ = {}.send({}); }}", self.place(a(0)).expect("channel"), self.val(a(1))),
+            "recv" => format!("{}.recv().ok()", self.place(a(0)).expect("channel")),
             "par-map" | "par-run" => {
                 let (f, xs) = (self.closure(a(1)), self.pv(a(0)));
                 let el = self.elem_ty(a(0));
@@ -2209,6 +2246,7 @@ impl<'a> Emitter<'a> {
             | ExprKind::As(_, x)
             | ExprKind::Copy(x) => self.plan_views_in(x),
             ExprKind::Lambda(_, b) => self.plan_views(b),
+            ExprKind::Tasks(_, ts) => ts.iter().for_each(|t| self.plan_views(&t.body)),
             _ => {}
         }
     }

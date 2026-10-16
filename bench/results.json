@@ -63,6 +63,13 @@
   "same_output": true
  },
  {
+  "bench": "pipeline",
+  "ail_s": 0.8788,
+  "rust_s": 0.9474,
+  "ratio": 0.928,
+  "same_output": true
+ },
+ {
   "bench": "raytrace",
   "ail_s": 0.0244,
   "rust_s": 0.0235,
