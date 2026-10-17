@@ -758,6 +758,127 @@ mod ail_rt {
     )* } }
     uabs_impl!(i8, i16, i32, i64, u8, u16, u32, u64);
 
+    /// Sorts `v` on all cores when it is long: chunks are sorted in parallel, then merged pairwise,
+    /// each merge split among the threads at points found by binary search. Ties keep their
+    /// order (an element of the left run goes first), so the result is the one a stable
+    /// sequential sort gives; `stable` false allows an unstable sort of each chunk, for element
+    /// types where equal means identical. `cmp` must not trap.
+    pub fn psort<T: Send + Sync>(v: &mut Vec<T>, stable: bool, cmp: impl Fn(&T, &T) -> std::cmp::Ordering + Sync) {
+        let n = v.len();
+        #[cfg(not(target_arch = "wasm32"))]
+        let threads = if n >= 1 << 16 && !pool::inside() { pool::size() } else { 1 };
+        #[cfg(target_arch = "wasm32")]
+        let threads = 1;
+        if threads <= 1 {
+            if stable { v.sort_by(cmp) } else { v.sort_unstable_by(cmp) }
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            struct P<T>(*mut T);
+            unsafe impl<T> Sync for P<T> {}
+            impl<T> P<T> {
+                #[inline(always)]
+                fn at(&self, i: usize) -> *mut T { unsafe { self.0.add(i) } }
+            }
+            // Runs task(0..count) on the pool, or here if the pool is taken.
+            fn tasks(count: usize, task: &(dyn Fn(usize) + Sync)) {
+                let next = AtomicUsize::new(0);
+                let work = || loop {
+                    let t = next.fetch_add(1, Ordering::Relaxed);
+                    if t >= count {
+                        break;
+                    }
+                    task(t);
+                };
+                if !pool::run(&work) {
+                    work();
+                }
+            }
+            let k = threads * 2;
+            let bounds: Vec<usize> = (0..=k).map(|c| n * c / k).collect();
+            let a = P(v.as_mut_ptr());
+            tasks(k, &|c| {
+                let s = unsafe { std::slice::from_raw_parts_mut(a.at(bounds[c]), bounds[c + 1] - bounds[c]) };
+                if stable { s.sort_by(&cmp) } else { s.sort_unstable_by(&cmp) }
+            });
+            let mut tmp: Vec<T> = Vec::with_capacity(n);
+            let b = P(tmp.as_mut_ptr());
+            // Runs, as boundaries; each round merges neighbours from one buffer into the other.
+            let mut runs = bounds;
+            let mut in_v = true;
+            while runs.len() > 2 {
+                let (src, dst) = if in_v { (&a, &b) } else { (&b, &a) };
+                let mut next_runs = vec![0];
+                let mut jobs: Vec<(usize, usize, usize)> = Vec::new(); // (lo, mid, hi)
+                let mut r = 0;
+                while r + 1 < runs.len() {
+                    if r + 2 < runs.len() {
+                        jobs.push((runs[r], runs[r + 1], runs[r + 2]));
+                        next_runs.push(runs[r + 2]);
+                        r += 2;
+                    } else {
+                        jobs.push((runs[r], runs[r + 1], runs[r + 1]));
+                        next_runs.push(runs[r + 1]);
+                        r += 1;
+                    }
+                }
+                // Each merge is split into pieces of about n / (2 * threads) output elements.
+                let piece = (n / (threads * 2)).max(1 << 12);
+                let mut pieces: Vec<(usize, usize, usize, usize)> = Vec::new(); // (job, k0, k1)
+                for (jx, &(lo, _, hi)) in jobs.iter().enumerate() {
+                    let len = hi - lo;
+                    let m = len.div_ceil(piece).max(1);
+                    for p in 0..m {
+                        pieces.push((jx, len * p / m, len * (p + 1) / m, 0));
+                    }
+                }
+                tasks(pieces.len(), &|t| {
+                    let (jx, k0, k1, _) = pieces[t];
+                    let (lo, mid, hi) = jobs[jx];
+                    let x = unsafe { std::slice::from_raw_parts(src.at(lo) as *const T, mid - lo) };
+                    let y = unsafe { std::slice::from_raw_parts(src.at(mid) as *const T, hi - mid) };
+                    // How many of the first k outputs come from x: the largest i with
+                    // x[i-1] not after y[k-i].
+                    let co = |kk: usize| {
+                        let (mut l, mut h) = (kk.saturating_sub(y.len()), kk.min(x.len()));
+                        while l < h {
+                            let i = (l + h + 1) / 2;
+                            let j = kk - i;
+                            if j < y.len() && cmp(&y[j], &x[i - 1]) == std::cmp::Ordering::Less { h = i - 1 } else { l = i }
+                        }
+                        l
+                    };
+                    let (mut i, i1) = (co(k0), co(k1));
+                    let (mut j, j1) = (k0 - i, k1 - i1);
+                    let mut o = lo + k0;
+                    unsafe {
+                        while i < i1 && j < j1 {
+                            if cmp(&y[j], &x[i]) == std::cmp::Ordering::Less {
+                                std::ptr::copy_nonoverlapping(&y[j], dst.at(o), 1);
+                                j += 1;
+                            } else {
+                                std::ptr::copy_nonoverlapping(&x[i], dst.at(o), 1);
+                                i += 1;
+                            }
+                            o += 1;
+                        }
+                        std::ptr::copy_nonoverlapping(x.as_ptr().add(i), dst.at(o), i1 - i);
+                        o += i1 - i;
+                        std::ptr::copy_nonoverlapping(y.as_ptr().add(j), dst.at(o), j1 - j);
+                    }
+                });
+                runs = next_runs;
+                in_v = !in_v;
+            }
+            if !in_v {
+                // The elements were moved into tmp; move them back (tmp keeps length 0).
+                unsafe { std::ptr::copy_nonoverlapping(b.0 as *const T, a.0, n) };
+            }
+        }
+    }
+
     /// Stable sort of `v` by precomputed keys (one per element): elements are moved, not copied.
     pub fn sort_by_keys<T, K>(v: &mut Vec<T>, keys: Vec<K>, cmp: impl Fn(&K, &K) -> std::cmp::Ordering) {
         let mut idx: Vec<usize> = (0..v.len()).collect();

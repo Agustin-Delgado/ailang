@@ -22,3 +22,6 @@ experiment/tasks_r4/*/perf/
 experiment/r4_tasks.py
 experiment/tasks_r5/*/tests/
 experiment/tasks_r5/*/perf/
+experiment/tasks_r6/*/tests/
+experiment/tasks_r6/*/perf/
+experiment/r6_tasks.py
