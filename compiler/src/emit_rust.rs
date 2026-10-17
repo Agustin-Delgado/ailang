@@ -52,6 +52,39 @@ pub struct Emitter<'a> {
     heavy_fns: HashSet<String>,
     /// Fns that use par-map, directly or through the fns they call.
     par_fns: HashSet<String>,
+    /// Native builds may send loops to the GPU (see `gpu_attempt`).
+    gpu_on: bool,
+    /// Every fn definition, for kernels that call helpers.
+    fn_defs: HashMap<String, FnDef>,
+    /// Static descriptions of the kernels written so far.
+    kernels: Vec<String>,
+    /// Second emission pass: vectors in GPU-aware fns carry mirrors (see `gpu_sync`).
+    pass2: bool,
+    /// Found by the first pass: loops that became kernels, and the fns that hold them.
+    kernel_loops: HashSet<u32>,
+    kernel_fns: HashSet<String>,
+    /// Fns with kernels and the fns that call them: their vectors keep device copies.
+    aware: HashSet<String>,
+    /// Mirror of each vector binding in the fn being emitted: (Rust name, kind).
+    mirrors: HashMap<BindId, (String, MirrorKind)>,
+    /// Above zero while emitting code that runs on the CPU as a whole (synced before).
+    gpu_quiet: u32,
+    /// Read-only parameters already shadowed by a CPU copy in the current block.
+    viewed: HashSet<BindId>,
+    /// The kernel loop being emitted as a statement of GPU-structured code: its launch uses
+    /// the vectors' mirrors (elsewhere a launch gets its own and leaves the CPU copy current).
+    kernel_stmt: Option<u32>,
+}
+
+/// How the fn being emitted holds a vector that has a mirror.
+#[derive(Clone, Copy, PartialEq)]
+enum MirrorKind {
+    /// A local: the fn owns it and its mirror.
+    Owned,
+    /// A `mut` parameter: written in place, the caller's mirror comes along.
+    MutParam,
+    /// A read-only parameter: never written here; read on the CPU through a copy if needed.
+    RefParam,
 }
 
 /// How a statement of a parallel loop body is emitted (see `for_par`).
@@ -170,10 +203,94 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, file_lines: &[u
         no_par: false,
         heavy_fns: HashSet::new(),
         par_fns: HashSet::new(),
+        gpu_on: !matches!(mode_kind, ModeKind::Web) && std::env::var("AIL_NO_GPU").is_err(),
+        fn_defs: prog.items.iter().filter_map(|i| match i { Item::Fn(f) => Some((f.name.clone(), f.clone())), _ => None }).collect(),
+        kernels: Vec::new(),
+        pass2: false,
+        kernel_loops: HashSet::new(),
+        kernel_fns: HashSet::new(),
+        aware: HashSet::new(),
+        mirrors: HashMap::new(),
+        gpu_quiet: 0,
+        viewed: HashSet::new(),
+        kernel_stmt: None,
     };
     em.infer_view_fns(prog);
     em.heavy_fns = fns_reaching(prog, |e| matches!(e.kind, ExprKind::For(..) | ExprKind::While(..)), true);
     em.par_fns = fns_reaching(prog, |e| matches!(&e.kind, ExprKind::Call(n, _, _) if n == "par-map" || n == "par-run"), false);
+    let mut out = emit_items(&mut em, prog, ck, &mode);
+    if !em.kernels.is_empty() {
+        // Loops became kernels: emit again, now knowing which fns hold device copies.
+        em.aware = gpu_aware(prog, ck, &em.kernel_fns);
+        em.pass2 = true;
+        em.kernels.clear();
+        em.tmp = 0;
+        out = emit_items(&mut em, prog, ck, &mode);
+    }
+    let (body, table) = line_table(&out, src, file_lines);
+    let mut fin = body;
+    writeln!(fin, "static AIL_FILE: &str = {:?};", file).unwrap();
+    writeln!(
+        fin,
+        "static AIL_LINES: [(u32, u32, u32); {}] = [{}];",
+        table.len(),
+        table
+            .iter()
+            .map(|(a, b, c)| format!("({a},{b},{c})"))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+    .unwrap();
+    fin.push_str(crate::runtime::RUNTIME);
+    fin.push_str(crate::runtime_net::RUNTIME_NET);
+    if !em.kernels.is_empty() {
+        for k in &em.kernels {
+            fin.push_str(k);
+            fin.push('\n');
+        }
+        fin.push_str(crate::runtime_gpu::RUNTIME_GPU);
+    }
+    if matches!(mode_kind, ModeKind::Web) {
+        fin.push_str(crate::runtime_web::RUNTIME_WEB);
+    } else {
+        // Native builds of an app (e.g. `ail test` on a game): drawing does nothing.
+        fin.push_str(crate::runtime_web::RUNTIME_WEB_STUB);
+    }
+    fin
+}
+
+/// Fns that hold kernels, and every fn that calls one of them.
+fn gpu_aware(prog: &Program, ck: &Checked, kernel_fns: &HashSet<String>) -> HashSet<String> {
+    let mut calls: HashMap<String, HashSet<String>> = HashMap::new();
+    for it in &prog.items {
+        if let Item::Fn(f) = it {
+            let mut cs = HashSet::new();
+            for e in &f.body {
+                walk_ref(e, &mut |x| {
+                    if let (ExprKind::Call(..), Some(Res::UserFn(g))) = (&x.kind, ck.res.get(x.id as usize)) {
+                        cs.insert(g.clone());
+                    }
+                });
+            }
+            calls.insert(f.name.clone(), cs);
+        }
+    }
+    let mut aware = kernel_fns.clone();
+    loop {
+        let mut grew = false;
+        for (f, cs) in &calls {
+            if !aware.contains(f) && cs.iter().any(|g| aware.contains(g)) {
+                aware.insert(f.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            return aware;
+        }
+    }
+}
+
+fn emit_items(em: &mut Emitter, prog: &Program, ck: &Checked, mode: &Mode) -> String {
     let mut out = String::new();
     out.push_str("#![allow(warnings)]\n#![allow(unconditional_panic, arithmetic_overflow)]\n");
     for it in &prog.items {
@@ -209,6 +326,9 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, file_lines: &[u
                 let sig = &ck.info.fns["main"];
                 let caps: Vec<String> = sig.params.iter().map(|(_, t, _)| rty(t)).collect();
                 out.push_str("fn main() {\n    ail_rt::init(&AIL_LINES, AIL_FILE);\n");
+                if !em.kernels.is_empty() {
+                    out.push_str("    ail_gpu::start();\n");
+                }
                 let call = format!("f_main({})", caps.join(", "));
                 if sig.ret == Ty::Unit {
                     writeln!(out, "    {call};").unwrap();
@@ -282,6 +402,8 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, file_lines: &[u
                     em.view_roots.clear();
                     em.plan_views(&t.body);
                     em.fn_name = format!("test \"{}\"", t.name);
+                    em.mirrors.clear();
+                    em.viewed.clear();
                     let body = em.block_as(&t.body, true);
                     writeln!(out, "fn t_{i}() {{\n    let _: () = {body};\n}}").unwrap();
                     names.push((i, t.name.clone()));
@@ -294,29 +416,7 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, file_lines: &[u
             out.push_str("    ];\n    ail_rt::run_tests(tests);\n}\n");
         }
     }
-    let (body, table) = line_table(&out, src, file_lines);
-    let mut fin = body;
-    writeln!(fin, "static AIL_FILE: &str = {:?};", file).unwrap();
-    writeln!(
-        fin,
-        "static AIL_LINES: [(u32, u32, u32); {}] = [{}];",
-        table.len(),
-        table
-            .iter()
-            .map(|(a, b, c)| format!("({a},{b},{c})"))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-    .unwrap();
-    fin.push_str(crate::runtime::RUNTIME);
-    fin.push_str(crate::runtime_net::RUNTIME_NET);
-    if matches!(mode_kind, ModeKind::Web) {
-        fin.push_str(crate::runtime_web::RUNTIME_WEB);
-    } else {
-        // Native builds of an app (e.g. `ail test` on a game): drawing does nothing.
-        fin.push_str(crate::runtime_web::RUNTIME_WEB_STUB);
-    }
-    fin
+    out
 }
 
 /// Replace `/*@OFFSET*/` markers with a table (rust line -> ail line, col).
@@ -636,20 +736,26 @@ impl<'a> Emitter<'a> {
         self.fn_name = f.name.clone();
         let vf = self.view_fns.get(&f.name).copied();
         self.cur_view = vf.map(|v| v.1);
-        let params: Vec<String> = f
-            .params
-            .iter()
-            .zip(sig.params.iter())
-            .enumerate()
-            .map(|(i, (p, (_, t, m)))| {
-                let ty = if vf.is_some_and(|v| v.0 == i) {
-                    "&'a str".to_string()
-                } else {
-                    self.param_rty(t, *m)
-                };
-                format!("{}: {}", self.local_name(&p.name), ty)
-            })
-            .collect();
+        self.mirrors.clear();
+        self.viewed.clear();
+        let aware = self.pass2 && self.aware.contains(&f.name);
+        let pbinds = self.ck.fn_params.get(&f.name).cloned().unwrap_or_default();
+        let mut params: Vec<String> = Vec::new();
+        for (i, (p, (_, t, m))) in f.params.iter().zip(sig.params.iter()).enumerate() {
+            let ty = if vf.is_some_and(|v| v.0 == i) {
+                "&'a str".to_string()
+            } else {
+                self.param_rty(t, *m)
+            };
+            params.push(format!("{}: {}", self.local_name(&p.name), ty));
+            if aware && gpu_vec(t) {
+                let name = format!("__mp{i}");
+                params.push(format!("{name}: &ail_gpu::Mirror"));
+                if let Some(b) = pbinds.get(i) {
+                    self.mirrors.insert(*b, (name, if *m { MirrorKind::MutParam } else { MirrorKind::RefParam }));
+                }
+            }
+        }
         let (generics, ret) = match vf {
             Some((_, View::Ref)) => ("<'a>", "&'a str".to_string()),
             Some((_, View::Cow)) => ("<'a>", "std::borrow::Cow<'a, str>".to_string()),
@@ -844,6 +950,7 @@ impl<'a> Emitter<'a> {
         out.push_str("std::thread::scope(|__s| {
 ");
         let saved = self.cur_view.take();
+        self.gpu_quiet += 1;
         for t in tasks {
             let mut ends = String::new();
             for (n, _) in &t.outs {
@@ -857,6 +964,7 @@ impl<'a> Emitter<'a> {
 "));
         }
         self.cur_view = saved;
+        self.gpu_quiet -= 1;
         out.push_str("}); }");
         out
     }
@@ -868,9 +976,26 @@ impl<'a> Emitter<'a> {
     fn block_tail(&mut self, es: &[Expr], tail: Tail) -> String {
         let unit = tail == Tail::Unit;
         let mut o = String::from("{\n");
+        let hooks = self.gpu_hooks();
+        let saved_viewed = if hooks { Some(self.viewed.clone()) } else { None };
         for (i, e) in es.iter().enumerate() {
             let last = i + 1 == es.len();
             let m = self.mark(e);
+            // GPU-aware fns: make the CPU copies current before a statement that uses them.
+            let quiet = if hooks {
+                let (pre, quiet) = self.gpu_sync(e);
+                o.push_str(&pre);
+                quiet
+            } else {
+                false
+            };
+            if quiet {
+                self.gpu_quiet += 1;
+            }
+            let saved_ks = self.kernel_stmt;
+            if hooks && matches!(e.kind, ExprKind::For(..)) && self.kernel_loops.contains(&e.id) {
+                self.kernel_stmt = Some(e.id);
+            }
             match &e.kind {
                 ExprKind::Let { mutable, value, .. } => {
                     let b = self.ck.decl[&(e.id as usize)];
@@ -881,13 +1006,24 @@ impl<'a> Emitter<'a> {
                     } else {
                         format!(": {}", rty(&bi.ty))
                     };
-                    let (ann, v) = match self.views.get(&b).copied() {
-                        Some(View::Ref) => (": &str".to_string(), self.vref(value)),
-                        Some(View::Cow) => (": std::borrow::Cow<str>".to_string(), self.vcow(value)),
-                        None => (ann, self.val(value)),
+                    let mirrored = hooks && gpu_vec(&bi.ty) && !self.views.contains_key(&b);
+                    let dev = if mirrored { self.dev_copy(value, b) } else { None };
+                    let (ann, v) = match (self.views.get(&b).copied(), dev) {
+                        (_, Some((pre, code))) => {
+                            o.push_str(&pre);
+                            (ann, code)
+                        }
+                        (Some(View::Ref), _) => (": &str".to_string(), self.vref(value)),
+                        (Some(View::Cow), _) => (": std::borrow::Cow<str>".to_string(), self.vcow(value)),
+                        (None, _) => (ann, self.val(value)),
                     };
-                    let mu = if *mutable { "mut " } else { "" };
+                    let mu = if *mutable || mirrored { "mut " } else { "" };
                     writeln!(o, "{m}let {mu}{name}{ann} = {v};").unwrap();
+                    if mirrored && !self.mirrors.contains_key(&b) {
+                        let mn = format!("__m{b}");
+                        writeln!(o, "let {mn} = ail_gpu::Mirror::new();").unwrap();
+                        self.mirrors.insert(b, (mn, MirrorKind::Owned));
+                    }
                     if last {
                         o.push_str("()\n");
                     }
@@ -908,6 +1044,13 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
+            if quiet {
+                self.gpu_quiet -= 1;
+            }
+            self.kernel_stmt = saved_ks;
+        }
+        if let Some(v) = saved_viewed {
+            self.viewed = v;
         }
         if es.is_empty() {
             o.push_str("()\n");
@@ -989,9 +1132,15 @@ impl<'a> Emitter<'a> {
             }
             ExprKind::Do(es) => self.block_as(es, t == Ty::Unit),
             ExprKind::While(c, body) => {
+                // Kernels in the body may change what the condition reads: sync it each time.
+                let sync = if self.gpu_hooks() { self.gpu_sync_vars(c, false) } else { String::new() };
                 let c = self.val(c);
                 let b = self.block(body);
-                format!("while {c} {{ let _ = {b}; }}")
+                if sync.is_empty() {
+                    format!("while {c} {{ let _ = {b}; }}")
+                } else {
+                    format!("while {{ {sync}{c} }} {{ let _ = {b}; }}")
+                }
             }
             ExprKind::For(_, _, it, body) => {
                 let b = self.ck.decl[&id];
@@ -1151,9 +1300,35 @@ impl<'a> Emitter<'a> {
         let sig = self.ck.info.fns[name].clone();
         let has_mut = sig.params.iter().any(|p| p.2);
         let mut pre = String::new();
+        let mut post = String::new();
         let mut parts = Vec::new();
+        let aware = self.pass2 && self.aware.contains(name);
         for (a, (_, pt, pm)) in args.iter().zip(sig.params.iter()) {
             let x = a.expr();
+            let n_before = parts.len();
+            // After the vector itself, its mirror (the caller's, or one for this call).
+            let mirror = if aware && gpu_vec(pt) {
+                let own = match (&x.kind, self.ck.res.get(x.id as usize)) {
+                    (ExprKind::Var(_), Some(Res::Local(b))) => self.mirrors.get(b).cloned(),
+                    _ => None,
+                };
+                Some(match own {
+                    Some((m, MirrorKind::Owned)) => format!("&{m}"),
+                    Some((m, _)) => m,
+                    None => {
+                        let t = self.fresh();
+                        write!(pre, "let {t} = ail_gpu::Mirror::new(); ").unwrap();
+                        if *pm {
+                            let p = self.place(x).expect("checked mutable place");
+                            write!(post, "{t}.to_cpu(&mut {p}); ").unwrap();
+                        }
+                        format!("&{t}")
+                    }
+                })
+            } else {
+                None
+            };
+            let _ = n_before;
             if *pm {
                 let p = self.place(x).expect("checked mutable place");
                 parts.push(format!("&mut {p}"));
@@ -1180,7 +1355,7 @@ impl<'a> Emitter<'a> {
                     Some(p) => parts.push(format!("&{p}")),
                     None => {
                         let v = self.rvalue(x);
-                        if has_mut {
+                        if has_mut || mirror.is_some() {
                             let t = self.fresh();
                             write!(pre, "let {t} = {v}; ").unwrap();
                             parts.push(format!("&{t}"));
@@ -1190,12 +1365,17 @@ impl<'a> Emitter<'a> {
                     }
                 }
             }
+            if let Some(m) = mirror {
+                parts.push(m);
+            }
         }
         let call = format!("{}({})", fn_name(name), parts.join(", "));
-        if pre.is_empty() {
+        if pre.is_empty() && post.is_empty() {
             call
-        } else {
+        } else if post.is_empty() {
             format!("{{ {pre}{call} }}")
+        } else {
+            format!("{{ {pre}let __cr = {call}; {post}__cr }}")
         }
     }
 
@@ -1900,7 +2080,9 @@ impl<'a> Emitter<'a> {
                     .map(|(b, t)| format!("{}: {}", self.local_name(&self.ck.bindings[*b].name), self.conv_ty(t)))
                     .collect();
                 let saved = self.cur_view.take();
+                self.gpu_quiet += 1;
                 let b = self.block_as(body, r.as_ref() == &Ty::Unit);
+                self.gpu_quiet -= 1;
                 self.cur_view = saved;
                 format!("(|{}| -> {ret} {b})", params.join(", "))
             }
@@ -2123,7 +2305,8 @@ impl<'a> Emitter<'a> {
                     ExprKind::Call(n, _, args) => match self.ck.res.get(e.id as usize) {
                         Some(Res::UserFn(f)) => {
                             heavy |= self.heavy_fns.contains(f) || !self.ck.info.fns.contains_key(f);
-                            bad |= self.par_fns.contains(f);
+                            // A fn that may use the GPU stays on the calling thread.
+                            bad |= self.par_fns.contains(f) || (self.pass2 && self.aware.contains(f));
                         }
                         Some(Res::LocalFn(_)) => bad = true,
                         Some(Res::Builtin(_)) => match n.as_str() {
@@ -2867,13 +3050,470 @@ impl<'a> Emitter<'a> {
         };
         self.no_par = was;
         let tuple = if ret.is_empty() { "()".to_string() } else { format!("({},)", ret.join(", ")) };
-        let worth = format!("ail_rt::par_worth(__plo, __phi, {heavy})");
+        let gpu = if range.is_some() && self.gpu_on && hists.is_empty() && pushes.is_empty() && maxes.is_empty() && modsums.is_empty() && lasts.is_empty() && scratch.is_empty() && !prints {
+            self.gpu_attempt(whole.id, lv, body, &sums, &writes, &own_reads, &tests)
+        } else {
+            None
+        };
+        if let Some(g) = &gpu {
+            pre.push_str(g);
+        }
+        let worth = format!("!__pdone && ail_rt::par_worth(__plo, __phi, {heavy})");
         let cond = std::iter::once(worth).chain(tests).collect::<Vec<_>>().join(" && ");
         pre.push_str(&format!(
             "if {cond} {{ {setup}let __pr = ail_rt::par_for(__plo, __phi, {chunks}, &|__a: i64, __b: i64| {{ {privs}{head} let _ = {pbody}; }} {tuple} }}); \
              if let Some(mut __parts) = __pr {{ let mut __ok = true; {combine_check}if __ok {{ {combine_ref}for __p in __parts.iter_mut() {{ let _ = &__p; {combine_own}}} __pdone = true; }} }} }} "
         ));
+        if gpu.is_some() {
+            // The CPU run after a kernel trap without backups must trap too.
+            return Some(format!("{{ let mut __gtrap = false; {pre}if !__pdone {seq} if __gtrap {{ ail_gpu::fatal_mismatch(); }} }}"));
+        }
         Some(format!("{{ {pre}if !__pdone {seq} }}"))
+    }
+
+    /// The loop as a GPU kernel, tried before the CPU: code that sets `__pdone` when the kernel
+    /// ran and its results are in place. None if the body is outside what kernels can do.
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_attempt(
+        &mut self,
+        loop_id: u32,
+        lv: BindId,
+        body: &[Expr],
+        sums: &[(BindId, Vec<u32>)],
+        writes: &[(BindId, Vec<(u32, &Expr)>)],
+        own_reads: &[(BindId, u32, &Expr)],
+        tests: &[String],
+    ) -> Option<String> {
+        let mut sum_map = HashMap::new();
+        let mut sum_vars = Vec::new();
+        for (r, (b, ids)) in sums.iter().enumerate() {
+            sum_vars.push(*b);
+            for id in ids {
+                sum_map.insert(*id, r);
+            }
+        }
+        let collapse = self.collapse_plan(lv, body, &sum_vars);
+        let collapsed: Option<(&Expr, &Expr)> = collapse.as_ref().map(|c| (c.jlo, c.jhi));
+        let inp = crate::gpu::Input {
+            ck: self.ck,
+            fns: &self.fn_defs,
+            lv,
+            body,
+            sums: sum_map,
+            sum_vars: sum_vars.clone(),
+            writes: writes.iter().flat_map(|(_, ws)| ws.iter().map(|w| w.0)).collect(),
+            own_reads: own_reads.iter().map(|x| x.1).collect(),
+            collapse,
+        };
+        let k = crate::gpu::build(&inp);
+        drop(inp);
+        let k = k?;
+        self.kernel_loops.insert(loop_id);
+        self.kernel_fns.insert(self.fn_name.clone());
+        let id = self.kernels.len();
+        let words: Vec<String> = k.words.iter().map(|w| format!("{w:#x}")).collect();
+        self.kernels.push(format!(
+            "static AIL_K{id}: ail_gpu::KernelDesc = ail_gpu::KernelDesc {{ id: {id}, words: &[{}], nbufs: {}, nargs: {}, nred: {}, f64: {}, exact: {} }};",
+            words.join(","),
+            k.bufs.len(),
+            k.args.len(),
+            k.nred,
+            k.f64,
+            k.exact
+        ));
+        let mut args = Vec::new();
+        for (a, sc) in &k.args {
+            let v = match a {
+                crate::gpu::KArg::Local(b) => self.bind_place(*b),
+                crate::gpu::KArg::Const(n) => format!("C_{}", mangle(n)),
+                crate::gpu::KArg::Len(bi) => format!("{}.len()", self.bind_place(k.bufs[*bi].bind)),
+                crate::gpu::KArg::Raw(r) => r.clone(),
+            };
+            args.push(match sc {
+                crate::spirv::Scalar::Float(_) => format!("({v}).to_bits()"),
+                crate::spirv::Scalar::Bool => format!("(({v}) as u64)"),
+                crate::spirv::Scalar::Int(32, true) => format!("((({v}) as i32 as u32) as u64)"),
+                _ => format!("(({v}) as u64)"),
+            });
+        }
+        let mut mirrors = String::new();
+        let mut bufs = Vec::new();
+        let mut after = String::new();
+        let mut fallback = String::new();
+        let mut shadows = String::new();
+        for (i, b) in k.bufs.iter().enumerate() {
+            let pl = self.bind_place(b.bind);
+            // A vector with a mirror keeps its device copy; any other gets one for the launch.
+            let resident = self.kernel_stmt == Some(loop_id);
+            let m = match self.mirrors.get(&b.bind).cloned().filter(|_| resident) {
+                Some((name, kind)) => {
+                    match kind {
+                        MirrorKind::RefParam => {
+                            // Read on the CPU (if the GPU path is not taken) through a copy.
+                            let n = self.local_name(&self.ck.bindings[b.bind].name);
+                            let et = rty(&self.ck.bindings[b.bind].ty);
+                            shadows.push_str(&format!(
+                                "let __gv{i} = if __pdone {{ None }} else {{ Some({name}.view(&{pl})) }}; let {n}: &{et} = match &__gv{i} {{ Some(c) => &**c, None => {n} }}; "
+                            ));
+                        }
+                        _ => {
+                            fallback.push_str(&format!("{name}.to_cpu(&mut {pl}); "));
+                            if b.write {
+                                fallback.push_str(&format!("{name}.cpu_changed(); "));
+                            }
+                        }
+                    }
+                    if kind == MirrorKind::Owned { format!("&{name}") } else { name }
+                }
+                None => {
+                    mirrors.push_str(&format!("let __gm{i} = ail_gpu::Mirror::new(); "));
+                    if b.write {
+                        after.push_str(&format!("__gm{i}.to_cpu(&mut {pl}); "));
+                    }
+                    format!("&__gm{i}")
+                }
+            };
+            if b.write {
+                bufs.push(format!("ail_gpu::BufArg::write(&mut {pl}, {m}, {})", b.read));
+            } else {
+                bufs.push(format!("ail_gpu::BufArg::read(&{pl}, {m})"));
+            }
+        }
+        let starts: Vec<String> = sum_vars.iter().map(|b| format!("({}) as i64", self.bind_place(*b))).collect();
+        for (r, b) in sum_vars.iter().enumerate() {
+            after.push_str(&format!("{} = __gs[{r}]; ", self.bind_place(*b)));
+        }
+        // The work items: the iterations, or (i, j) pairs when the inner loop is folded in. The
+        // inner range is computed wide; if it does not fit, or either range is empty, the CPU
+        // runs the loop (and traps or does nothing exactly as the program would).
+        let (count, setup) = match collapsed {
+            Some((jlo, jhi)) => {
+                let (wl, wh) = (wide_of(self, jlo), wide_of(self, jhi));
+                (
+                    "__gn".to_string(),
+                    format!(
+                        "let __gn: i64 = {{ let __ni = (__phi as i128) - (__plo as i128); if __ni <= 0 {{ 0 }} else {{ let (__jl, __jh) = ({wl}, {wh}); let __nj = __jh - __jl; if __jl < i64::MIN as i128 || __jh > i64::MAX as i128 || __nj <= 0 || __ni * __nj > (1i128 << 40) {{ 0 }} else {{ (__ni * __nj) as i64 }} }} }}; "
+                    ),
+                )
+            }
+            None => ("__phi.wrapping_sub(__plo)".to_string(), String::new()),
+        };
+        let (glo, ghi) = if collapsed.is_some() { ("0".to_string(), "__gn".to_string()) } else { ("__plo".to_string(), "__phi".to_string()) };
+        // Where the data already is on the device, the GPU is the cheaper place to run.
+        let resident: Vec<String> = k
+            .bufs
+            .iter()
+            .filter_map(|b| self.mirrors.get(&b.bind).filter(|_| self.kernel_stmt == Some(loop_id)).cloned())
+            .map(|(m, kind)| if kind == MirrorKind::Owned { format!("&{m}") } else { m })
+            .collect();
+        let mut cond = vec![if resident.is_empty() {
+            format!("ail_gpu::worth({count}, {})", k.cost)
+        } else {
+            format!("ail_gpu::worth_at({count}, {}, &[{}])", k.cost, resident.join(", "))
+        }];
+        if collapsed.is_some() {
+            cond.insert(0, "__gn > 0".into());
+        }
+        cond.extend(tests.iter().cloned());
+        cond.push("ail_gpu::ready()".into());
+        Some(format!(
+            "{{ {setup}if {} {{ {mirrors}match ail_gpu::launch(&AIL_K{id}, {glo}, {ghi}, &[{}], &mut [{}], &[{}]) {{ Ok(__gs) => {{ {after}__pdone = true; }} Err(__t) => __gtrap = __t }} }} }} if !__pdone {{ {fallback}}} {shadows}",
+            cond.join(" && "),
+            args.join(", "),
+            bufs.join(", "),
+            starts.join(", ")
+        ))
+    }
+
+    /// True where statements get syncs: a GPU-aware fn, outside code that runs on the CPU as a
+    /// whole (a CPU statement, a lambda, a task, a chunk of a parallel loop).
+    fn gpu_hooks(&self) -> bool {
+        self.pass2 && self.gpu_quiet == 0 && !self.in_par && self.aware.contains(&self.fn_name)
+    }
+
+    /// `(slice v a b)` or `(copy v)` of a vector with a mirror, bound to new vector `b`: copied on
+    /// the device when that is where v is current. Returns the declaration of b's mirror (to go
+    /// before the `let`) and the value.
+    fn dev_copy(&mut self, value: &Expr, b: BindId) -> Option<(String, String)> {
+        let (v, range) = match &value.kind {
+            ExprKind::Call(n, _, xs) if n == "slice" && xs.len() == 3 && matches!(self.ck.res.get(value.id as usize), Some(Res::Builtin(_))) => {
+                (xs[0].expr(), Some((xs[1].expr(), xs[2].expr())))
+            }
+            ExprKind::Copy(x) => (&**x, None),
+            _ => return None,
+        };
+        let Some(Res::Local(src)) = self.ck.res.get(v.id as usize) else { return None };
+        if !matches!(v.kind, ExprKind::Var(_)) {
+            return None;
+        }
+        let (m, kind) = self.mirrors.get(src)?.clone();
+        let mref = if kind == MirrorKind::Owned { format!("&{m}") } else { m.clone() };
+        let pl = self.bind_place(*src);
+        let mn = format!("__m{b}");
+        let (a, z) = match range {
+            Some((a, z)) => (self.val(a), self.val(z)),
+            None => ("0".to_string(), format!("({pl}.len() as i64)")),
+        };
+        let cpu = self.val(value);
+        self.mirrors.insert(b, (mn.clone(), MirrorKind::Owned));
+        Some((
+            format!("let {mn} = ail_gpu::Mirror::new();\n"),
+            format!("if {m}.on_cpu() {{ {cpu} }} else {{ ail_gpu::slice_dev(&{pl}, {mref}, {a}, {z}, &{mn}) }}"),
+        ))
+    }
+
+    /// True if running `e` may launch a kernel: it holds a kernel loop or calls a GPU-aware fn.
+    fn has_gpu(&self, e: &Expr) -> bool {
+        let mut found = false;
+        walk_ref(e, &mut |x| match &x.kind {
+            ExprKind::For(..) if self.kernel_loops.contains(&x.id) => found = true,
+            ExprKind::Call(..) => {
+                if let Some(Res::UserFn(g)) = self.ck.res.get(x.id as usize) {
+                    if self.aware.contains(g) {
+                        found = true;
+                    }
+                }
+            }
+            _ => {}
+        });
+        found
+    }
+
+    /// The syncs to emit before statement `e`, and whether `e` then runs as plain CPU code.
+    /// A statement that may launch kernels is not synced as a whole: only the parts it runs
+    /// before its body (an `if` condition, a range), and its body's statements get their own.
+    fn gpu_sync(&mut self, e: &Expr) -> (String, bool) {
+        if self.mirrors.is_empty() {
+            return (String::new(), false);
+        }
+        if let ExprKind::For(..) = &e.kind {
+            if self.kernel_loops.contains(&e.id) {
+                // The launch and its CPU fallback do their own syncing.
+                return (String::new(), true);
+            }
+        }
+        if let ExprKind::Let { value, .. } = &e.kind {
+            let b = self.ck.decl.get(&(e.id as usize)).copied();
+            let src_mirrored = |x: &Expr| matches!((&x.kind, self.ck.res.get(x.id as usize)), (ExprKind::Var(_), Some(Res::Local(s))) if self.mirrors.contains_key(s));
+            if b.is_some_and(|b| gpu_vec(&self.ck.bindings[b].ty)) {
+                match &value.kind {
+                    ExprKind::Call(n, _, xs) if n == "slice" && xs.len() == 3 && src_mirrored(xs[0].expr()) => {
+                        let mut s = self.gpu_sync_vars(xs[1].expr(), false);
+                        s.push_str(&self.gpu_sync_vars(xs[2].expr(), false));
+                        return (s, true);
+                    }
+                    ExprKind::Copy(x) if src_mirrored(x) => return (String::new(), true),
+                    _ => {}
+                }
+            }
+        }
+        if !self.has_gpu(e) {
+            return (self.gpu_sync_vars(e, false), true);
+        }
+        let pre = match &e.kind {
+            ExprKind::If(c, _, _) => self.gpu_sync_vars(c, false),
+            ExprKind::Match(sc, _) => self.gpu_sync_vars(sc, false),
+            ExprKind::For(_, _, ForIter::Range(a, b), _) => {
+                let mut s = self.gpu_sync_vars(a, false);
+                s.push_str(&self.gpu_sync_vars(b, false));
+                s
+            }
+            ExprKind::For(_, _, ForIter::Each(v), _) => self.gpu_sync_vars(v, false),
+            ExprKind::Do(_) | ExprKind::While(..) => String::new(),
+            // A statement with a call of a GPU-aware fn: its vector arguments go with their
+            // mirrors; everything else it uses is synced.
+            _ => self.gpu_sync_vars(e, true),
+        };
+        (pre, false)
+    }
+
+    /// Syncs for every vector with a mirror that `e` uses (skipping the vector arguments of
+    /// calls to GPU-aware fns when `skip_aware_args`): its own memory made current, and its
+    /// device copy marked stale if `e` changes it. Read-only parameters are shadowed by a CPU
+    /// copy instead (they cannot be written to).
+    fn gpu_sync_vars(&mut self, e: &Expr, skip_aware_args: bool) -> String {
+        let mut used: Vec<BindId> = Vec::new();
+        let mut skip: HashSet<u32> = HashSet::new();
+        if skip_aware_args {
+            walk_ref(e, &mut |x| {
+                if let (ExprKind::Call(_, _, args), Some(Res::UserFn(g))) = (&x.kind, self.ck.res.get(x.id as usize)) {
+                    if self.aware.contains(g) {
+                        for a in args {
+                            if matches!(a.expr().kind, ExprKind::Var(_)) {
+                                skip.insert(a.expr().id);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        let mut changed: HashSet<BindId> = HashSet::new();
+        walk_ref(e, &mut |x| {
+            if let (ExprKind::Var(_), Some(Res::Local(b))) = (&x.kind, self.ck.res.get(x.id as usize)) {
+                if self.mirrors.contains_key(b) && !skip.contains(&x.id) && !used.contains(b) {
+                    used.push(*b);
+                }
+            }
+            match &x.kind {
+                ExprKind::Set(pl, _) => {
+                    if let Some(r) = self.root_of(pl) {
+                        changed.insert(r);
+                    }
+                }
+                ExprKind::Call(_, _, args) => {
+                    for a in args {
+                        if let Arg::Mut(m, _) = a {
+                            if !skip.contains(&m.id) {
+                                if let Some(r) = self.root_of(m) {
+                                    changed.insert(r);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
+        let mut out = String::new();
+        for b in used {
+            let (name, kind) = self.mirrors[&b].clone();
+            let pl = self.bind_place(b);
+            match kind {
+                MirrorKind::RefParam => {
+                    if self.viewed.insert(b) {
+                        let n = self.local_name(&self.ck.bindings[b].name);
+                        let et = rty(&self.ck.bindings[b].ty);
+                        let t = self.fresh();
+                        out.push_str(&format!("let {t} = {name}.view(&{pl}); let {n}: &{et} = &*{t}; "));
+                    }
+                }
+                _ => {
+                    out.push_str(&format!("{name}.to_cpu(&mut {pl}); "));
+                    if changed.contains(&b) {
+                        out.push_str(&format!("{name}.cpu_changed(); "));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The body as lets, one inner range loop, and sums of the inner loop folded into outer ones
+    /// (see `gpu::Collapse`); None if it has another shape.
+    fn collapse_plan<'b>(&self, lv: BindId, body: &'b [Expr], sum_vars: &[BindId]) -> Option<crate::gpu::Collapse<'b>> {
+        let local = |e: &Expr| match (&e.kind, self.ck.res.get(e.id as usize)) {
+            (ExprKind::Var(_), Some(Res::Local(b))) => Some(*b),
+            _ => None,
+        };
+        // The inner loop, alone or as the only thing under an `(if c ...)` without else.
+        let inner_of = |e: &'b Expr| -> Option<(&'b Expr, Option<&'b Expr>)> {
+            match &e.kind {
+                ExprKind::For(_, _, ForIter::Range(..), _) => Some((e, None)),
+                ExprKind::If(c, t, None) => match &t.kind {
+                    ExprKind::For(_, _, ForIter::Range(..), _) => Some((&**t, Some(&**c))),
+                    ExprKind::Do(es) if es.len() == 1 && matches!(es[0].kind, ExprKind::For(_, _, ForIter::Range(..), _)) => Some((&es[0], Some(&**c))),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let at = body.iter().position(|e| inner_of(e).is_some())?;
+        let (fe, guard) = inner_of(&body[at])?;
+        let ExprKind::For(_, _, ForIter::Range(jlo, jhi), inner) = &fe.kind else { return None };
+        let j = *self.ck.decl.get(&(fe.id as usize))?;
+        if breaks_out(inner) {
+            return None;
+        }
+        let mut prefix = Vec::new();
+        let mut cands: Vec<BindId> = Vec::new();
+        let mut declared: HashSet<BindId> = HashSet::new();
+        for e in &body[..at] {
+            let ExprKind::Let { mutable, value, .. } = &e.kind else { return None };
+            let b = *self.ck.decl.get(&(e.id as usize))?;
+            declared.insert(b);
+            if *mutable {
+                if !matches!(value.kind, ExprKind::Int(0)) || self.ck.bindings[b].ty != Ty::Int(IntK::I64) {
+                    return None;
+                }
+                cands.push(b);
+            } else {
+                prefix.push(e);
+            }
+        }
+        let mut inner_sums: HashMap<BindId, usize> = HashMap::new();
+        for e in &body[at + 1..] {
+            let ExprKind::Set(pl, v) = &e.kind else { return None };
+            let s = local(pl)?;
+            let si = sum_vars.iter().position(|x| *x == s)?;
+            let ExprKind::Call(op, _, xs) = &v.kind else { return None };
+            if op != "+" || xs.len() != 2 {
+                return None;
+            }
+            let (a, b) = (local(xs[0].expr()), local(xs[1].expr()));
+            let r = if a == Some(s) { b? } else if b == Some(s) { a? } else { return None };
+            if !cands.contains(&r) || inner_sums.insert(r, si).is_some() {
+                return None;
+            }
+        }
+        if cands.len() != inner_sums.len() {
+            return None;
+        }
+        // Inside the inner loop an inner sum is only added to.
+        let mut uses: HashMap<BindId, usize> = HashMap::new();
+        let mut sets: HashMap<BindId, usize> = HashMap::new();
+        let mut bad = false;
+        for x in inner.iter() {
+            walk_ref(x, &mut |e| {
+                if let Some(b) = local(e) {
+                    if inner_sums.contains_key(&b) {
+                        *uses.entry(b).or_insert(0) += 1;
+                    }
+                    if b == lv || declared.contains(&b) && !inner_sums.contains_key(&b) {
+                        // reading the outer index or a prefix value is fine
+                    }
+                }
+                if let ExprKind::Set(pl, v) = &e.kind {
+                    if let Some(b) = local(pl) {
+                        if inner_sums.contains_key(&b) {
+                            let ok = matches!(&v.kind, ExprKind::Call(op, _, xs) if op == "+"
+                                && xs.iter().filter(|a| local(a.expr()) == Some(b)).count() == 1);
+                            if !ok {
+                                bad = true;
+                            }
+                            *sets.entry(b).or_insert(0) += 1;
+                        } else if b == lv || declared.contains(&b) {
+                            bad = true;
+                        }
+                    }
+                }
+            });
+        }
+        if bad || inner_sums.keys().any(|r| uses.get(r).copied().unwrap_or(0) != 2 * sets.get(r).copied().unwrap_or(0)) {
+            return None;
+        }
+        // The inner range does not depend on the outer index or on the body.
+        let mut fixed = true;
+        for x in [&**jlo, &**jhi] {
+            walk_ref(x, &mut |e| {
+                if let Some(b) = local(e) {
+                    if b == lv || declared.contains(&b) || sum_vars.contains(&b) {
+                        fixed = false;
+                    }
+                }
+                if let ExprKind::Call(n, _, _) = &e.kind {
+                    if !matches!(n.as_str(), "+" | "-" | "*" | "len") {
+                        fixed = false;
+                    }
+                }
+            });
+        }
+        if !fixed {
+            return None;
+        }
+        if guard.is_some() && !inner_sums.is_empty() {
+            return None;
+        }
+        Some(crate::gpu::Collapse { j, jlo, jhi, prefix, guard, inner, inner_sums })
     }
 
     /// `(if c (set (at v i) x))` on an element proven in range, where neither c nor x can trap:
@@ -3992,6 +4632,15 @@ fn collect_returns<'e>(es: &'e [Expr], out: &mut Vec<&'e Expr>) {
 }
 
 /// Pre-order walk like `check::walk`, but the visited expressions keep the tree's lifetime.
+/// A vector whose elements a kernel can use in place: it gets a mirror in GPU-aware fns.
+fn gpu_vec(t: &Ty) -> bool {
+    matches!(t, Ty::Vec(el) if crate::gpu::elem_ok(el).is_some())
+}
+
+pub fn walk_ref_pub<'e>(e: &'e Expr, f: &mut dyn FnMut(&'e Expr)) {
+    walk_ref(e, f)
+}
+
 fn walk_ref<'e>(e: &'e Expr, f: &mut dyn FnMut(&'e Expr)) {
     f(e);
     match &e.kind {

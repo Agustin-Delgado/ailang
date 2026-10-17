@@ -2,11 +2,14 @@ mod ast;
 mod check;
 mod diag;
 mod emit_rust;
+mod gpu;
 mod parinfer;
 mod runtime;
+mod runtime_gpu;
 mod runtime_net;
 mod runtime_web;
 mod sexpr;
+mod spirv;
 mod types;
 
 use diag::Diag;

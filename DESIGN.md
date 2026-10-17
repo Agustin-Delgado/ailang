@@ -141,6 +141,18 @@ If any chunk traps, the parallel run is thrown away and the loop runs again sequ
 output and the trap are exactly the sequential ones. A loop that already uses `par-map` keeps that
 parallelism, and loops inside a parallel one stay sequential.
 
+### Loops that run on the GPU
+
+A parallel loop whose only effects are sums and writes to its own elements, over vectors of
+64- or 32-bit integers or F64, is also compiled to a SPIR-V compute kernel and run through
+Vulkan, loaded at run time (no driver needed to build or run the program). Nested loops whose
+inner range does not depend on the outer index become one work item per (i, j). Every operation
+that traps on the CPU marks the invocation instead; a trapped launch is thrown away and the loop
+runs on the CPU, which traps where the program would. Vectors keep a device copy between loops
+(a mirror beside each vector in the fns that use the GPU), and a statement that touches a vector
+on the CPU first brings its current contents back. `AIL_GPU=0` turns this off, `AIL_GPU=force`
+sends every eligible loop to the GPU (used to check that every program gives the same output).
+
 `sort` and `sort-desc` on a long vector also use every core: chunks are sorted in parallel and
 merged pairwise, each merge cut among the threads at points found by binary search. On ties an
 element of the left run goes first, so the result is the one a stable sequential sort gives.
