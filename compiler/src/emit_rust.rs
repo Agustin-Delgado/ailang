@@ -974,6 +974,7 @@ impl<'a> Emitter<'a> {
                 let tb = self.block_as(std::slice::from_ref(th), true);
                 format!("if {c} {{ let _ = {tb}; {flag} = true; }}")
             }
+            ExprKind::If(c, th, None) if self.select_store(c, th).is_some() => self.select_store(c, th).unwrap(),
             ExprKind::If(c, th, el) => {
                 let c = self.val(c);
                 let unit = t == Ty::Unit;
@@ -1540,14 +1541,13 @@ impl<'a> Emitter<'a> {
                     _ => Ty::Err,
                 };
                 let p = self.mut_place(&args[0]);
+                // On all cores for long vectors; the same order a sequential sort gives.
                 if el.is_float() {
-                    format!("{p}.sort_unstable_by(|a, b| a.total_cmp(b))")
+                    format!("ail_rt::psort(&mut {p}, false, |a, b| a.total_cmp(b))")
                 } else if !matches!(el, Ty::Int(_) | Ty::Str | Ty::Bool) {
-                    format!(
-                        "{p}.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))"
-                    )
+                    format!("ail_rt::psort(&mut {p}, true, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))")
                 } else {
-                    format!("{p}.sort_unstable()")
+                    format!("ail_rt::psort(&mut {p}, false, |a, b| a.cmp(b))")
                 }
             }
             "reverse" => format!("{}.reverse()", self.mut_place(&args[0])),
@@ -1558,11 +1558,9 @@ impl<'a> Emitter<'a> {
                 };
                 let p = self.mut_place(&args[0]);
                 if el.is_float() {
-                    format!("{p}.sort_by(|a, b| b.total_cmp(a))")
+                    format!("ail_rt::psort(&mut {p}, false, |a, b| b.total_cmp(a))")
                 } else {
-                    format!(
-                        "{p}.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal))"
-                    )
+                    format!("ail_rt::psort(&mut {p}, true, |a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal))")
                 }
             }
             "sum" => format!("{}.iter().sum::<{}>()", self.pv(a(0)), rty(&t)),
@@ -2494,6 +2492,30 @@ impl<'a> Emitter<'a> {
         for b in &pushes {
             claim(*b, push_uses.get(b).copied().unwrap_or(0));
         }
+        // Reads of a vector the loop writes: allowed (when its elements are plain values) if
+        // each read falls in the window its own iteration writes, tested before the loop.
+        let write_ids: HashSet<u32> = writes.iter().flat_map(|(_, ws)| ws.iter().map(|w| w.0)).collect();
+        let mut own_reads: Vec<(BindId, u32, &Expr)> = Vec::new();
+        for x in body {
+            walk_ref(x, &mut |e| {
+                if let ExprKind::Call(n, _, args) = &e.kind {
+                    if n == "at" && args.len() == 2 && builtin(e) && !write_ids.contains(&e.id) {
+                        if let Some(r) = local_of(args[0].expr()) {
+                            if writes.iter().any(|w| w.0 == r) {
+                                own_reads.push((r, e.id, args[1].expr()));
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        for (r, _, _) in &own_reads {
+            let Ty::Vec(et) = &self.ck.bindings[*r].ty else { return None };
+            if !self.is_copy(et) || matches!(**et, Ty::Vec(_)) {
+                return None;
+            }
+            claim(*r, 1);
+        }
         for (fid, group, _) in &maxes {
             let ExprKind::If(_, th, _) = &find_expr(body, *fid)?.kind else { unreachable!() };
             let n_sets = match &th.kind {
@@ -2555,10 +2577,13 @@ impl<'a> Emitter<'a> {
         }
         // Disjoint writes: per vector, the windows each iteration writes.
         let mut win_tests: Vec<String> = Vec::new();
-        for (_, ws) in &writes {
+        for (wb, ws) in &writes {
             let mut stride: Option<Option<&Expr>> = None;
             let mut wins: Vec<String> = Vec::new();
-            for (_, idx) in ws {
+            let mut bounds: Vec<(String, String)> = Vec::new();
+            let reads: Vec<&Expr> = own_reads.iter().filter(|x| x.0 == *wb).map(|x| x.2).collect();
+            let n_writes = ws.len();
+            for (wi, idx) in ws.iter().map(|w| w.1).chain(reads.iter().copied()).enumerate() {
                 let mut af = Aff::default();
                 if !aff(self, idx, lv, &lets, &ranges, &fixed, true, &mut af, 0) || !af.lv {
                     return None;
@@ -2577,16 +2602,24 @@ impl<'a> Emitter<'a> {
                     c.push_str(if *plus { " + " } else { " - " });
                     c.push_str(&wide_of(self, t));
                 }
-                match af.j {
+                let (lo, hi) = match af.j {
                     Some(j) => {
                         let (jl, jh) = ranges[&j];
                         if !fixed(jl) || !fixed(jh) {
                             return None;
                         }
                         let (jl, jh) = (wide_of(self, jl), wide_of(self, jh));
-                        wins.push(format!("({c} + {jl}, {c} + {jh} - 1)"));
+                        (format!("{c} + {jl}"), format!("{c} + {jh} - 1"))
                     }
-                    None => wins.push(format!("({c}, {c})")),
+                    None => (c.clone(), c.clone()),
+                };
+                if wi < n_writes {
+                    wins.push(format!("({lo}, {hi})"));
+                    bounds.push((lo, hi));
+                } else {
+                    // An empty read window needs nothing; otherwise one write window holds it.
+                    let inside: Vec<String> = bounds.iter().map(|(wl, wh)| format!("(({lo}) >= ({wl}) && ({hi}) <= ({wh}))")).collect();
+                    win_tests.push(format!("(({lo}) > ({hi}) || {})", inside.join(" || ")));
                 }
             }
             let s = match stride.flatten() {
@@ -2801,6 +2834,10 @@ impl<'a> Emitter<'a> {
                 let ic = self.val(idx);
                 unchecked.push((*fid, format!("(*{name}.at({ic}))")));
             }
+            for (_, rid, idx) in own_reads.iter().filter(|x| x.0 == *b) {
+                let ic = self.val(idx);
+                unchecked.push((*rid, format!("(*{name}.at({ic}))")));
+            }
         }
         // The chunk body, with the hooks and shared vectors in place.
         let saved_hooks = std::mem::take(&mut self.par_hooks);
@@ -2837,6 +2874,45 @@ impl<'a> Emitter<'a> {
              if let Some(mut __parts) = __pr {{ let mut __ok = true; {combine_check}if __ok {{ {combine_ref}for __p in __parts.iter_mut() {{ let _ = &__p; {combine_own}}} __pdone = true; }} }} }} "
         ));
         Some(format!("{{ {pre}if !__pdone {seq} }}"))
+    }
+
+    /// `(if c (set (at v i) x))` on an element proven in range, where neither c nor x can trap:
+    /// the element is written either way (with its own value when c is false), so the loop has
+    /// no branch around a store and LLVM can vectorize it.
+    fn select_store(&mut self, c: &Expr, th: &Expr) -> Option<String> {
+        let ExprKind::Set(place, value) = &th.kind else { return None };
+        // Only where the loop vectorizes (its arithmetic defers overflow): elsewhere the extra
+        // stores just cost.
+        if !self.defer {
+            return None;
+        }
+        if !matches!(&place.kind, ExprKind::Call(n, _, xs) if n == "at" && xs.len() == 2) || self.par_hooks.contains_key(&th.id) {
+            return None;
+        }
+        let slot = self.unchecked.get(&place.id)?.clone();
+        if !self.is_copy(self.ty(place)) || !self.no_trap(c) || !self.no_trap(value) {
+            return None;
+        }
+        let (c, v) = (self.val(c), self.val(value));
+        Some(format!("{{ let __c = {c}; let __n = {v}; let __s = &mut {slot}; *__s = if __c {{ __n }} else {{ *__s }}; }}"))
+    }
+
+    /// True if evaluating `e` cannot trap: literals, variables, element reads proven in range,
+    /// comparisons and logic on those, and arithmetic where it records overflow instead.
+    fn no_trap(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Var(_) => true,
+            ExprKind::Call(n, _, xs) if matches!(self.ck.res.get(e.id as usize), Some(Res::Builtin(_))) => {
+                let args_ok = xs.iter().all(|x| matches!(x, Arg::Val(_)) && self.no_trap(x.expr()));
+                match n.as_str() {
+                    "at" => self.unchecked.contains_key(&e.id),
+                    "<" | ">" | "<=" | ">=" | "==" | "!=" | "and" | "or" | "not" | "min" | "max" => args_ok,
+                    "+" | "-" | "*" => args_ok && (self.ty(e).is_float() || (self.defer && self.ty(e).is_int())),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     fn unsigned(&self, t: &Ty) -> bool {

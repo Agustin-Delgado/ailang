@@ -141,6 +141,10 @@ If any chunk traps, the parallel run is thrown away and the loop runs again sequ
 output and the trap are exactly the sequential ones. A loop that already uses `par-map` keeps that
 parallelism, and loops inside a parallel one stay sequential.
 
+`sort` and `sort-desc` on a long vector also use every core: chunks are sorted in parallel and
+merged pairwise, each merge cut among the threads at points found by binary search. On ties an
+element of the left run goes first, so the result is the one a stable sequential sort gives.
+
 ## 11. Servers: reads in parallel, writes alone
 
 A server is a state plus two handlers: `(http-serve net port max-body state read write)`. GET and
