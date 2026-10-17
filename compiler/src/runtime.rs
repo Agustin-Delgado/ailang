@@ -383,14 +383,20 @@ mod ail_rt {
 
     #[track_caller]
     #[track_caller]
-    pub fn slice_ref<T>(v: &Vec<T>, a: i64, b: i64) -> &[T] {
+    #[track_caller]
+    pub fn slice_bounds(len: usize, a: i64, b: i64) -> (usize, usize) {
         let (a, b) = (ix(a), ix(b));
-        if a > b || b > v.len() { panic!("slice [{a}, {b}) out of bounds for length {}", v.len()) }
+        if a > b || b > len { panic!("slice [{a}, {b}) out of bounds for length {len}") }
+        (a, b)
+    }
+    #[track_caller]
+    pub fn slice_ref<T>(v: &Vec<T>, a: i64, b: i64) -> &[T] {
+        let (a, b) = slice_bounds(v.len(), a, b);
         &v[a..b]
     }
+    #[track_caller]
     pub fn slice<T: Clone>(v: &Vec<T>, a: i64, b: i64) -> Vec<T> {
-        let (a, b) = (ix(a), ix(b));
-        if a > b || b > v.len() { panic!("slice [{a}, {b}) out of bounds for length {}", v.len()) }
+        let (a, b) = slice_bounds(v.len(), a, b);
         v[a..b].to_vec()
     }
     pub fn concat<T: Clone>(a: &Vec<T>, b: &Vec<T>) -> Vec<T> {
