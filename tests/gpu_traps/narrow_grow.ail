@@ -1,0 +1,19 @@
+; Values that start in one byte and grow past two, four and eight bytes' worth of range: the
+; device copy starts narrow and has to widen, in plain launches and inside a chunked loop.
+(fn main (params (con Console))
+  (body
+    (let n 100000)
+    (var v (Vec I64) (fill n 0))
+    (for i (range 0 n) (set (at v i) (- (% i 200) 100)))
+    (for i (range 0 n) (set (at v i) (* (at v i) 300)))
+    (println con (at v 7))
+    (for t (range 0 40)
+      (for i (range 0 n) (set (at v i) (+ (* (at v i) 2) (% i 3)))))
+    (var s 0)
+    (for i (range 0 n) (set s (+ s (% (at v i) 1000))))
+    (println con s)
+    (println con (at v 99999))
+    (var w (Vec I32) (fill n 1))
+    (for t (range 0 20)
+      (for i (range 0 n) (set (at w i) (+ (* (at w i) 2) (as I32 (% i 2))))))
+    (println con (at w 12345))))

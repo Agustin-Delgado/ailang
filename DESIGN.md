@@ -158,6 +158,12 @@ runs on the CPU, which traps where the program would. Vectors keep a device copy
 on the CPU first brings its current contents back. `AIL_GPU=0` turns this off, `AIL_GPU=force`
 sends every eligible loop to the GPU (used to check that every program gives the same output).
 
+A device copy of a vector of integers is stored as narrow as its values allow (1, 2, 4 or 8 bytes
+per element, chosen when it is uploaded); the kernel reads and writes it at that width. A store
+that does not fit stops the launch like a trap, but instead of running the loop on the CPU the
+launch is undone, the copy goes back to full width for good, and the launch runs again.
+`AIL_GPU_NARROW=0` keeps every copy at full width.
+
 Waiting for each launch costs more than most launches, so an outer loop that only computes (it
 uses no capability, does not leave early, and changes outside itself only plain values and
 vectors with a device copy) runs in growing groups of iterations whose launches are queued and

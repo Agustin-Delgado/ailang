@@ -3188,13 +3188,14 @@ impl<'a> Emitter<'a> {
         let id = self.kernels.len();
         let words: Vec<String> = k.words.iter().map(|w| format!("{w:#x}")).collect();
         self.kernels.push(format!(
-            "static AIL_K{id}: ail_gpu::KernelDesc = ail_gpu::KernelDesc {{ id: {id}, words: &[{}], nbufs: {}, nargs: {}, nred: {}, f64: {}, exact: {} }};",
+            "static AIL_K{id}: ail_gpu::KernelDesc = ail_gpu::KernelDesc {{ id: {id}, words: &[{}], nbufs: {}, nargs: {}, nred: {}, f64: {}, exact: {}, narrow: {} }};",
             words.join(","),
             k.bufs.len(),
             k.args.len(),
             k.nred,
             k.f64,
-            k.exact
+            k.exact,
+            k.bufs.iter().enumerate().filter(|(_, b)| b.narrow).map(|(i, _)| 1u32 << i).sum::<u32>()
         ));
         let mut args = Vec::new();
         for (a, sc) in &k.args {
@@ -3446,7 +3447,7 @@ impl<'a> Emitter<'a> {
              if __cn > 1 && ail_gpu::chunk_begin() {{ let __snap = ({save}); \
              let __r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ for {var} in __ct..__ct + __cn {{ let _ = {bd}; }} }})); \
              if ail_gpu::chunk_end(__r) {{ __ct += __cn; __cd += __cn; continue; }} \
-             {restore}__cd = -1; for {var} in __ct..__ct + __cn {{ let _ = {bd}; }} __ct += __cn; \
+             {restore}__cd = ail_gpu::chunk_retry(__cd); for {var} in __ct..__ct + __cn {{ let _ = {bd}; }} __ct += __cn; \
              }} else {{ let {var}: i64 = __ct; let _ = {bd}; __ct += 1; if __cd >= 0 {{ __cd += 1; }} }} }} }}"
         )
     }

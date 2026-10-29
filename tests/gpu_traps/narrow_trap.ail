@@ -1,0 +1,8 @@
+; A narrow copy that widens step by step until a value overflows I64.
+(fn main (params (con Console))
+  (body
+    (let n 60000)
+    (var v (Vec I64) (fill n 1))
+    (for t (range 0 70)
+      (for i (range 0 n) (set (at v i) (* (at v i) (if (== i 4242) 3 1))))) ; traps here
+    (println con (at v 4242))))
