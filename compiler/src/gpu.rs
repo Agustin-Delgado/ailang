@@ -61,6 +61,19 @@ pub struct Collapse<'a> {
     /// Inner sums: `(var r 0)` before the inner loop, `(set r (+ r e))` inside it, and
     /// `(set S (+ S r))` after it: r -> the reduction index of S.
     pub inner_sums: HashMap<BindId, usize>,
+    /// A sliding window carried across the inner loop (see `Rot`).
+    pub rot: Option<Rot<'a>>,
+}
+
+/// `(var x1 a1) ... (var xk ak)` before the inner loop, whose body starts with lets `lets` that
+/// end in `(let e ...)`, depend only on j and on values fixed for the row, and ends with
+/// `(set x1 x2) ... (set xk e)`. At item j (s = j - jlo), x_m holds e as computed at j - (k-m+1)
+/// when s reaches that far, and a_{m+s} before: each item computes it again from the lets, so the
+/// items of a row do not depend on each other.
+pub struct Rot<'a> {
+    pub vars: Vec<BindId>,
+    pub lets: &'a [Expr],
+    pub e: BindId,
 }
 
 pub struct Kernel {
@@ -259,6 +272,58 @@ impl<'a> T<'a> {
     fn label(&mut self) -> Id {
         self.m.id()
     }
+    /// Sets the window variables of `r` for item j (see `Rot`); `jv` holds j.
+    fn rotate(&mut self, r: &Rot, jv: Id, j: Id, jl: Id) -> Option<()> {
+        let s64 = Scalar::Int(64, true);
+        let k = r.vars.len();
+        let mut inits = Vec::new();
+        for b in &r.vars {
+            let (p, sc) = *self.locals.get(b)?;
+            inits.push((self.load(p, sc), sc));
+        }
+        let s = self.op(op::I_SUB, s64, &[j, jl]);
+        // t[d]: e at j - d, for the items that have it.
+        let mut t = vec![0; k + 1];
+        for d in 1..=k {
+            let sc = inits[k - d].1;
+            let tv = self.var(sc);
+            let dc = self.m.c_i64(d as i64);
+            let has = self.bop(op::S_GREATER_THAN_EQUAL, &[s, dc]);
+            let (yes, done) = (self.label(), self.label());
+            self.f.emit(op::SELECTION_MERGE, &[done, 0]);
+            self.f.branch_cond(has, yes, done);
+            self.f.label(yes);
+            let jd = self.op(op::I_SUB, s64, &[j, dc]);
+            self.f.store(jv, jd);
+            for st in r.lets {
+                self.stmt(st)?;
+            }
+            let (ep, es) = *self.locals.get(&r.e)?;
+            if es != sc {
+                return None;
+            }
+            let ev = self.load(ep, es);
+            self.f.store(tv, ev);
+            self.f.branch(done);
+            self.f.label(done);
+            t[d] = self.load(tv, sc);
+        }
+        self.f.store(jv, j);
+        for m in 0..k {
+            let d = k - m;
+            let (_, sc) = inits[m];
+            let mut v = t[d];
+            for tt in (0..d).rev() {
+                let tc = self.m.c_i64(tt as i64);
+                let at = self.bop(op::I_EQUAL, &[s, tc]);
+                v = self.op(op::SELECT, sc, &[at, inits[m + tt].0, v]);
+            }
+            let (p, _) = *self.locals.get(&r.vars[m])?;
+            self.f.store(p, v);
+        }
+        Some(())
+    }
+
     /// Marks the invocation trapped where `cond` holds.
     fn trap_if(&mut self, cond: Id) {
         let b = Scalar::Bool;
@@ -389,6 +454,9 @@ impl<'a> T<'a> {
                 }
                 None => None,
             };
+            if let Some(r) = &c.rot {
+                self.rotate(r, jv, j, jl)?;
+            }
             for s in c.inner {
                 self.stmt(s)?;
             }

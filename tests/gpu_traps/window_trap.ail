@@ -1,0 +1,20 @@
+; A sliding window carried across the inner loop whose computed value overflows at one cell: the
+; items after it on the GPU compute that value again, and the CPU run stops at its line.
+(fn main (params (con Console))
+  (body
+    (let n 300)
+    (var src (Vec I64) (fill (* n n) 1))
+    (set (at src (+ (* 200 n) 150)) 9223372036854775000)
+    (var dst (Vec I64) (fill (* n n) 0))
+    (for r (range 0 n)
+      (let mid (* r n))
+      (var a (at src mid))
+      (var b (at src (+ mid 1)))
+      (for c (range 0 (- n 2))
+        (let e (+ (at src (+ mid (+ c 2))) 1000)) ; traps here
+        (set (at dst (+ (* r n) c)) (- e (+ a b)))
+        (set a b)
+        (set b e)))
+    (var s 0)
+    (for i (range 0 (* n n)) (set s (+ s (at dst i))))
+    (println con s)))

@@ -151,7 +151,10 @@ parallelism, and loops inside a parallel one stay sequential.
 A parallel loop whose only effects are sums and writes to its own elements, over vectors of
 64- or 32-bit integers or F64, is also compiled to a SPIR-V compute kernel and run through
 Vulkan, loaded at run time (no driver needed to build or run the program). Nested loops whose
-inner range does not depend on the outer index become one work item per (i, j). Every operation
+inner range does not depend on the outer index become one work item per (i, j), also when the
+inner loop carries a sliding window (`(set a b) (set b e)` at the end of each step, with `e` a
+value computed from j and values fixed for the row): each item computes `e` again for the
+columns before it that the window holds, so the items do not depend on each other. Every operation
 that traps on the CPU marks the invocation instead; a trapped launch is thrown away and the loop
 runs on the CPU, which traps where the program would. Vectors keep a device copy between loops
 (a mirror beside each vector in the fns that use the GPU), and a statement that touches a vector

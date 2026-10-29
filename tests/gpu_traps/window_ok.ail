@@ -1,0 +1,20 @@
+; No trap: a sliding window carried across the inner loop, (set a b) (set b e) at the end of
+; each column; on the GPU every (row, column) item computes the window again.
+(fn main (params (con Console))
+  (body
+    (let n 300)
+    (var src (Vec I64) (fill (* n n) 0))
+    (for i (range 0 (* n n)) (set (at src i) (% (* i 7919) 1000)))
+    (var dst (Vec I64) (fill (* n n) 0))
+    (for r (range 0 n)
+      (let mid (* r n))
+      (var a (+ (at src mid) 5))
+      (var b (* (at src (+ mid 1)) 3))
+      (for c (range 0 (- n 2))
+        (let e (+ (at src (+ mid (+ c 2))) c))
+        (set (at dst (+ (* r n) c)) (- (+ a e) b))
+        (set a b)
+        (set b e)))
+    (var s 0)
+    (for i (range 0 (* n n)) (set s (+ s (* (at dst i) (% i 13)))))
+    (println con s)))

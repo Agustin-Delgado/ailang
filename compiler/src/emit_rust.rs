@@ -3617,11 +3617,87 @@ impl<'a> Emitter<'a> {
         let mut prefix = Vec::new();
         let mut cands: Vec<BindId> = Vec::new();
         let mut declared: HashSet<BindId> = HashSet::new();
+        let mut muts: Vec<BindId> = Vec::new();
+        for e in &body[..at] {
+            let ExprKind::Let { mutable: true, .. } = &e.kind else { continue };
+            muts.push(*self.ck.decl.get(&(e.id as usize))?);
+        }
+        // A sliding window: `(set x1 x2) ... (set xk e)` ending the inner body (see gpu::Rot).
+        let mut tail = inner.len();
+        while tail > 0 && matches!(&inner[tail - 1].kind, ExprKind::Set(pl, v)
+            if local(pl).is_some_and(|b| muts.contains(&b)) && local(v).is_some())
+        {
+            tail -= 1;
+        }
+        let mut rot: Option<crate::gpu::Rot<'b>> = None;
+        if tail < inner.len() {
+            let sets: Vec<(BindId, BindId)> = inner[tail..]
+                .iter()
+                .map(|e| match &e.kind {
+                    ExprKind::Set(pl, v) => (local(pl).unwrap(), local(v).unwrap()),
+                    _ => unreachable!(),
+                })
+                .collect();
+            let vars: Vec<BindId> = sets.iter().map(|x| x.0).collect();
+            let e = sets.last()?.1;
+            let chained = sets.windows(2).all(|w| w[0].1 == w[1].0);
+            let distinct = vars.iter().collect::<HashSet<_>>().len() == vars.len();
+            // The lets that compute e: the start of the inner body, up to e's own.
+            let p = inner.iter().position(|x| matches!(x.kind, ExprKind::Let { mutable: false, .. })
+                && self.ck.decl.get(&(x.id as usize)) == Some(&e))?;
+            let lets = &inner[..=p];
+            if !chained || !distinct || muts.contains(&e) || !lets.iter().all(|x| matches!(x.kind, ExprKind::Let { mutable: false, .. })) {
+                return None;
+            }
+            // e depends only on j and values fixed for the row: no mutable variable, and no
+            // vector the loop writes.
+            let mut written: HashSet<BindId> = HashSet::new();
+            for x in body.iter() {
+                walk_ref(x, &mut |y| {
+                    if let ExprKind::Set(pl, _) = &y.kind {
+                        if let ExprKind::Call(n, _, xs) = &pl.kind {
+                            if n == "at" {
+                                if let Some(v) = local(xs[0].expr()) {
+                                    written.insert(v);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            let mut pure = true;
+            for x in lets {
+                walk_ref(x, &mut |y| {
+                    if let Some(b) = local(y) {
+                        if muts.contains(&b) || written.contains(&b) {
+                            pure = false;
+                        }
+                    }
+                });
+            }
+            // The window variables are set only by the chain.
+            for x in &inner[..tail] {
+                walk_ref(x, &mut |y| {
+                    if let ExprKind::Set(pl, _) = &y.kind {
+                        if local(pl).is_some_and(|b| vars.contains(&b)) {
+                            pure = false;
+                        }
+                    }
+                });
+            }
+            if !pure {
+                return None;
+            }
+            rot = Some(crate::gpu::Rot { vars, lets, e });
+        }
+        let rot_vars: Vec<BindId> = rot.as_ref().map(|r| r.vars.clone()).unwrap_or_default();
         for e in &body[..at] {
             let ExprKind::Let { mutable, value, .. } = &e.kind else { return None };
             let b = *self.ck.decl.get(&(e.id as usize))?;
             declared.insert(b);
-            if *mutable {
+            if rot_vars.contains(&b) {
+                prefix.push(e);
+            } else if *mutable {
                 if !matches!(value.kind, ExprKind::Int(0)) || self.ck.bindings[b].ty != Ty::Int(IntK::I64) {
                     return None;
                 }
@@ -3652,7 +3728,7 @@ impl<'a> Emitter<'a> {
         let mut uses: HashMap<BindId, usize> = HashMap::new();
         let mut sets: HashMap<BindId, usize> = HashMap::new();
         let mut bad = false;
-        for x in inner.iter() {
+        for x in inner[..tail].iter() {
             walk_ref(x, &mut |e| {
                 if let Some(b) = local(e) {
                     if inner_sums.contains_key(&b) {
@@ -3703,7 +3779,7 @@ impl<'a> Emitter<'a> {
         if guard.is_some() && !inner_sums.is_empty() {
             return None;
         }
-        Some(crate::gpu::Collapse { j, jlo, jhi, prefix, guard, inner, inner_sums })
+        Some(crate::gpu::Collapse { j, jlo, jhi, prefix, guard, inner, inner_sums, rot })
     }
 
     /// `(if c (set (at v i) x))` on an element proven in range, where neither c nor x can trap:
