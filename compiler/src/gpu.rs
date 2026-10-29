@@ -16,6 +16,9 @@ use crate::types::{IntK, Ty};
 /// One vector a kernel reads or writes: binding `index + 1`.
 pub struct KBuf {
     pub bind: BindId,
+    /// A copy of the vector taken before the loop, for reads of elements that only later
+    /// iterations write (they must see the old values).
+    pub snap: bool,
     pub elem: Scalar,
     pub write: bool,
     pub read: bool,
@@ -73,6 +76,9 @@ pub struct Input<'a> {
     pub writes: HashSet<u32>,
     /// Vectors whose reads fall in the iteration's own write window (already tested).
     pub own_reads: HashSet<u32>,
+    /// Reads of a written vector that see its contents from before the loop (already tested
+    /// to hit only elements no earlier iteration writes): they read the `snap` buffer.
+    pub stale: HashSet<u32>,
     pub collapse: Option<Collapse<'a>>,
 }
 
@@ -586,7 +592,11 @@ impl<'a> T<'a> {
 
     /// The buffer of vector `b`, declared on first use; with its length argument.
     fn buffer(&mut self, b: BindId, write: bool) -> Option<usize> {
-        if let Some(i) = self.bufs.iter().position(|x| x.bind == b) {
+        self.buffer_of(b, write, false)
+    }
+
+    fn buffer_of(&mut self, b: BindId, write: bool, snap: bool) -> Option<usize> {
+        if let Some(i) = self.bufs.iter().position(|x| x.bind == b && x.snap == snap) {
             if write {
                 self.bufs[i].write = true;
             } else {
@@ -606,7 +616,7 @@ impl<'a> T<'a> {
         };
         let binding = self.bufs.len() as u32 + 1;
         let v = buffer_var(&mut self.m, t, stride, binding, &mut self.decorated);
-        self.bufs.push(KBuf { bind: b, elem: s, write, read: !write });
+        self.bufs.push(KBuf { bind: b, snap, elem: s, write, read: !write });
         self.buf_vars.push(v);
         Some(self.bufs.len() - 1)
     }
@@ -1365,10 +1375,11 @@ impl<'a> T<'a> {
                 // A vector the loop writes is read only at its own elements.
                 let b = *b;
                 let written = self.bufs.iter().any(|x| x.bind == b && x.write) || self.writes_vec(b);
-                if written && !self.inp.own_reads.contains(&e.id) {
+                let stale = self.inp.stale.contains(&e.id);
+                if written && !self.inp.own_reads.contains(&e.id) && !stale {
                     return None;
                 }
-                let bi = self.buffer(b, false)?;
+                let bi = self.buffer_of(b, false, stale)?;
                 let (iv, is) = self.expr(a(1))?;
                 if is != Scalar::Int(64, true) {
                     return None;

@@ -37,7 +37,7 @@ def grade(src):
 
 progs, sols = [], []
 for d, _, fs in os.walk(ROOT):
-    if any(x in d for x in ("target", "node_modules", ".git")):
+    if any(x in d for x in ("target", "node_modules", ".git", ".claude")):
         continue
     for f in fs:
         p = os.path.join(d, f)
@@ -49,7 +49,7 @@ for d, _, fs in os.walk(ROOT):
             if "(fn main" in text or "(fn init" in text or "(test " in text:
                 progs.append(p)
 
-with ThreadPoolExecutor(4) as ex:
+with ThreadPoolExecutor(int(os.environ.get("REGRESS_JOBS", "4"))) as ex:
     res = dict(ex.map(build, progs))
     res.update(ex.map(grade, sols))
 json.dump(res, open(OUT, "w"), indent=1, sort_keys=True)

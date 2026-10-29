@@ -188,6 +188,9 @@ pub mod ail_gpu {
         segs: Vec<u64>,
         tsets: u32,
         deferred: Vec<Buf>,
+        /// Buffers for `snap` arguments, reused from launch to launch: queued launches run in
+        /// order, and the copy into one waits for the kernel before it to finish reading.
+        snap_free: Vec<Buf>,
     }
     const POOL: u64 = 1 << 30;
     /// Buffers up to SMALL bytes are carved out of blocks of SLAB bytes.
@@ -393,7 +396,7 @@ pub mod ail_gpu {
             dev, d, queue, cmd, fence, dsl_cache: Default::default(), pool: dpool, local_type, host_type,
             staging: None, io: None, io_dev: None, pipes: Default::default(), f64_ok, dead: false,
             bufpool: RefCell::new(Vec::new()), pool_bytes: std::cell::Cell::new(0), slab: std::cell::Cell::new((0, 0)),
-            tpool, rec: false, cursor: 0, segs: Vec::new(), tsets: 0, deferred: Vec::new(),
+            tpool, rec: false, cursor: 0, segs: Vec::new(), tsets: 0, deferred: Vec::new(), snap_free: Vec::new(),
         })
     }
 
@@ -793,14 +796,53 @@ pub mod ail_gpu {
     pub struct KernelDesc { pub id: usize, pub words: &'static [u32], pub nbufs: usize, pub nargs: usize, pub nred: usize, pub f64: bool, pub exact: bool }
 
     /// One vector a kernel uses.
-    pub struct BufArg<'a> { ptr: *mut u8, bytes: u64, mirror: &'a Mirror, write: bool, reads: bool }
+    /// `snap`: instead of a vector, a copy of vector `bufs[i]` (whose mirror is `mirror`) made on
+    /// the device just before the kernel runs.
+    pub struct BufArg<'a> { ptr: *mut u8, bytes: u64, mirror: &'a Mirror, write: bool, reads: bool, snap: Option<usize> }
     impl<'a> BufArg<'a> {
         pub fn read<T: Copy>(v: &Vec<T>, m: &'a Mirror) -> Self {
-            BufArg { ptr: v.as_ptr() as *mut u8, bytes: (v.len() * std::mem::size_of::<T>()) as u64, mirror: m, write: false, reads: true }
+            BufArg { ptr: v.as_ptr() as *mut u8, bytes: (v.len() * std::mem::size_of::<T>()) as u64, mirror: m, write: false, reads: true, snap: None }
         }
         /// `reads`: the kernel also reads the vector it writes.
         pub fn write<T: Copy>(v: &mut Vec<T>, m: &'a Mirror, reads: bool) -> Self {
-            BufArg { ptr: v.as_mut_ptr() as *mut u8, bytes: (v.len() * std::mem::size_of::<T>()) as u64, mirror: m, write: true, reads }
+            BufArg { ptr: v.as_mut_ptr() as *mut u8, bytes: (v.len() * std::mem::size_of::<T>()) as u64, mirror: m, write: true, reads, snap: None }
+        }
+        pub fn snap_of(i: usize, m: &'a Mirror) -> Self {
+            BufArg { ptr: std::ptr::null_mut(), bytes: 0, mirror: m, write: false, reads: true, snap: Some(i) }
+        }
+    }
+
+    /// Device copies for the `snap` arguments of a launch: (argument index, buffer), allocated
+    /// once the vectors they copy are on the device.
+    unsafe fn snap_bufs(g: &mut Gpu, bufs: &[BufArg]) -> Option<Vec<(usize, Buf)>> {
+        let mut out = Vec::new();
+        for (i, b) in bufs.iter().enumerate() {
+            if b.snap.is_some() {
+                let size = b.mirror.st.borrow().buf.as_ref()?.size;
+                if let Some(k) = g.snap_free.iter().position(|x| x.size == size) {
+                    out.push((i, g.snap_free.swap_remove(k)));
+                    continue;
+                }
+                match g.alloc(size, false) {
+                    Some(x) => out.push((i, x)),
+                    None => {
+                        g.snap_free.extend(out.into_iter().map(|x| x.1));
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+    /// Records the copies into the snap buffers (before the barrier that precedes the kernel).
+    unsafe fn snap_copies(g: &mut Gpu, bufs: &[BufArg], snaps: &[(usize, Buf)]) {
+        if snaps.is_empty() {
+            return;
+        }
+        g.barrier(ST_COMPUTE | ST_TRANSFER, SHADER_WRITE | TRANSFER_WRITE, ST_TRANSFER, TRANSFER_READ);
+        for (i, x) in snaps {
+            let src = bufs[*i].mirror.st.borrow().buf.as_ref().unwrap().buf;
+            g.copy(src, x.buf, x.size);
         }
     }
 
@@ -877,6 +919,9 @@ pub mod ail_gpu {
         let ngroups = gx as u64 * gy as u64;
         // Device copies: allocated, and current where the kernel reads them.
         for b in bufs.iter_mut() {
+            if b.snap.is_some() {
+                continue;
+            }
             if b.bytes / 4 > u32::MAX as u64 {
                 return None;
             }
@@ -925,17 +970,24 @@ pub mod ail_gpu {
         for (i, a) in args.iter().enumerate() {
             *iow.add(4 + i) = *a;
         }
+        let snaps = snap_bufs(g, bufs)?;
         let mut infos: Vec<DescBuf> = vec![DescBuf { buffer: io_dev, offset: 0, range: !0u64 }];
-        for b in bufs.iter() {
-            infos.push(DescBuf { buffer: b.mirror.st.borrow().buf.as_ref().unwrap().buf, offset: 0, range: !0u64 });
+        for (i, b) in bufs.iter().enumerate() {
+            let buf = match snaps.iter().find(|s| s.0 == i) {
+                Some(s) => s.1.buf,
+                None => b.mirror.st.borrow().buf.as_ref().unwrap().buf,
+            };
+            infos.push(DescBuf { buffer: buf, offset: 0, range: !0u64 });
         }
         let writes: Vec<WriteDS> = (0..infos.len())
             .map(|i| WriteDS { s_type: 35, p_next: std::ptr::null(), set, binding: i as u32, elem: 0, n: 1, ty: 7, img: std::ptr::null(), buf: &infos[i], texel: std::ptr::null() })
             .collect();
         (g.d.vkUpdateDescriptorSets)(g.dev, writes.len() as u32, writes.as_ptr(), 0, std::ptr::null());
         if !g.begin() {
+            g.snap_free.extend(snaps.into_iter().map(|x| x.1));
             return None;
         }
+        snap_copies(g, bufs, &snaps);
         // A written vector whose only current copy is on the device gets a backup first, so a
         // trap can put it back.
         let mut backups: Vec<usize> = Vec::new();
@@ -954,6 +1006,7 @@ pub mod ail_gpu {
                         None => {
                             drop(st);
                             let _ = g.run();
+                            g.snap_free.extend(snaps.into_iter().map(|x| x.1));
                             return None;
                         }
                     }
@@ -972,6 +1025,7 @@ pub mod ail_gpu {
         g.copy(io_dev, io, words * 8);
         g.barrier(ST_TRANSFER, TRANSFER_WRITE, ST_HOST, HOST_READ);
         let ran = g.run();
+        g.snap_free.extend(snaps.into_iter().map(|x| x.1));
         let mut ok = ran && std::ptr::read_volatile(iow) == 0;
         let mut out = Vec::with_capacity(k.nred);
         if ok {
@@ -1196,6 +1250,9 @@ pub mod ail_gpu {
         let gy = groups.div_ceil(gx as u64) as u32;
         let ngroups = gx as u64 * gy as u64;
         for b in bufs.iter_mut() {
+            if b.snap.is_some() {
+                continue;
+            }
             if b.bytes / 4 > u32::MAX as u64 {
                 return None;
             }
@@ -1274,14 +1331,24 @@ pub mod ail_gpu {
             chunk_trap();
         }
         g.tsets += 1;
+        let snaps = match snap_bufs(g, bufs) {
+            Some(x) => x,
+            None => chunk_trap(),
+        };
         let mut infos: Vec<DescBuf> = vec![DescBuf { buffer: io_dev, offset: off * 8, range: words * 8 }];
-        for b in bufs.iter() {
-            infos.push(DescBuf { buffer: b.mirror.st.borrow().buf.as_ref().unwrap().buf, offset: 0, range: !0u64 });
+        for (i, b) in bufs.iter().enumerate() {
+            let buf = match snaps.iter().find(|s| s.0 == i) {
+                Some(s) => s.1.buf,
+                None => b.mirror.st.borrow().buf.as_ref().unwrap().buf,
+            };
+            infos.push(DescBuf { buffer: buf, offset: 0, range: !0u64 });
         }
         let writes: Vec<WriteDS> = (0..infos.len())
             .map(|i| WriteDS { s_type: 35, p_next: std::ptr::null(), set, binding: i as u32, elem: 0, n: 1, ty: 7, img: std::ptr::null(), buf: &infos[i], texel: std::ptr::null() })
             .collect();
         (g.d.vkUpdateDescriptorSets)(g.dev, writes.len() as u32, writes.as_ptr(), 0, std::ptr::null());
+        snap_copies(g, bufs, &snaps);
+        g.snap_free.extend(snaps.into_iter().map(|x| x.1));
         let c = BufCopy { src: off * 8, dst: off * 8, size: pbase * 8 };
         (g.d.vkCmdCopyBuffer)(g.cmd, io, io_dev, 1, &c);
         g.barrier(ST_TRANSFER | ST_HOST, TRANSFER_WRITE | HOST_WRITE, ST_COMPUTE, SHADER_READ | SHADER_WRITE);

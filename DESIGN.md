@@ -133,7 +133,12 @@ thread pool, with no change to the program:
   combines chunk by chunk in order, so ties resolve as in the sequential loop;
 - an outside variable that the body only assigns takes the value of the last assignment;
 - `(set (at v k) x)` is allowed when each iteration writes its own elements: `k` is the loop index,
-  or `i * w + j` with `j` from an inner range no wider than `w` (checked before the loop);
+  or `i * w + j` with `j` from an inner range no wider than `w` (checked before the loop); the
+  index may also go down as the loop goes up (`c - i`);
+- in-place dynamic programming over a row walked backwards (the 0/1 knapsack): when the last
+  statement writes `v` at `c ± i` and the other reads of `v` hit elements only later iterations
+  write (checked before the loop), those reads come from a copy of `v` taken before the loop
+  (on the GPU, a device copy made at launch);
 - a scratch vector that every iteration overwrites before reading gets one copy per chunk;
 - `push` and `print` collect per chunk and are appended in iteration order.
 

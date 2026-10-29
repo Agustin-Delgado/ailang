@@ -2766,15 +2766,73 @@ impl<'a> Emitter<'a> {
         }
         // Disjoint writes: per vector, the windows each iteration writes.
         let mut win_tests: Vec<String> = Vec::new();
+        // Reads that see the vector as it was before the loop (from a copy): a vector written
+        // once per iteration, by the last statement, at `c ± i`, whose other reads come before
+        // that write and hit `c ± i + d` with d on the side of later iterations (so no earlier
+        // iteration has written there). That is the in-place dynamic programming over a row
+        // walked backwards, as in a 0/1 knapsack.
+        let mut stale: Vec<(BindId, u32, &Expr)> = Vec::new();
+        let mut stale_tests: Vec<String> = Vec::new();
         for (wb, ws) in &writes {
+            let reads: Vec<(BindId, u32, &Expr)> = own_reads.iter().filter(|x| x.0 == *wb).copied().collect();
+            if ws.len() != 1 || reads.is_empty() {
+                continue;
+            }
+            if !matches!(body.last().map(|x| &x.kind), Some(ExprKind::Set(p, _)) if p.id == ws[0].0) {
+                continue;
+            }
+            // Each index as (decreasing?, its fixed terms as source text, the same terms wide).
+            let mut forms: Vec<Option<(bool, String, String)>> = Vec::new();
+            for idx in std::iter::once(ws[0].1).chain(reads.iter().map(|r| r.2)) {
+                let mut af = Aff::default();
+                if !aff(self, idx, lv, &lets, &ranges, &fixed, true, &mut af, 0) || !af.lv || af.j.is_some() || af.stride.is_some() {
+                    forms.push(None);
+                    continue;
+                }
+                let (mut src, mut wide) = (String::from("0"), String::from("0i128"));
+                for (plus, t) in &af.consts {
+                    let sg = if *plus { " + " } else { " - " };
+                    src.push_str(&format!("{sg}({})", self.src_of(t)));
+                    wide.push_str(&format!("{sg}{}", wide_of(self, t)));
+                }
+                forms.push(Some((af.neg, src, wide)));
+            }
+            let Some(Some((wneg, wsrc, wwide))) = forms.first().cloned() else { continue };
+            let rs: Vec<_> = forms[1..].iter().cloned().collect();
+            if rs.iter().any(|f| !matches!(f, Some((n, _, _)) if *n == wneg)) {
+                continue;
+            }
+            // Only worth a copy when some read is not the iteration's own element.
+            if rs.iter().all(|f| f.as_ref().is_some_and(|f| f.1 == wsrc)) {
+                continue;
+            }
+            for (r, f) in reads.iter().zip(rs.iter()) {
+                stale.push(*r);
+                let rw = &f.as_ref().unwrap().2;
+                // read - write must be <= 0 for a decreasing index, >= 0 for an increasing one.
+                stale_tests.push(if wneg { format!("(({rw}) - ({wwide}) <= 0)") } else { format!("(({rw}) - ({wwide}) >= 0)") });
+            }
+        }
+        let stale_vecs: HashSet<BindId> = stale.iter().map(|x| x.0).collect();
+        own_reads.retain(|x| !stale_vecs.contains(&x.0));
+        win_tests.extend(stale_tests);
+        for (wb, ws) in &writes {
+            if stale_vecs.contains(wb) {
+                continue;
+            }
             let mut stride: Option<Option<&Expr>> = None;
             let mut wins: Vec<String> = Vec::new();
             let mut bounds: Vec<(String, String)> = Vec::new();
             let reads: Vec<&Expr> = own_reads.iter().filter(|x| x.0 == *wb).map(|x| x.2).collect();
             let n_writes = ws.len();
+            let mut dir: Option<bool> = None;
             for (wi, idx) in ws.iter().map(|w| w.1).chain(reads.iter().copied()).enumerate() {
                 let mut af = Aff::default();
                 if !aff(self, idx, lv, &lets, &ranges, &fixed, true, &mut af, 0) || !af.lv {
+                    return None;
+                }
+                // All of a vector's indices move the same way with the loop.
+                if *dir.get_or_insert(af.neg) != af.neg {
                     return None;
                 }
                 let s_src = af.stride.map(|e| self.src_of(e).to_string());
@@ -3027,6 +3085,15 @@ impl<'a> Emitter<'a> {
                 let ic = self.val(idx);
                 unchecked.push((*rid, format!("(*{name}.at({ic}))")));
             }
+            if stale.iter().any(|x| x.0 == *b) {
+                // The copy is taken before the shared view of the vector is made.
+                let sn = format!("__pst{i}");
+                setup.insert_str(0, &format!("let {sn} = {pl}.clone(); "));
+                for (_, rid, idx) in stale.iter().filter(|x| x.0 == *b) {
+                    let ic = self.val(idx);
+                    unchecked.push((*rid, format!("{sn}[ail_rt::ix({ic})]")));
+                }
+            }
         }
         // The chunk body, with the hooks and shared vectors in place.
         let saved_hooks = std::mem::take(&mut self.par_hooks);
@@ -3057,7 +3124,7 @@ impl<'a> Emitter<'a> {
         self.no_par = was;
         let tuple = if ret.is_empty() { "()".to_string() } else { format!("({},)", ret.join(", ")) };
         let gpu = if range.is_some() && self.gpu_on && hists.is_empty() && pushes.is_empty() && maxes.is_empty() && modsums.is_empty() && lasts.is_empty() && scratch.is_empty() && !prints {
-            self.gpu_attempt(whole.id, lv, body, &sums, &writes, &own_reads, &tests)
+            self.gpu_attempt(whole.id, lv, body, &sums, &writes, &own_reads, &stale, &tests)
         } else {
             None
         };
@@ -3088,6 +3155,7 @@ impl<'a> Emitter<'a> {
         sums: &[(BindId, Vec<u32>)],
         writes: &[(BindId, Vec<(u32, &Expr)>)],
         own_reads: &[(BindId, u32, &Expr)],
+        stale: &[(BindId, u32, &Expr)],
         tests: &[String],
     ) -> Option<String> {
         let mut sum_map = HashMap::new();
@@ -3109,6 +3177,7 @@ impl<'a> Emitter<'a> {
             sum_vars: sum_vars.clone(),
             writes: writes.iter().flat_map(|(_, ws)| ws.iter().map(|w| w.0)).collect(),
             own_reads: own_reads.iter().map(|x| x.1).collect(),
+            stale: stale.iter().map(|x| x.1).collect(),
             collapse,
         };
         let k = crate::gpu::build(&inp);
@@ -3147,8 +3216,17 @@ impl<'a> Emitter<'a> {
         let mut after = String::new();
         let mut fallback = String::new();
         let mut shadows = String::new();
+        let mut mstr: Vec<String> = Vec::new();
         for (i, b) in k.bufs.iter().enumerate() {
             let pl = self.bind_place(b.bind);
+            if b.snap {
+                // Copied on the device from the written vector's buffer at launch (filled in
+                // below, once that buffer's mirror is known).
+                let w = k.bufs.iter().position(|x| x.bind == b.bind && !x.snap)?;
+                bufs.push(format!("\u{0}SNAP{w}"));
+                mstr.push(String::new());
+                continue;
+            }
             // A vector with a mirror keeps its device copy; any other gets one for the launch.
             let resident = self.kernel_stmt == Some(loop_id);
             let m = match self.mirrors.get(&b.bind).cloned().filter(|_| resident) {
@@ -3179,10 +3257,17 @@ impl<'a> Emitter<'a> {
                     format!("&__gm{i}")
                 }
             };
+            mstr.push(m.clone());
             if b.write {
                 bufs.push(format!("ail_gpu::BufArg::write(&mut {pl}, {m}, {})", b.read));
             } else {
                 bufs.push(format!("ail_gpu::BufArg::read(&{pl}, {m})"));
+            }
+        }
+        for x in bufs.iter_mut() {
+            if let Some(w) = x.strip_prefix("\u{0}SNAP") {
+                let w: usize = w.parse().unwrap();
+                *x = format!("ail_gpu::BufArg::snap_of({w}, {})", mstr[w]);
             }
         }
         let starts: Vec<String> = sum_vars.iter().map(|b| format!("({}) as i64", self.bind_place(*b))).collect();
@@ -4835,6 +4920,8 @@ fn find_expr(es: &[Expr], id: u32) -> Option<&Expr> {
 #[derive(Default)]
 struct Aff<'e> {
     lv: bool,
+    /// The loop variable is subtracted: the index goes down as the loop goes up.
+    neg: bool,
     stride: Option<&'e Expr>,
     j: Option<BindId>,
     consts: Vec<(bool, &'e Expr)>,
@@ -4868,10 +4955,11 @@ fn aff<'e>(
     }
     if let Some(b) = local(e) {
         if b == lv {
-            if out.lv || !plus {
+            if out.lv {
                 return false;
             }
             out.lv = true;
+            out.neg = !plus;
             return true;
         }
         if ranges.contains_key(&b) {
@@ -4894,11 +4982,7 @@ fn aff<'e>(
         ("+", _) => xs.iter().all(|x| aff(em, x.expr(), lv, lets, ranges, fixed, plus, out, depth + 1)),
         ("-", 2) => {
             aff(em, xs[0].expr(), lv, lets, ranges, fixed, plus, out, depth + 1)
-                && fixed(xs[1].expr())
-                && {
-                    out.consts.push((!plus, xs[1].expr()));
-                    true
-                }
+                && aff(em, xs[1].expr(), lv, lets, ranges, fixed, !plus, out, depth + 1)
         }
         ("*", 2) => {
             let (x, y) = (xs[0].expr(), xs[1].expr());
@@ -4910,10 +4994,11 @@ fn aff<'e>(
                 return false;
             };
             let _ = v;
-            if out.lv || !plus {
+            if out.lv {
                 return false;
             }
             out.lv = true;
+            out.neg = !plus;
             out.stride = Some(s);
             true
         }
