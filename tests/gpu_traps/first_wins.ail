@@ -1,0 +1,13 @@
+; Two different traps in one loop: the one at the lower index is the one the program reports,
+; even though the GPU runs the later one first or at the same time.
+(fn main (params (con Console))
+  (body
+    (let n 100000)
+    (var v (Vec I64) (fill n 0))
+    (var s 0)
+    (for i (range 0 n)
+      (let a (if (== i 90000) (/ i (- i i)) i))
+      (let b (if (== i 20000) (* a 4611686018427387904) a)) ; traps here
+      (set (at v i) b)
+      (set s (+ s b)))
+    (println con s)))

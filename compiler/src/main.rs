@@ -624,7 +624,8 @@ fn fnv(s: &str) -> u64 {
 fn compile(rust: &str, test: bool, o: &Opts) -> Result<PathBuf, String> {
     // A trap in a read handler of http-serve answers 500 and the server keeps going: that needs
     // unwinding. Everything else stops at the first trap, so it can abort.
-    let unwinds = rust.contains("ail_http::serve(");
+    // So does a loop run in chunks on the GPU: a trap inside a chunk rolls it back.
+    let unwinds = rust.contains("ail_http::serve(") || rust.contains("ail_gpu::chunk_begin(");
     let mut flags = vec![
         "--edition",
         "2021",

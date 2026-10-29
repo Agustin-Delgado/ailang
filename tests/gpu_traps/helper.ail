@@ -1,0 +1,11 @@
+; The trap is inside a helper fn that the kernel calls.
+(fn scale (params (x I64) (k I64)) (returns I64)
+  (body
+    (if (> x 90000) (/ x (- k k)) (* x k)))) ; traps here
+
+(fn main (params (con Console))
+  (body
+    (let n 100000)
+    (var v (Vec I64) (fill n 0))
+    (for i (range 0 n) (set (at v i) (scale i 3)))
+    (println con (at v 99))))

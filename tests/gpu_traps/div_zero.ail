@@ -1,0 +1,7 @@
+; A division by zero in the middle of the range, in a kernel that writes without reading.
+(fn main (params (con Console))
+  (body
+    (let n 100000)
+    (var v (Vec I64) (fill n 1))
+    (for i (range 0 n) (set (at v i) (/ 1000000 (- i 61234)))) ; traps here
+    (println con (at v 0))))

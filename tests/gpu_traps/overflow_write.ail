@@ -1,0 +1,11 @@
+; An element write that overflows near the end of the range.
+(fn main (params (con Console))
+  (body
+    (let n 200000)
+    (var v (Vec I64) (fill n 0))
+    (for i (range 0 n)
+      (set (at v i) (* i 46116860184273)))
+    (println con (at v (- n 1)))
+    (for i (range 0 n)
+      (set (at v i) (* (at v i) (+ i 1)))) ; traps here
+    (println con (at v 7))))

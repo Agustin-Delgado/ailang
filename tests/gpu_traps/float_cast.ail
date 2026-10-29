@@ -1,0 +1,9 @@
+; An F64 that does not fit in an I64 when converted.
+(fn main (params (con Console))
+  (body
+    (let n 100000)
+    (var xs (Vec F64) (fill n 1.5))
+    (for i (range 0 n) (set (at xs i) (* (as F64 i) 1.0e14)))
+    (var out (Vec I64) (fill n 0))
+    (for i (range 0 n) (set (at out i) (as I64 (* (at xs i) 1000.0)))) ; traps here
+    (println con (at out 3))))

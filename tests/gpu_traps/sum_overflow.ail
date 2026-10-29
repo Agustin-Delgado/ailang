@@ -1,0 +1,9 @@
+; A sum whose terms are large enough that the total overflows.
+(fn main (params (con Console))
+  (body
+    (let n 300000)
+    (var v (Vec I64) (fill n 0))
+    (for i (range 0 n) (set (at v i) (* i 1000)))
+    (var total 0)
+    (for i (range 0 n) (set total (+ total (* (at v i) 100000000)))) ; traps here
+    (println con total)))

@@ -1,0 +1,10 @@
+; A read past the end of another vector.
+(fn main (params (con Console))
+  (body
+    (let n 100000)
+    (var src (Vec I64) (fill (+ n 50) 3))
+    (var dst (Vec I64) (fill n 0))
+    (for i (range 0 n) (set (at dst i) (+ (at src i) 1)))
+    (println con (at dst 5))
+    (for i (range 0 n) (set (at dst i) (at src (* i 2)))) ; traps here
+    (println con (at dst 5))))

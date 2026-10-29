@@ -1,0 +1,14 @@
+; An outer loop whose iterations each launch a kernel, run with the launches queued: the kernel
+; of iteration 150 traps, after the outer variable has been updated in every iteration so far.
+(fn main (params (con Console))
+  (body
+    (let n 50000)
+    (var v (Vec I64) (fill n 1))
+    (var acc 0)
+    (println con "start")
+    (for t (range 0 300)
+      (set acc (+ acc t))
+      (for i (range 0 n)
+        (set (at v i) (+ (% (* (at v i) 3) 1000003) (if (and (== t 150) (== i 777)) (/ 1 (- t t)) 1))))) ; traps here
+    (println con acc)
+    (println con (at v 5))))

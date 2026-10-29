@@ -1153,6 +1153,9 @@ impl<'a> Emitter<'a> {
                 if let ForIter::Range(a, z) = it {
                     let lo = self.val(a);
                     let hi = self.val(z);
+                    if let Some(snap) = self.chunk_plan(b, body) {
+                        return self.for_chunked(&var, &lo, &hi, body, &snap);
+                    }
                     return self.for_range_seq(b, &var, &lo, &hi, a, body);
                 }
                 let head = match it {
@@ -2535,7 +2538,10 @@ impl<'a> Emitter<'a> {
                         }
                         ExprKind::Call(n, _, pa) if n == "at" && pa.len() == 2 => {
                             let at_src = self.src_of(pl);
+                            // `(set (at v i) (+ (at v i) e))` at the loop index is a write to the
+                            // iteration's own element, not a histogram.
                             let hist = local_of(pa[0].expr()) == Some(r)
+                                && local_of(pa[1].expr()) != Some(lv)
                                 && self.ty(pl).is_int()
                                 && !self.unsigned(self.ty(pl))
                                 && matches!(&v.kind, ExprKind::Call(op, _, xs) if op == "+" && builtin(v)
@@ -3260,6 +3266,104 @@ impl<'a> Emitter<'a> {
             format!("let {mn} = ail_gpu::Mirror::new();\n"),
             format!("if {m}.on_cpu() {{ {cpu} }} else {{ ail_gpu::slice_dev(&{pl}, {mref}, {a}, {z}, &{mn}) }}"),
         ))
+    }
+
+    /// A loop that may run in chunks (see `ail_gpu::chunk_begin`): it launches kernels, has no
+    /// effects but computing (no capability is used, nothing leaves the loop early), and changes
+    /// outside it only variables that can be saved by copying (returned here) and vectors with
+    /// mirrors (which the runtime saves), the latter only element by element or through a call.
+    fn chunk_plan(&self, lv: BindId, body: &[Expr]) -> Option<Vec<BindId>> {
+        if !self.gpu_hooks() || !body.iter().any(|e| self.has_gpu(e)) {
+            return None;
+        }
+        let mut inner: HashSet<BindId> = HashSet::from([lv]);
+        let mut nested: HashSet<u32> = HashSet::new();
+        for e in body {
+            walk_ref(e, &mut |x| match &x.kind {
+                ExprKind::Let { .. } | ExprKind::For(..) => {
+                    if let Some(b) = self.ck.decl.get(&(x.id as usize)) {
+                        inner.insert(*b);
+                    }
+                    if let ExprKind::For(_, _, _, fb) = &x.kind {
+                        fb.iter().for_each(|y| walk_ref(y, &mut |z| { nested.insert(z.id); }));
+                    }
+                }
+                ExprKind::While(_, wb) => wb.iter().for_each(|y| walk_ref(y, &mut |z| { nested.insert(z.id); })),
+                _ => {}
+            });
+        }
+        let mut snap: Vec<BindId> = Vec::new();
+        let mut ok = true;
+        let outer = |p: &Expr| self.root_of(p).filter(|r| !inner.contains(r));
+        for e in body {
+            walk_ref(e, &mut |x| {
+                if !ok {
+                    return;
+                }
+                match &x.kind {
+                    ExprKind::Return(_) | ExprKind::Try(_) | ExprKind::Tasks(..) => ok = false,
+                    ExprKind::Break | ExprKind::Continue if !nested.contains(&x.id) => ok = false,
+                    ExprKind::Var(_) if matches!(self.ty(x), Ty::Cap(_)) => ok = false,
+                    ExprKind::Set(pl, _) => {
+                        if let Some(r) = outer(pl) {
+                            let ty = &self.ck.bindings[r].ty;
+                            let elem = matches!(&pl.kind, ExprKind::Call(n, _, a) if n == "at" && matches!(a[0].expr().kind, ExprKind::Var(_)));
+                            if self.is_copy(ty) {
+                                if !snap.contains(&r) {
+                                    snap.push(r);
+                                }
+                            } else if !(elem && gpu_vec(ty) && self.mirrors.contains_key(&r)) {
+                                ok = false;
+                            }
+                        } else if self.root_of(pl).is_none() {
+                            ok = false;
+                        }
+                    }
+                    ExprKind::Call(_, _, args) => {
+                        let user = matches!(self.ck.res.get(x.id as usize), Some(Res::UserFn(_)));
+                        for a in args {
+                            let Arg::Mut(m, _) = a else { continue };
+                            let Some(r) = outer(m) else {
+                                if self.root_of(m).is_none() {
+                                    ok = false;
+                                }
+                                continue;
+                            };
+                            let ty = &self.ck.bindings[r].ty;
+                            let var = matches!(m.kind, ExprKind::Var(_));
+                            if var && self.is_copy(ty) {
+                                if !snap.contains(&r) {
+                                    snap.push(r);
+                                }
+                            } else if !(var && user && gpu_vec(ty) && self.mirrors.contains_key(&r)) {
+                                ok = false;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        }
+        ok.then_some(snap)
+    }
+
+    /// `(for var (range lo hi) body)` in chunks: each chunk runs with its GPU work queued and is
+    /// checked at its end; one that traps is undone (the saved variables here, the mirrors in
+    /// the runtime) and runs again the ordinary way. Chunks grow from one iteration.
+    fn for_chunked(&mut self, var: &str, lo: &str, hi: &str, body: &[Expr], snap: &[BindId]) -> String {
+        let bd = self.block(body);
+        let places: Vec<String> = snap.iter().map(|b| self.bind_place(*b)).collect();
+        let save = places.iter().map(|p| format!("{p}, ")).collect::<String>();
+        let restore = places.iter().enumerate().map(|(i, p)| format!("{p} = __snap.{i}; ")).collect::<String>();
+        format!(
+            "{{ let __chi: i64 = {hi}; let mut __ct: i64 = {lo}; let mut __cd: i64 = 0; \
+             while __ct < __chi {{ let __cn = ail_gpu::chunk_len(__cd, __chi - __ct); \
+             if __cn > 1 && ail_gpu::chunk_begin() {{ let __snap = ({save}); \
+             let __r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{ for {var} in __ct..__ct + __cn {{ let _ = {bd}; }} }})); \
+             if ail_gpu::chunk_end(__r) {{ __ct += __cn; __cd += __cn; continue; }} \
+             {restore}__cd = -1; for {var} in __ct..__ct + __cn {{ let _ = {bd}; }} __ct += __cn; \
+             }} else {{ let {var}: i64 = __ct; let _ = {bd}; __ct += 1; if __cd >= 0 {{ __cd += 1; }} }} }} }}"
+        )
     }
 
     /// True if running `e` may launch a kernel: it holds a kernel loop or calls a GPU-aware fn.

@@ -1,0 +1,14 @@
+; The vector stays on the device across loops; the trap in the third loop must see what the
+; first two wrote, and the output printed before it must be complete.
+(fn main (params (con Console))
+  (body
+    (let n 150000)
+    (var v (Vec I64) (fill n 1))
+    (for i (range 0 n) (set (at v i) (+ (at v i) i)))
+    (for i (range 0 n) (set (at v i) (* (at v i) 3)))
+    (println con (at v 100))
+    (println con (at v (- n 1)))
+    (for i (range 0 n) (set (at v i) (- 449991 (at v i))))
+    (println con (at v 1))
+    (for i (range 0 n) (set (at v i) (/ 7 (at v i)))) ; traps here
+    (println con (at v 2))))

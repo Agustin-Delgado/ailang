@@ -1,0 +1,9 @@
+; The very first iteration traps, in a sum loop over data already on the device.
+(fn main (params (con Console))
+  (body
+    (let n 100000)
+    (var v (Vec I64) (fill n 5))
+    (for i (range 0 n) (set (at v i) (- (at v i) (if (== i 0) 5 0))))
+    (var s 0)
+    (for i (range 0 n) (set s (+ s (/ 100 (at v i))))) ; traps here
+    (println con s)))

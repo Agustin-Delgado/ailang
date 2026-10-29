@@ -135,6 +135,7 @@ pub mod ail_gpu {
         vkCreateDescriptorPool: fn(Ptr, *const DpCI, *const c_void, *mut Nd) -> i32;
         vkAllocateDescriptorSets: fn(Ptr, *const DsAI, *mut Nd) -> i32;
         vkUpdateDescriptorSets: fn(Ptr, u32, *const WriteDS, u32, *const c_void);
+        vkResetDescriptorPool: fn(Ptr, Nd, u32) -> i32;
         vkCreateCommandPool: fn(Ptr, *const CmdPoolCI, *const c_void, *mut Nd) -> i32;
         vkAllocateCommandBuffers: fn(Ptr, *const CbAI, *mut Ptr) -> i32;
         vkResetCommandBuffer: fn(Ptr, u32) -> i32;
@@ -177,8 +178,21 @@ pub mod ail_gpu {
         /// Freed device buffers kept for reuse (allocation is slow): at most POOL bytes.
         bufpool: RefCell<Vec<Buf>>,
         pool_bytes: std::cell::Cell<u64>,
+        slab: std::cell::Cell<(Nd, u64)>,
+        /// Work recorded but not yet submitted (only inside a chunk, see `chunk_begin`): each
+        /// launch has its own segment of the argument buffers (`segs`, in words) and a
+        /// descriptor set from `tpool`; buffers freed meanwhile wait in `deferred`.
+        tpool: Nd,
+        rec: bool,
+        cursor: u64,
+        segs: Vec<u64>,
+        tsets: u32,
+        deferred: Vec<Buf>,
     }
     const POOL: u64 = 1 << 30;
+    /// Buffers up to SMALL bytes are carved out of blocks of SLAB bytes.
+    const SMALL: u64 = 1 << 20;
+    const SLAB: u64 = 64 << 20;
     unsafe impl Send for Gpu {}
 
     /// What a kernel needs to know about the device to use it.
@@ -189,8 +203,10 @@ pub mod ail_gpu {
     /// AIL_GPU_LOG=1 prints what the GPU does (for measuring and debugging).
     pub fn log(msg: &str) {
         static L: OnceLock<bool> = OnceLock::new();
+        static T0: OnceLock<std::time::Instant> = OnceLock::new();
         if *L.get_or_init(|| std::env::var("AIL_GPU_LOG").is_ok()) {
-            eprintln!("[gpu] {msg}");
+            let t = T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[gpu] {t:9.2}ms {msg}");
         }
     }
 
@@ -367,14 +383,80 @@ pub mod ail_gpu {
         if (d.vkCreateDescriptorPool)(dev, &dpci, std::ptr::null(), &mut dpool) != 0 {
             return None;
         }
+        let tsizes = PoolSize { ty: 7, n: TSETS * 16 };
+        let tpci = DpCI { s_type: 33, p_next: std::ptr::null(), flags: 0, max: TSETS, n: 1, sizes: &tsizes };
+        let mut tpool: Nd = 0;
+        if (d.vkCreateDescriptorPool)(dev, &tpci, std::ptr::null(), &mut tpool) != 0 {
+            return None;
+        }
         Some(Gpu {
             dev, d, queue, cmd, fence, dsl_cache: Default::default(), pool: dpool, local_type, host_type,
             staging: None, io: None, io_dev: None, pipes: Default::default(), f64_ok, dead: false,
-            bufpool: RefCell::new(Vec::new()), pool_bytes: std::cell::Cell::new(0),
+            bufpool: RefCell::new(Vec::new()), pool_bytes: std::cell::Cell::new(0), slab: std::cell::Cell::new((0, 0)),
+            tpool, rec: false, cursor: 0, segs: Vec::new(), tsets: 0, deferred: Vec::new(),
         })
     }
 
+    /// Launches queued before the work is submitted, and descriptor sets per submission.
+    const MAX_QUEUED: usize = 512;
+    const TSETS: u32 = 1024;
+    /// Argument segments start at multiples of this many words (256 bytes, a valid offset).
+    const SEG_ALIGN: u64 = 32;
+
     impl Gpu {
+        /// Frees `b` now, or after the queued work if some is pending (it may use b).
+        unsafe fn free_later(&mut self, b: Buf) {
+            if self.rec {
+                self.deferred.push(b);
+            } else {
+                self.free(b);
+            }
+        }
+        /// Opens the command buffer for queued work, if it is not open.
+        unsafe fn ensure_rec(&mut self) -> bool {
+            if self.rec {
+                return true;
+            }
+            if !self.begin() {
+                return false;
+            }
+            self.rec = true;
+            self.cursor = 0;
+            self.segs.clear();
+            self.tsets = 0;
+            true
+        }
+        /// Submits the queued work and waits for it. False if the device failed or a launch in
+        /// it trapped: the caller is inside a chunk, which is then rolled back.
+        unsafe fn settle(&mut self) -> bool {
+            if !self.rec {
+                return true;
+            }
+            self.rec = false;
+            let bytes = self.cursor * 8;
+            if bytes > 0 {
+                if let (Some(io), Some(io_dev)) = (self.io.as_ref().map(|x| x.0.buf), self.io_dev.as_ref().map(|x| x.buf)) {
+                    self.barrier(ST_COMPUTE | ST_TRANSFER, SHADER_WRITE | TRANSFER_WRITE, ST_TRANSFER, TRANSFER_READ);
+                    self.copy(io_dev, io, bytes);
+                    self.barrier(ST_TRANSFER, TRANSFER_WRITE, ST_HOST, HOST_READ);
+                }
+            }
+            let ok = self.run();
+            let iop = self.io.as_ref().map(|x| x.1 as *const u64);
+            let trapped = ok && iop.is_some_and(|p| self.segs.iter().any(|&off| std::ptr::read_volatile(p.add(off as usize)) != 0));
+            (self.d.vkResetDescriptorPool)(self.dev, self.tpool, 0);
+            self.tsets = 0;
+            for b in std::mem::take(&mut self.deferred) {
+                self.free(b);
+            }
+            ok && !trapped
+        }
+        /// Settles queued work before an operation that needs the device idle or its results.
+        unsafe fn sync(&mut self) {
+            if self.rec && !self.settle() {
+                chunk_trap();
+            }
+        }
         unsafe fn alloc(&self, size: u64, host: bool) -> Option<Buf> {
             let size = size.max(16);
             if !host {
@@ -397,6 +479,26 @@ pub mod ail_gpu {
                 (self.d.vkDestroyBuffer)(self.dev, buf, std::ptr::null());
                 return None;
             }
+            // Small device buffers share big blocks of memory: allocating memory is slow, and a
+            // chunk may need a new buffer per iteration (a slice) before it can reuse freed ones.
+            // Such a buffer has `mem` 0 and is never destroyed, only kept for reuse.
+            if !host && req.size <= SMALL {
+                let (mut smem, mut used) = self.slab.get();
+                let at = used.div_ceil(req.align.max(1)) * req.align.max(1);
+                if smem == 0 || at + req.size > SLAB {
+                    let mai = MemAI { s_type: 5, p_next: std::ptr::null(), size: SLAB, index: ty };
+                    smem = 0;
+                    if (self.d.vkAllocateMemory)(self.dev, &mai, std::ptr::null(), &mut smem) != 0 {
+                        (self.d.vkDestroyBuffer)(self.dev, buf, std::ptr::null());
+                        return None;
+                    }
+                    used = 0;
+                }
+                let at = used.div_ceil(req.align.max(1)) * req.align.max(1);
+                (self.d.vkBindBufferMemory)(self.dev, buf, smem, at);
+                self.slab.set((smem, at + req.size));
+                return Some(Buf { buf, mem: 0, size, host });
+            }
             let mai = MemAI { s_type: 5, p_next: std::ptr::null(), size: req.size, index: ty };
             let mut mem: Nd = 0;
             if (self.d.vkAllocateMemory)(self.dev, &mai, std::ptr::null(), &mut mem) != 0 {
@@ -407,7 +509,7 @@ pub mod ail_gpu {
             Some(Buf { buf, mem, size, host })
         }
         unsafe fn free(&self, b: Buf) {
-            if !b.host && self.pool_bytes.get() + b.size <= POOL {
+            if !b.host && (b.mem == 0 || self.pool_bytes.get() + b.size <= POOL) {
                 self.pool_bytes.set(self.pool_bytes.get() + b.size);
                 self.bufpool.borrow_mut().push(b);
                 return;
@@ -481,6 +583,7 @@ pub mod ail_gpu {
             ok
         }
         unsafe fn upload(&mut self, dst: Nd, src: *const u8, size: u64) -> bool {
+            self.sync();
             let Some((st, p)) = self.host(0, size) else { return false };
             std::ptr::copy_nonoverlapping(src, p, size as usize);
             if !self.begin() {
@@ -490,6 +593,7 @@ pub mod ail_gpu {
             self.run()
         }
         unsafe fn download(&mut self, src: Nd, dst: *mut u8, size: u64) -> bool {
+            self.sync();
             let Some((st, p)) = self.host(0, size) else { return false };
             if !self.begin() {
                 return false;
@@ -559,12 +663,18 @@ pub mod ail_gpu {
 
     /// The companion of a vector the GPU may hold: its device copy and which copy is current.
     /// Dropped with the vector it belongs to.
-    pub struct Mirror { st: RefCell<MState> }
+    /// `birth`: the chunk it was made in (0 outside chunks); a chunk rolls back only the
+    /// mirrors that existed before it.
+    pub struct Mirror { st: RefCell<MState>, birth: u64 }
 
     impl Mirror {
-        pub fn new() -> Mirror { Mirror { st: RefCell::new(MState { buf: None, spare: None, gpu_ok: false, cpu_ok: true }) } }
+        pub fn new() -> Mirror {
+            let birth = CHUNK.with(|c| { let c = c.borrow(); if c.active { c.serial } else { 0 } });
+            Mirror { st: RefCell::new(MState { buf: None, spare: None, gpu_ok: false, cpu_ok: true }), birth }
+        }
         /// Makes the vector's own memory current (downloads it if the GPU changed it).
-        pub fn to_cpu<T: Copy>(&self, v: &mut Vec<T>) {
+        pub fn to_cpu<T: Copy + 'static>(&self, v: &mut Vec<T>) {
+            backup_cpu(self, v);
             let mut st = self.st.borrow_mut();
             if st.cpu_ok {
                 return;
@@ -582,6 +692,7 @@ pub mod ail_gpu {
         /// The vector's contents as the CPU can read them, for a vector the caller cannot
         /// write to: itself if current, else a copy downloaded from the device.
         pub fn view<'a, T: Copy>(&self, v: &'a Vec<T>) -> std::borrow::Cow<'a, Vec<T>> {
+            touch(self);
             let st = self.st.borrow();
             if st.cpu_ok || st.buf.is_none() {
                 return std::borrow::Cow::Borrowed(v);
@@ -599,6 +710,7 @@ pub mod ail_gpu {
         }
         /// The vector changed on the CPU: the device copy is stale.
         pub fn cpu_changed(&self) {
+            touch(self);
             let mut st = self.st.borrow_mut();
             st.gpu_ok = false;
             st.cpu_ok = true;
@@ -611,9 +723,9 @@ pub mod ail_gpu {
             let (a, b) = (st.buf.take(), st.spare.take());
             if a.is_some() || b.is_some() {
                 if let Some(g) = GPU.get().and_then(|g| g.as_ref()) {
-                    let g = g.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut g = g.lock().unwrap_or_else(|e| e.into_inner());
                     for x in [a, b].into_iter().flatten() {
-                        unsafe { g.free(x) };
+                        unsafe { g.free_later(x) };
                     }
                 }
             }
@@ -630,17 +742,21 @@ pub mod ail_gpu {
         let copied = (|| -> Option<()> {
             let g = gpu()?;
             let mut g = g.lock().unwrap_or_else(|e| e.into_inner());
+            touch(src);
             let st = src.st.borrow();
             let from = st.buf.as_ref()?.buf;
             let buf = unsafe { g.alloc((n as u64 * sz).max(16), false)? };
+            // Inside a chunk the copy is queued after the work that produces the source.
+            let queued = in_chunk();
             let ok = unsafe {
-                g.begin() && {
+                (if queued { g.ensure_rec() } else { g.begin() }) && {
                     if n > 0 {
+                        g.barrier(ST_COMPUTE | ST_TRANSFER, SHADER_WRITE | TRANSFER_WRITE, ST_TRANSFER, TRANSFER_READ);
                         let c = BufCopy { src: ua as u64 * sz, dst: 0, size: n as u64 * sz };
                         (g.d.vkCmdCopyBuffer)(g.cmd, from, buf.buf, 1, &c);
                     }
                     g.barrier(ST_TRANSFER, TRANSFER_WRITE, ST_COMPUTE | ST_TRANSFER, SHADER_READ | TRANSFER_READ);
-                    g.run()
+                    queued || g.run()
                 }
             };
             if !ok {
@@ -649,7 +765,7 @@ pub mod ail_gpu {
             }
             let mut d = dst.st.borrow_mut();
             if let Some(old) = d.buf.replace(buf) {
-                unsafe { g.free(old) };
+                unsafe { g.free_later(old) };
             }
             d.gpu_ok = true;
             d.cpu_ok = false;
@@ -729,6 +845,13 @@ pub mod ail_gpu {
             return None;
         }
         let t = std::time::Instant::now();
+        if in_chunk() {
+            let r = unsafe { launch_queued(&mut g, k, lo, n, args, bufs, starts) };
+            if r.is_none() {
+                log(&format!("kernel {} n={} not queued", k.id, n));
+            }
+            return r;
+        }
         let r = unsafe { launch_locked(&mut g, k, lo, n, args, bufs, starts) };
         log(&format!("kernel {} n={} {} in {:?}", k.id, n, if r.is_some() { "ran" } else { "fell back" }, t.elapsed()));
         r
@@ -898,6 +1021,300 @@ pub mod ail_gpu {
                 st.cpu_ok = false;
                 st.gpu_ok = true;
             }
+        }
+        Some(out)
+    }
+
+
+    // ---- Chunks: loop iterations whose GPU work is queued and checked once at the end. ----
+    //
+    // Waiting for each launch costs more than most launches. A loop whose body only computes
+    // (no output, no other effects) can instead run a group of its iterations with every launch
+    // queued, and check them all at the end. Each mirror that existed before the group keeps,
+    // from the moment the group first changes it, a copy of what it held (on the device or on
+    // the CPU, wherever it was current); the variables the body assigns are saved by the
+    // generated code. If anything traps inside the group, on the GPU or on the CPU, all of it
+    // is put back and the group runs again the ordinary way, one launch at a time, which traps
+    // exactly where the program does.
+
+    struct CRec { m: *const Mirror, gpu_ok: bool, cpu_ok: bool, gpu_backed: bool, cpu: Option<Box<dyn FnOnce()>> }
+    struct Chunk { active: bool, serial: u64, recs: Vec<CRec>, failures: u32 }
+    thread_local! { static CHUNK: RefCell<Chunk> = const { RefCell::new(Chunk { active: false, serial: 0, recs: Vec::new(), failures: 0 }) }; }
+
+    fn in_chunk() -> bool { CHUNK.with(|c| c.borrow().active) }
+
+    /// The record of `m` in the running chunk (made on first use), if m predates the chunk.
+    fn touch(m: &Mirror) -> Option<usize> {
+        CHUNK.with(|c| {
+            let mut c = c.borrow_mut();
+            if !c.active || m.birth == c.serial {
+                return None;
+            }
+            let p = m as *const Mirror;
+            if let Some(i) = c.recs.iter().position(|r| r.m == p) {
+                return Some(i);
+            }
+            let st = m.st.borrow();
+            c.recs.push(CRec { m: p, gpu_ok: st.gpu_ok, cpu_ok: st.cpu_ok, gpu_backed: false, cpu: None });
+            Some(c.recs.len() - 1)
+        })
+    }
+
+    /// Before the CPU copy of `v` may change inside a chunk: keep what it held at the start.
+    fn backup_cpu<T: Copy + 'static>(m: &Mirror, v: &mut Vec<T>) {
+        let Some(i) = touch(m) else { return };
+        CHUNK.with(|c| {
+            let mut c = c.borrow_mut();
+            let r = &mut c.recs[i];
+            if r.cpu_ok && r.cpu.is_none() {
+                let saved = v.clone();
+                let p = v as *mut Vec<T>;
+                // The vector outlives the chunk (it belongs to code outside it), and the restore
+                // runs after everything inside has finished.
+                r.cpu = Some(Box::new(move || unsafe { *p = saved }));
+            }
+        });
+    }
+
+    /// Before the device copy of `m` changes inside a chunk: queue a copy of what it held.
+    unsafe fn backup_dev(g: &mut Gpu, m: &Mirror) -> bool {
+        let Some(i) = touch(m) else { return true };
+        let need = CHUNK.with(|c| { let c = c.borrow(); c.recs[i].gpu_ok && !c.recs[i].gpu_backed });
+        if !need {
+            return true;
+        }
+        let mut st = m.st.borrow_mut();
+        let Some(size) = st.buf.as_ref().map(|b| b.size) else { return true };
+        if st.spare.as_ref().map_or(true, |s| s.size != size) {
+            if let Some(old) = st.spare.take() {
+                g.free_later(old);
+            }
+            match g.alloc(size, false) {
+                Some(x) => st.spare = Some(x),
+                None => return false,
+            }
+        }
+        if !g.ensure_rec() {
+            return false;
+        }
+        g.barrier(ST_COMPUTE | ST_TRANSFER, SHADER_WRITE | TRANSFER_WRITE, ST_TRANSFER, TRANSFER_READ);
+        g.copy(st.buf.as_ref().unwrap().buf, st.spare.as_ref().unwrap().buf, size);
+        g.barrier(ST_TRANSFER, TRANSFER_WRITE | TRANSFER_READ, ST_COMPUTE | ST_TRANSFER, SHADER_READ | SHADER_WRITE | TRANSFER_WRITE);
+        CHUNK.with(|c| c.borrow_mut().recs[i].gpu_backed = true);
+        true
+    }
+
+    /// Ends the chunk the hard way: the generated code catches this and rolls back.
+    #[cold]
+    fn chunk_trap() -> ! {
+        std::panic::panic_any(ChunkTrap)
+    }
+    struct ChunkTrap;
+
+    /// How many iterations the next chunk of a loop takes, given how many it has done in chunks
+    /// so far (`done`, -1 once a chunk of it failed) and how many are left.
+    pub fn chunk_len(done: i64, left: i64) -> i64 {
+        if done < 0 || mode() == 0 || CHUNK.with(|c| { let c = c.borrow(); c.active || c.failures >= 3 }) {
+            return 1;
+        }
+        (done + 1).min(1 << 20).min(left).max(1)
+    }
+
+    /// Starts a chunk; false (and nothing started) if there is no device or one is running.
+    pub fn chunk_begin() -> bool {
+        if in_chunk() || !ready() {
+            return false;
+        }
+        CHUNK.with(|c| {
+            let mut c = c.borrow_mut();
+            c.active = true;
+            c.serial += 1;
+            c.recs.clear();
+        });
+        super::ail_rt::CHUNK_QUIET.with(|q| q.set(true));
+        true
+    }
+
+    /// Ends a chunk: true if it ran without trapping (its effects stay), false if it was rolled
+    /// back (the caller restores its variables and runs the iterations again).
+    pub fn chunk_end(r: Result<(), Box<dyn std::any::Any + Send>>) -> bool {
+        super::ail_rt::CHUNK_QUIET.with(|q| q.set(false));
+        let g = gpu();
+        let settled = match g {
+            Some(g) => unsafe { g.lock().unwrap_or_else(|e| e.into_inner()).settle() },
+            None => true,
+        };
+        let recs = CHUNK.with(|c| {
+            let mut c = c.borrow_mut();
+            c.active = false;
+            std::mem::take(&mut c.recs)
+        });
+        if r.is_ok() && settled {
+            log(&format!("chunk of {} mirrors done", recs.len()));
+            return true;
+        }
+        CHUNK.with(|c| c.borrow_mut().failures += 1);
+        log("chunk rolled back");
+        let dead = g.map_or(true, |g| g.lock().map(|g| g.dead).unwrap_or(true));
+        for r in recs {
+            // Every mirror in the list outlives the chunk (see `touch`).
+            let m = unsafe { &*r.m };
+            let mut st = m.st.borrow_mut();
+            if r.gpu_backed {
+                let MState { buf, spare, .. } = &mut *st;
+                std::mem::swap(buf, spare);
+            }
+            if let Some(f) = r.cpu {
+                f();
+            }
+            st.gpu_ok = r.gpu_ok;
+            st.cpu_ok = r.cpu_ok;
+            if dead && !st.cpu_ok {
+                drop(st);
+                fatal();
+            }
+        }
+        false
+    }
+
+    /// `launch` inside a chunk: the kernel is queued, and the writes it makes are assumed to
+    /// succeed (they are checked when the chunk ends). Kernels with sums wait for their result.
+    /// None: it cannot run on the device; the caller runs the loop on the CPU (which waits for
+    /// the queued work first).
+    unsafe fn launch_queued(g: &mut Gpu, k: &KernelDesc, lo: i64, n: i64, args: &[u64], bufs: &mut [BufArg], starts: &[i64]) -> Option<Vec<i64>> {
+        let Some((pipe, layout, _)) = g.pipe(k) else {
+            if let Ok(mut d) = DISABLED.lock() {
+                d.push(k.id);
+            }
+            return None;
+        };
+        let groups = (n as u64).div_ceil(WG as u64);
+        if groups > 65535 * 65535 {
+            return None;
+        }
+        let gx = groups.min(65535) as u32;
+        let gy = groups.div_ceil(gx as u64) as u32;
+        let ngroups = gx as u64 * gy as u64;
+        for b in bufs.iter_mut() {
+            if b.bytes / 4 > u32::MAX as u64 {
+                return None;
+            }
+            touch(b.mirror);
+            let size = b.bytes.max(16);
+            let mut st = b.mirror.st.borrow_mut();
+            if st.buf.as_ref().map_or(false, |x| x.size != size) {
+                return None;
+            }
+            if st.buf.is_none() {
+                st.buf = Some(g.alloc(size, false)?);
+                st.gpu_ok = false;
+            }
+            if !st.gpu_ok {
+                drop(st);
+                if !backup_dev(g, b.mirror) {
+                    return None;
+                }
+                let st = b.mirror.st.borrow();
+                let dst = st.buf.as_ref().unwrap().buf;
+                drop(st);
+                if b.bytes > 0 && !g.upload(dst, b.ptr, b.bytes) {
+                    return None;
+                }
+                b.mirror.st.borrow_mut().gpu_ok = true;
+            }
+        }
+        for b in bufs.iter() {
+            if b.write && !backup_dev(g, b.mirror) {
+                return None;
+            }
+        }
+        // This launch's segment of the argument buffers.
+        let pbase = 4 + args.len() as u64;
+        let words = pbase + ngroups * 2 * k.nred as u64;
+        let span = words.div_ceil(SEG_ALIGN) * SEG_ALIGN;
+        if g.rec && ((g.cursor + span) * 8 > g.io.as_ref().map_or(0, |x| x.0.size) || g.io_dev.as_ref().map_or(0, |x| x.size) < (g.cursor + span) * 8 || g.tsets >= TSETS || g.segs.len() >= MAX_QUEUED) {
+            g.sync();
+        }
+        if !g.ensure_rec() {
+            return None;
+        }
+        let need = (g.cursor + span) * 8;
+        if g.io.as_ref().map_or(true, |x| x.0.size < need) || g.io_dev.as_ref().map_or(true, |x| x.size < need) {
+            // Only at the start of a recording (see above): nothing queued uses them yet.
+            let (io_ok, dev_ok) = (g.io.as_ref().map_or(false, |x| x.0.size >= need), g.io_dev.as_ref().map_or(false, |x| x.size >= need));
+            if !io_ok {
+                g.host(1, need.max(1 << 20))?;
+            }
+            if !dev_ok {
+                if let Some(old) = g.io_dev.take() {
+                    g.free_later(old);
+                }
+                g.io_dev = Some(g.alloc(need.max(1 << 20).next_power_of_two(), false)?);
+            }
+        }
+        let off = g.cursor;
+        g.cursor += span;
+        let (io, iop) = (g.io.as_ref().unwrap().0.buf, g.io.as_ref().unwrap().1 as *mut u64);
+        let io_dev = g.io_dev.as_ref().unwrap().buf;
+        let iow = iop.add(off as usize);
+        *iow = 0;
+        *iow.add(1) = pbase;
+        *iow.add(2) = lo as u64;
+        *iow.add(3) = n as u64;
+        for (i, a) in args.iter().enumerate() {
+            *iow.add(4 + i) = *a;
+        }
+        g.segs.push(off);
+        // A descriptor set of its own, pointing at the segment.
+        let nb = k.nbufs as u32 + 1;
+        let (dsl, _) = g.dsl_cache[&nb];
+        let dai = DsAI { s_type: 34, p_next: std::ptr::null(), pool: g.tpool, n: 1, layouts: &dsl };
+        let mut set: Nd = 0;
+        if (g.d.vkAllocateDescriptorSets)(g.dev, &dai, &mut set) != 0 {
+            chunk_trap();
+        }
+        g.tsets += 1;
+        let mut infos: Vec<DescBuf> = vec![DescBuf { buffer: io_dev, offset: off * 8, range: words * 8 }];
+        for b in bufs.iter() {
+            infos.push(DescBuf { buffer: b.mirror.st.borrow().buf.as_ref().unwrap().buf, offset: 0, range: !0u64 });
+        }
+        let writes: Vec<WriteDS> = (0..infos.len())
+            .map(|i| WriteDS { s_type: 35, p_next: std::ptr::null(), set, binding: i as u32, elem: 0, n: 1, ty: 7, img: std::ptr::null(), buf: &infos[i], texel: std::ptr::null() })
+            .collect();
+        (g.d.vkUpdateDescriptorSets)(g.dev, writes.len() as u32, writes.as_ptr(), 0, std::ptr::null());
+        let c = BufCopy { src: off * 8, dst: off * 8, size: pbase * 8 };
+        (g.d.vkCmdCopyBuffer)(g.cmd, io, io_dev, 1, &c);
+        g.barrier(ST_TRANSFER | ST_HOST, TRANSFER_WRITE | HOST_WRITE, ST_COMPUTE, SHADER_READ | SHADER_WRITE);
+        (g.d.vkCmdBindPipeline)(g.cmd, 1, pipe);
+        (g.d.vkCmdBindDescriptorSets)(g.cmd, 1, layout, 0, 1, &set, 0, std::ptr::null());
+        (g.d.vkCmdDispatch)(g.cmd, gx, gy, 1);
+        g.barrier(ST_COMPUTE, SHADER_WRITE, ST_COMPUTE | ST_TRANSFER, SHADER_READ | SHADER_WRITE | TRANSFER_READ | TRANSFER_WRITE);
+        for b in bufs.iter() {
+            if b.write {
+                let mut st = b.mirror.st.borrow_mut();
+                st.cpu_ok = false;
+                st.gpu_ok = true;
+            }
+        }
+        if k.nred == 0 {
+            return Some(Vec::new());
+        }
+        // The sums are needed now: wait, and read them from the segment.
+        g.sync();
+        let mut out = Vec::with_capacity(k.nred);
+        for r in 0..k.nred {
+            let mut total: i128 = starts[r] as i128;
+            let mut bound: i128 = (starts[r] as i128).abs();
+            for gi in 0..ngroups as usize {
+                let at = pbase as usize + (gi * k.nred + r) * 2;
+                total += (*iow.add(at)) as i64 as i128;
+                bound += (*iow.add(at + 1)) as i128;
+            }
+            if bound > i64::MAX as i128 {
+                // The writes cannot be taken back one launch at a time here: roll back all.
+                chunk_trap();
+            }
+            out.push(total as i64);
         }
         Some(out)
     }

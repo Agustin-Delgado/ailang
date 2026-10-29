@@ -1,0 +1,11 @@
+; The trap is on the CPU, in iteration 200 of an outer loop whose kernels are queued.
+(fn main (params (con Console))
+  (body
+    (let n 40000)
+    (var v (Vec I64) (fill n 0))
+    (var small (Vec I64) (fill 200 3))
+    (var total 0)
+    (for t (range 0 400)
+      (for i (range 0 n) (set (at v i) (+ (% (* (at v i) 5) 99991) t)))
+      (set total (+ total (at small t)))) ; traps here
+    (println con total)))

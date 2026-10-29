@@ -1,0 +1,15 @@
+; A 2D loop run as one work item per (i, j); one cell overflows.
+(fn main (params (con Console))
+  (body
+    (let w 600)
+    (let h 500)
+    (var m (Vec I64) (fill (* w h) 0))
+    (for i (range 0 h)
+      (for j (range 0 w)
+        (set (at m (+ (* i w) j)) (+ (* i 1000) j))))
+    (println con (at m 1234))
+    (for i (range 0 h)
+      (for j (range 0 w)
+        (let x (at m (+ (* i w) j)))
+        (set (at m (+ (* i w) j)) (if (and (== i 417) (== j 333)) (* x 9223372036854775) x)))) ; traps here
+    (println con (at m 1234))))

@@ -1,0 +1,16 @@
+; Two buffers stepped in turn through a fn with a mut parameter (a stencil); the values grow
+; until one overflows in step 61.
+(fn step (params (src (Vec I64)) (dst (mut (Vec I64))) (n I64))
+  (body
+    (for i (range 1 (- n 1))
+      (set (at dst i) (+ (at src (- i 1)) (* 2 (at src i)) (at src (+ i 1))))))) ; traps here
+
+(fn main (params (con Console))
+  (body
+    (let n 30000)
+    (var a (Vec I64) (fill n 1))
+    (var b (Vec I64) (fill n 1))
+    (for s (range 0 40)
+      (step a (mut b) n)
+      (step b (mut a) n))
+    (println con (at a 15000))))

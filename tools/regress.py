@@ -3,6 +3,7 @@ in tests/ must pass, and every experiment solution must pass the same hidden tes
 
 usage: python tools/regress.py <ail.exe> <out.json> [baseline.json]
 With a baseline, prints every program whose result changed and exits 1 if any got worse.
+tests/gpu_traps/ only gets built here; tools/gputraps.py runs it on the CPU and the GPU.
 """
 import json, os, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -16,7 +17,7 @@ def build(src):
     rel = os.path.relpath(src, ROOT).replace("\\", "/")
     work = tempfile.mkdtemp(prefix="regress_")
     web = "/web/" in rel or rel.endswith("dodge.ail")
-    if rel.startswith("tests/"):
+    if rel.startswith("tests/") and rel.count("/") == 1:
         args = [AIL, "test", src]
     else:
         args = [AIL, "build", src] + (["--target", "web", "-o", work] if web else ["-o", os.path.join(work, "p.exe")])

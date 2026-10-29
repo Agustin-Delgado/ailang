@@ -153,6 +153,15 @@ runs on the CPU, which traps where the program would. Vectors keep a device copy
 on the CPU first brings its current contents back. `AIL_GPU=0` turns this off, `AIL_GPU=force`
 sends every eligible loop to the GPU (used to check that every program gives the same output).
 
+Waiting for each launch costs more than most launches, so an outer loop that only computes (it
+uses no capability, does not leave early, and changes outside itself only plain values and
+vectors with a device copy) runs in growing groups of iterations whose launches are queued and
+checked together. The runtime keeps a copy of every vector the group changes, the generated code
+keeps the plain values; if anything traps inside the group, on the GPU or the CPU, all of it is
+put back and those iterations run again one launch at a time, which traps exactly where the
+program does. `tools/gputraps.py` runs the programs in `tests/gpu_traps/` with the GPU off and
+forced and checks that output, trap message and line are the same.
+
 `sort` and `sort-desc` on a long vector also use every core: chunks are sorted in parallel and
 merged pairwise, each merge cut among the threads at points found by binary search. On ties an
 element of the left run goes first, so the result is the one a stable sequential sort gives.

@@ -1,0 +1,13 @@
+; The kernel runs in a fn that gets the vector as mut; the caller prints after each call.
+(fn bump (params (v (mut (Vec I64))) (by I64))
+  (body
+    (for i (range 0 (len v)) (set (at v i) (+ (at v i) by))))) ; traps here
+
+(fn main (params (con Console))
+  (body
+    (var v (Vec I64) (fill 120000 0))
+    (set (at v 77777) 9223372036854775400)
+    (bump (mut v) 300)
+    (println con (at v 5))
+    (bump (mut v) 500)
+    (println con (at v 5))))

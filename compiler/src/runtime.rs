@@ -227,6 +227,11 @@ mod ail_rt {
     #[cfg(not(target_arch = "wasm32"))]
     thread_local! { pub static SOFT_TRAP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
+    // Set while a group of loop iterations runs with its GPU work queued (see ail_gpu::chunk_begin):
+    // a trap there only rolls the group back, and the group runs again the ordinary way, which
+    // reports the trap.
+    thread_local! { pub static CHUNK_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn init(lines: &'static [(u32, u32, u32)], file: &'static str) {
         unsafe { LINES = lines; FILE = file; }
@@ -239,6 +244,9 @@ mod ail_rt {
                 }
                 pool::abandon();
                 loop { std::thread::park(); }
+            }
+            if cfg!(panic = "unwind") && CHUNK_QUIET.with(|q| q.get()) {
+                return;
             }
             if SOFT_TRAP.with(|s| s.get()) {
                 eprintln!("trap in a read handler (answered 500): {}", describe(info));
@@ -1002,7 +1010,7 @@ mod ail_rt {
     pub fn run_tests(tests: &[(&str, fn())]) {
         std::panic::set_hook(Box::new(|info| {
             // A trap inside a parallel loop only makes the loop run again sequentially.
-            if !PAR_TRAP.with(|t| t.get()).is_null() {
+            if !PAR_TRAP.with(|t| t.get()).is_null() || CHUNK_QUIET.with(|q| q.get()) {
                 return;
             }
             let d = describe(info);

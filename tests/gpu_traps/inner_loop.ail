@@ -1,0 +1,13 @@
+; The trap is inside a loop that every work item runs.
+(fn main (params (con Console))
+  (body
+    (let n 50000)
+    (var v (Vec I64) (fill n 0))
+    (for i (range 0 n)
+      (var acc 1)
+      (var k 0)
+      (while (< k 70)
+        (set acc (* acc (if (== i 43210) 2 1))) ; traps here
+        (set k (+ k 1)))
+      (set (at v i) acc))
+    (println con (at v 3))))

@@ -1,0 +1,24 @@
+; No trap: an outer loop with queued kernels, a slice taken on the device each iteration, an
+; outer scalar and a sum read back each iteration.
+(fn main (params (con Console))
+  (body
+    (let n 300)
+    (var d (Vec I64) (fill (* n n) 0))
+    (for i (range 0 (* n n)) (set (at d i) (% (* i 7919) 1000)))
+    (var checks 0)
+    (for k (range 0 n)
+      (let row (slice d (* k n) (* (+ k 1) n)))
+      (for i (range 0 n)
+        (let dik (at d (+ (* i n) k)))
+        (for j (range 0 n)
+          (let c (+ dik (at row j)))
+          (if (< c (at d (+ (* i n) j))) (set (at d (+ (* i n) j)) c))))
+      (if (== (% k 50) 0)
+        (do
+          (var s 0)
+          (for i (range 0 (* n n)) (set s (+ s (at d i))))
+          (set checks (+ checks s)))))
+    (var total 0)
+    (for i (range 0 (* n n)) (set total (+ total (at d i))))
+    (println con checks)
+    (println con total)))
