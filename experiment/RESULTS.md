@@ -265,6 +265,17 @@ What the run showed:
 2. **Launch overhead, not arithmetic, was the limit for loops inside a sequential outer loop**
    (floyd's k, knapsack's items). Queuing the launches of a group of outer iterations and
    checking them together is what moved those tasks.
-3. **The losses that remain are code that is sequential or does not fit a kernel.** Opus's life
-   packs cells into bits with operations the kernels do not take, so it runs on the CPU; Sonnet's
-   lcs is a dynamic program over a row; reach is a graph search; queens is backtracking.
+3. **The losses that remain are code that is sequential, or Rust that uses a better algorithm.**
+   Both Rust lcs programs and Opus's Rust life are bit-parallel (64 cells per operation); the ail
+   versions are the textbook dynamic program and grid. A plain Rust version of the same lcs
+   dynamic program runs at the speed of the ail one, so that gap is the algorithm, not the
+   compiler. reach is a graph search; queens is backtracking.
+
+**Afterwards: a sliding window in the inner loop.** Opus's ail life walks each row keeping the
+column sums of the last two columns in variables (`(set vl vm) (set vm vr)`), so the columns of a
+row depended on each other and the kernel ran one row per work item: 2000 items, each reading
+memory far from its neighbors. The compiler now gives each (row, column) its own item, which
+computes the window again from the columns before it. Re-timed afterwards
+(`r6_perf_gpu2.json`), Opus's life goes from 9.53 to 3.93 and the geometric mean is 0.92;
+the other ratios move within the noise (Sonnet's Rust lcs measured 0.06 s here and 0.16 s
+before).
