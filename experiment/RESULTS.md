@@ -213,3 +213,58 @@ What the run showed:
    primes 3.5 times slower. Loops whose body uses `par-map` (directly or through a function) now
    stay sequential.
 
+
+## Run r6: heavy tasks, and the GPU (2026-10-29)
+
+r6 asks for eight compute-heavy tasks (floyd, knapsack, lcs, life, mandel, queens, reach,
+sortgen), with the same "timed on one input at the limits stated here" note as r5 and nothing
+about cores or GPUs. Opus and Sonnet wrote each task once in ail and Rust, with no compiling and
+no testing.
+
+**Correctness: 31 of 32.** Every Rust program and 15 of 16 ail programs passed every hidden test.
+The miss: Sonnet's ail knapsack fails one of seven tests (its answer on the timed input is right).
+
+**Speed:** ail time divided by the Rust time of the same model and task, best of 3 interleaved
+runs, on a Ryzen 5 2600 with an RX 6600. Same programs in both columns; only the ail compiler
+changes. The first column is the compiler of 2026-10-16 (`r6_perf_base.json`); the second adds
+loops on the GPU (see DESIGN.md, "Loops that run on the GPU"): kernels compiled to SPIR-V and run
+through Vulkan, outer loops in queued groups of launches, reads of a row from before the loop
+(the in-place knapsack), narrow device copies and a fast path for checked 64-bit multiplication
+(`r6_perf_gpu.json`).
+
+| model | task | before | with the GPU |
+|---|---|---|---|
+| Opus | floyd | 1.75 | 0.33 |
+| Opus | knapsack | 1.74 | 0.33 |
+| Opus | lcs | 0.52 | 0.69 |
+| Opus | life | 13.22 | 9.53 |
+| Opus | mandel | 2.42 | 1.39 |
+| Opus | queens | 0.98 | 1.37 |
+| Opus | reach | 1.33 | 1.42 |
+| Opus | sortgen | 0.91 | 0.52 |
+| Sonnet | floyd | 1.24 | 0.19 |
+| Sonnet | knapsack | 1.89 | 0.21 |
+| Sonnet | lcs | 10.94 | 5.96 |
+| Sonnet | life | 21.20 | 2.52 |
+| Sonnet | mandel | 1.56 | 0.75 |
+| Sonnet | queens | 1.10 | 0.99 |
+| Sonnet | reach | 1.54 | 1.65 |
+| Sonnet | sortgen | 1.11 | 0.72 |
+| | **geometric mean** | **2.05** | **0.96** |
+
+ail is faster than Rust in 9 of 16 programs, against 3 before. The machine is short of memory
+and noisy: the Rust times themselves moved by up to 50% between the two columns (queens Opus,
+3.9 s to 2.1 s), so single ratios move by a few tenths; the geometric mean holds.
+
+What the run showed:
+
+1. **Dense loops over vectors go to the GPU without a change to the source.** floyd, knapsack,
+   mandel and Sonnet's life are 1.3 to 9 times faster than before, and floyd and knapsack 3 to 5
+   times faster than the Rust. Every trap stays exact: a launch that traps is undone and the loop
+   runs again on the CPU, which stops at the same line (`tools/gputraps.py`).
+2. **Launch overhead, not arithmetic, was the limit for loops inside a sequential outer loop**
+   (floyd's k, knapsack's items). Queuing the launches of a group of outer iterations and
+   checking them together is what moved those tasks.
+3. **The losses that remain are code that is sequential or does not fit a kernel.** Opus's life
+   packs cells into bits with operations the kernels do not take, so it runs on the CPU; Sonnet's
+   lcs is a dynamic program over a row; reach is a graph search; queens is backtracking.
