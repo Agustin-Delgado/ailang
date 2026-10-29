@@ -443,7 +443,14 @@ pub mod ail_gpu {
             }
             let ok = self.run();
             let iop = self.io.as_ref().map(|x| x.1 as *const u64);
-            let trapped = ok && iop.is_some_and(|p| self.segs.iter().any(|&off| std::ptr::read_volatile(p.add(off as usize)) != 0));
+            let flags: Vec<u64> = match iop {
+                Some(p) if ok => self.segs.iter().map(|&off| std::ptr::read_volatile(p.add(off as usize))).filter(|f| *f != 0).collect(),
+                _ => Vec::new(),
+            };
+            let trapped = !flags.is_empty();
+            if trapped && flags.iter().all(|f| *f == 2) {
+                WIDEN.with(|w| w.set(true));
+            }
             (self.d.vkResetDescriptorPool)(self.dev, self.tpool, 0);
             self.tsets = 0;
             for b in std::mem::take(&mut self.deferred) {
@@ -655,11 +662,130 @@ pub mod ail_gpu {
         }
     }
 
+    // ---- Narrow copies: integer vectors stored on the device in fewer bytes per element. ----
+
+    /// Device bytes for `n` elements of 2^w bytes (whole 32-bit words, at least 16 bytes).
+    fn dev_size(n: u64, w: u8) -> u64 {
+        ((n << w).div_ceil(4) * 4).max(16)
+    }
+
+    unsafe fn read_int(src: *const u8, i: usize, esz: u8) -> i64 {
+        match esz {
+            0 => *(src.add(i) as *const i8) as i64,
+            1 => std::ptr::read_unaligned(src.add(2 * i) as *const i16) as i64,
+            2 => std::ptr::read_unaligned(src.add(4 * i) as *const i32) as i64,
+            _ => std::ptr::read_unaligned(src.add(8 * i) as *const i64),
+        }
+    }
+    unsafe fn write_int(dst: *mut u8, i: usize, esz: u8, v: i64) {
+        match esz {
+            0 => *(dst.add(i) as *mut i8) = v as i8,
+            1 => std::ptr::write_unaligned(dst.add(2 * i) as *mut i16, v as i16),
+            2 => std::ptr::write_unaligned(dst.add(4 * i) as *mut i32, v as i32),
+            _ => std::ptr::write_unaligned(dst.add(8 * i) as *mut i64, v),
+        }
+    }
+
+    /// Copies `n` integers of 2^from bytes at `src` to integers of 2^to bytes at `dst` (they fit).
+    unsafe fn convert(src: *const u8, from: u8, dst: *mut u8, to: u8, n: usize) {
+        macro_rules! conv { ($a:ty, $b:ty) => {{
+            let s = std::slice::from_raw_parts(src as *const $a, n);
+            let d = std::slice::from_raw_parts_mut(dst as *mut $b, n);
+            for (x, y) in s.iter().zip(d.iter_mut()) { *y = *x as $b; }
+        }} }
+        match (from, to) {
+            (3, 0) => conv!(i64, i8), (3, 1) => conv!(i64, i16), (3, 2) => conv!(i64, i32),
+            (2, 0) => conv!(i32, i8), (2, 1) => conv!(i32, i16),
+            (0, 3) => conv!(i8, i64), (1, 3) => conv!(i16, i64), (2, 3) => conv!(i32, i64),
+            (0, 2) => conv!(i8, i32), (1, 2) => conv!(i16, i32),
+            _ => for i in 0..n { write_int(dst, i, to, read_int(src, i, from)); },
+        }
+    }
+
+    /// The narrowest width (log2 of bytes) that holds every element of the integer vector.
+    unsafe fn pick_width(src: *const u8, n: u64, esz: u8) -> u8 {
+        // AIL_GPU_NARROW=0 keeps every copy at full width (for comparing).
+        static OFF: OnceLock<bool> = OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("AIL_GPU_NARROW").as_deref() == Ok("0")) {
+            return esz;
+        }
+        let (mut lo, mut hi) = (0i64, 0i64);
+        match esz {
+            3 => {
+                for x in std::slice::from_raw_parts(src as *const i64, n as usize) {
+                    lo = lo.min(*x);
+                    hi = hi.max(*x);
+                }
+            }
+            _ => {
+                for x in std::slice::from_raw_parts(src as *const i32, n as usize) {
+                    lo = lo.min(*x as i64);
+                    hi = hi.max(*x as i64);
+                }
+            }
+        }
+        let w = if lo >= i8::MIN as i64 && hi <= i8::MAX as i64 {
+            0
+        } else if lo >= i16::MIN as i64 && hi <= i16::MAX as i64 {
+            1
+        } else if lo >= i32::MIN as i64 && hi <= i32::MAX as i64 {
+            2
+        } else {
+            3
+        };
+        w.min(esz)
+    }
+
+    impl Gpu {
+        /// Uploads `n` elements of 2^esz bytes as elements of 2^w bytes (they fit).
+        unsafe fn upload_packed(&mut self, dst: Nd, src: *const u8, n: u64, esz: u8, w: u8) -> bool {
+            if w == esz {
+                return self.upload(dst, src, n << esz);
+            }
+            self.sync();
+            let size = n << w;
+            let Some((st, p)) = self.host(0, size) else { return false };
+            convert(src, esz, p, w, n as usize);
+            if !self.begin() {
+                return false;
+            }
+            self.copy(st, dst, size);
+            self.run()
+        }
+        /// Downloads `n` elements stored with 2^w bytes into memory with 2^esz bytes each.
+        unsafe fn download_unpacked(&mut self, src: Nd, dst: *mut u8, n: u64, w: u8, esz: u8) -> bool {
+            if w == esz {
+                return self.download(src, dst, n << esz);
+            }
+            self.sync();
+            let size = n << w;
+            let Some((st, p)) = self.host(0, size) else { return false };
+            if !self.begin() {
+                return false;
+            }
+            self.copy(src, st, size);
+            self.barrier(ST_TRANSFER, TRANSFER_WRITE, ST_HOST, HOST_READ);
+            if !self.run() {
+                return false;
+            }
+            convert(p, w, dst, esz, n as usize);
+            true
+        }
+    }
+
+    /// log2 of the size of T.
+    fn esz_of<T>() -> u8 {
+        std::mem::size_of::<T>().max(1).trailing_zeros() as u8
+    }
+
     // ---- Mirrors: where the current contents of a vector are. ----
 
     /// `spare`: a second device buffer of the same size, kept for backups before kernels that
     /// write a vector only the device holds.
-    struct MState { buf: Option<Buf>, spare: Option<Buf>, gpu_ok: bool, cpu_ok: bool }
+    /// `w`: log2 of the bytes per element of the device copy (narrower than the vector's own
+    /// elements when the values allowed it), `n`: its length; `pin`: always full width (a
+    /// kernel once stored a value too wide for a narrow copy).
+    struct MState { buf: Option<Buf>, spare: Option<Buf>, gpu_ok: bool, cpu_ok: bool, w: u8, n: u64, pin: bool }
 
     /// The companion of a vector the GPU may hold: its device copy and which copy is current.
     /// Dropped with the vector it belongs to.
@@ -670,7 +796,7 @@ pub mod ail_gpu {
     impl Mirror {
         pub fn new() -> Mirror {
             let birth = CHUNK.with(|c| { let c = c.borrow(); if c.active { c.serial } else { 0 } });
-            Mirror { st: RefCell::new(MState { buf: None, spare: None, gpu_ok: false, cpu_ok: true }), birth }
+            Mirror { st: RefCell::new(MState { buf: None, spare: None, gpu_ok: false, cpu_ok: true, w: 0, n: 0, pin: false }), birth }
         }
         /// Makes the vector's own memory current (downloads it if the GPU changed it).
         pub fn to_cpu<T: Copy + 'static>(&self, v: &mut Vec<T>) {
@@ -680,11 +806,12 @@ pub mod ail_gpu {
                 return;
             }
             st.cpu_ok = true;
-            let bytes = (v.len() * std::mem::size_of::<T>()) as u64;
+            let n = v.len() as u64;
+            let w = st.w;
             let Some(b) = st.buf.as_ref() else { return };
             let Some(g) = gpu() else { fatal() };
             let mut g = g.lock().unwrap_or_else(|e| e.into_inner());
-            if bytes > 0 && !unsafe { g.download(b.buf, v.as_mut_ptr() as *mut u8, bytes) } {
+            if n > 0 && !unsafe { g.download_unpacked(b.buf, v.as_mut_ptr() as *mut u8, n, w, esz_of::<T>()) } {
                 drop(g);
                 fatal();
             }
@@ -698,10 +825,10 @@ pub mod ail_gpu {
                 return std::borrow::Cow::Borrowed(v);
             }
             let mut out: Vec<T> = Vec::with_capacity(v.len());
-            let bytes = (v.len() * std::mem::size_of::<T>()) as u64;
+            let n = v.len() as u64;
             let Some(g) = gpu() else { fatal() };
             let mut g = g.lock().unwrap_or_else(|e| e.into_inner());
-            if bytes > 0 && !unsafe { g.download(st.buf.as_ref().unwrap().buf, out.as_mut_ptr() as *mut u8, bytes) } {
+            if n > 0 && !unsafe { g.download_unpacked(st.buf.as_ref().unwrap().buf, out.as_mut_ptr() as *mut u8, n, st.w, esz_of::<T>()) } {
                 drop(g);
                 fatal();
             }
@@ -737,7 +864,6 @@ pub mod ail_gpu {
     #[track_caller]
     pub fn slice_dev<T: Copy + Default>(v: &Vec<T>, src: &Mirror, a: i64, b: i64, dst: &Mirror) -> Vec<T> {
         let (ua, ub) = super::ail_rt::slice_bounds(v.len(), a, b);
-        let sz = std::mem::size_of::<T>() as u64;
         let n = ub - ua;
         let copied = (|| -> Option<()> {
             let g = gpu()?;
@@ -745,7 +871,9 @@ pub mod ail_gpu {
             touch(src);
             let st = src.st.borrow();
             let from = st.buf.as_ref()?.buf;
-            let buf = unsafe { g.alloc((n as u64 * sz).max(16), false)? };
+            let (w, pin) = (st.w, st.pin);
+            let sz = 1u64 << w;
+            let buf = unsafe { g.alloc(dev_size(n as u64, w), false)? };
             // Inside a chunk the copy is queued after the work that produces the source.
             let queued = in_chunk();
             let ok = unsafe {
@@ -769,6 +897,9 @@ pub mod ail_gpu {
             }
             d.gpu_ok = true;
             d.cpu_ok = false;
+            d.w = w;
+            d.n = n as u64;
+            d.pin = pin;
             Some(())
         })();
         match copied {
@@ -790,19 +921,96 @@ pub mod ail_gpu {
     /// `exact`: no loops and no sums inside, so the kernel traps exactly when the loop on the CPU
     /// would; a vector it writes but does not read then needs no backup (after a trap the CPU
     /// run traps too, and what the vector held no longer matters).
-    pub struct KernelDesc { pub id: usize, pub words: &'static [u32], pub nbufs: usize, pub nargs: usize, pub nred: usize, pub f64: bool, pub exact: bool }
+    /// `narrow`: one bit per buffer the kernel reads and writes in whatever width its copy has
+    /// (the widths go in word 4 of the argument buffer, 4 bits each; arguments start at 5).
+    pub struct KernelDesc { pub id: usize, pub words: &'static [u32], pub nbufs: usize, pub nargs: usize, pub nred: usize, pub f64: bool, pub exact: bool, pub narrow: u32 }
 
     /// One vector a kernel uses.
-    pub struct BufArg<'a> { ptr: *mut u8, bytes: u64, mirror: &'a Mirror, write: bool, reads: bool }
+    /// `n` elements of 2^esz bytes; `int`: signed integers (i64 or i32), which may be narrow.
+    pub struct BufArg<'a> { ptr: *mut u8, bytes: u64, n: u64, esz: u8, int: bool, mirror: &'a Mirror, write: bool, reads: bool }
+    fn is_int<T: 'static>() -> bool {
+        let t = std::any::TypeId::of::<T>();
+        t == std::any::TypeId::of::<i64>() || t == std::any::TypeId::of::<i32>()
+    }
     impl<'a> BufArg<'a> {
-        pub fn read<T: Copy>(v: &Vec<T>, m: &'a Mirror) -> Self {
-            BufArg { ptr: v.as_ptr() as *mut u8, bytes: (v.len() * std::mem::size_of::<T>()) as u64, mirror: m, write: false, reads: true }
+        pub fn read<T: Copy + 'static>(v: &Vec<T>, m: &'a Mirror) -> Self {
+            BufArg { ptr: v.as_ptr() as *mut u8, bytes: (v.len() * std::mem::size_of::<T>()) as u64, n: v.len() as u64, esz: esz_of::<T>(), int: is_int::<T>(), mirror: m, write: false, reads: true }
         }
         /// `reads`: the kernel also reads the vector it writes.
-        pub fn write<T: Copy>(v: &mut Vec<T>, m: &'a Mirror, reads: bool) -> Self {
-            BufArg { ptr: v.as_mut_ptr() as *mut u8, bytes: (v.len() * std::mem::size_of::<T>()) as u64, mirror: m, write: true, reads }
+        pub fn write<T: Copy + 'static>(v: &mut Vec<T>, m: &'a Mirror, reads: bool) -> Self {
+            BufArg { ptr: v.as_mut_ptr() as *mut u8, bytes: (v.len() * std::mem::size_of::<T>()) as u64, n: v.len() as u64, esz: esz_of::<T>(), int: is_int::<T>(), mirror: m, write: true, reads }
         }
     }
+
+    /// The widths word of the argument buffer for this launch.
+    fn widths_word(k: &KernelDesc, bufs: &[BufArg]) -> u64 {
+        let mut w = 0u64;
+        for (i, b) in bufs.iter().enumerate() {
+            if k.narrow & (1 << i) != 0 {
+                w |= (b.mirror.st.borrow().w as u64) << (4 * i);
+            }
+        }
+        w
+    }
+
+    /// Makes the device copy of `b` current, in a layout kernel `k` can use (narrow where it
+    /// may be). None: not possible here (the caller runs the loop on the CPU).
+    unsafe fn make_resident(g: &mut Gpu, k: &KernelDesc, bi: usize, b: &BufArg) -> Option<()> {
+        let narrow_ok = k.narrow & (1 << bi) != 0 && b.int;
+        let mut st = b.mirror.st.borrow_mut();
+        if st.buf.is_some() && st.gpu_ok && (st.n != b.n || (!narrow_ok && st.w != b.esz)) {
+            if !st.cpu_ok {
+                return None;
+            }
+            st.gpu_ok = false;
+        }
+        if !st.gpu_ok {
+            if !st.cpu_ok {
+                return None;
+            }
+            let w = if narrow_ok && !st.pin { pick_width(b.ptr, b.n, b.esz) } else { b.esz };
+            let size = dev_size(b.n, w);
+            if st.buf.as_ref().map_or(true, |x| x.size != size) {
+                if let Some(old) = st.buf.take() {
+                    g.free(old);
+                }
+                if let Some(old) = st.spare.take() {
+                    g.free(old);
+                }
+                st.buf = Some(g.alloc(size, false)?);
+            }
+            let dst = st.buf.as_ref().unwrap().buf;
+            if b.n > 0 && !g.upload_packed(dst, b.ptr, b.n, b.esz, w) {
+                return None;
+            }
+            st.w = w;
+            st.n = b.n;
+            st.gpu_ok = true;
+        }
+        Some(())
+    }
+
+    /// After a launch stopped at a value too wide for a narrow copy (and was undone): the
+    /// copies it writes go back to full width for good.
+    unsafe fn widen(g: &mut Gpu, bufs: &[BufArg]) -> bool {
+        for b in bufs.iter().filter(|b| b.write) {
+            let mut st = b.mirror.st.borrow_mut();
+            if st.w == b.esz {
+                continue;
+            }
+            if !st.cpu_ok {
+                let Some(buf) = st.buf.as_ref().map(|x| x.buf) else { return false };
+                if b.n > 0 && !g.download_unpacked(buf, b.ptr, b.n, st.w, b.esz) {
+                    return false;
+                }
+                st.cpu_ok = true;
+            }
+            st.pin = true;
+            st.gpu_ok = false;
+        }
+        true
+    }
+    thread_local! { static WIDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
     /// Reached after the CPU run of a loop whose kernel trapped without backups (see
     /// `KernelDesc::exact`): that run should have trapped too; the program's state is lost, so
@@ -852,7 +1060,14 @@ pub mod ail_gpu {
             }
             return r;
         }
-        let r = unsafe { launch_locked(&mut g, k, lo, n, args, bufs, starts) };
+        WIDEN.with(|w| w.set(false));
+        let mut r = unsafe { launch_locked(&mut g, k, lo, n, args, bufs, starts) };
+        if r.is_none() && WIDEN.with(|w| w.replace(false)) {
+            log(&format!("kernel {} stored a value too wide: widening", k.id));
+            if unsafe { widen(&mut g, bufs) } {
+                r = unsafe { launch_locked(&mut g, k, lo, n, args, bufs, starts) };
+            }
+        }
         log(&format!("kernel {} n={} {} in {:?}", k.id, n, if r.is_some() { "ran" } else { "fell back" }, t.elapsed()));
         r
     }
@@ -876,36 +1091,16 @@ pub mod ail_gpu {
         let gy = groups.div_ceil(gx as u64) as u32;
         let ngroups = gx as u64 * gy as u64;
         // Device copies: allocated, and current where the kernel reads them.
-        for b in bufs.iter_mut() {
+        for (bi, b) in bufs.iter().enumerate() {
             if b.bytes / 4 > u32::MAX as u64 {
                 return None;
             }
-            let mut st = b.mirror.st.borrow_mut();
-            let size = b.bytes.max(16);
-            if st.buf.as_ref().map_or(true, |x| x.size != size) {
-                if !st.cpu_ok {
-                    return None;
-                }
-                if let Some(old) = st.buf.take() {
-                    g.free(old);
-                }
-                if let Some(old) = st.spare.take() {
-                    g.free(old);
-                }
-                st.buf = Some(g.alloc(size, false)?);
-                st.gpu_ok = false;
-            }
-            if !st.gpu_ok {
-                let dst = st.buf.as_ref().unwrap().buf;
-                if b.bytes > 0 && !g.upload(dst, b.ptr, b.bytes) {
-                    return None;
-                }
-                st.gpu_ok = true;
-            }
+            make_resident(g, k, bi, b)?;
         }
-        // The argument buffer: flag, first partial slot, lo, n, the arguments, then the partial
-        // sums. Written here, copied to device memory for the kernel, and back for the results.
-        let pbase = 4 + args.len() as u64;
+        // The argument buffer: flag, first partial slot, lo, n, widths, the arguments, then the
+        // partial sums. Written here, copied to device memory for the kernel, and back for the
+        // results.
+        let pbase = 5 + args.len() as u64;
         let nparts = ngroups * 2 * k.nred as u64;
         let words = pbase + nparts;
         let (io, iop) = g.host(1, words * 8)?;
@@ -922,8 +1117,9 @@ pub mod ail_gpu {
         *iow.add(1) = pbase;
         *iow.add(2) = lo as u64;
         *iow.add(3) = n as u64;
+        *iow.add(4) = widths_word(k, bufs);
         for (i, a) in args.iter().enumerate() {
-            *iow.add(4 + i) = *a;
+            *iow.add(5 + i) = *a;
         }
         let mut infos: Vec<DescBuf> = vec![DescBuf { buffer: io_dev, offset: 0, range: !0u64 }];
         for b in bufs.iter() {
@@ -972,7 +1168,8 @@ pub mod ail_gpu {
         g.copy(io_dev, io, words * 8);
         g.barrier(ST_TRANSFER, TRANSFER_WRITE, ST_HOST, HOST_READ);
         let ran = g.run();
-        let mut ok = ran && std::ptr::read_volatile(iow) == 0;
+        let flag = if ran { std::ptr::read_volatile(iow) } else { 0 };
+        let mut ok = ran && flag == 0;
         let mut out = Vec::with_capacity(k.nred);
         if ok {
             for r in 0..k.nred {
@@ -1010,7 +1207,10 @@ pub mod ail_gpu {
                 // Lost device: whatever only it held is gone.
                 fatal();
             }
-            if no_backup {
+            if flag == 2 {
+                // A store too wide for a narrow copy: not a trap (the caller widens and retries).
+                WIDEN.with(|w| w.set(true));
+            } else if no_backup {
                 MUST_TRAP_LOCAL.with(|m| m.set(true));
             }
             return None;
@@ -1120,6 +1320,14 @@ pub mod ail_gpu {
         (done + 1).min(1 << 20).min(left).max(1)
     }
 
+    thread_local! { static WIDENED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+    /// After a chunk was rolled back: the loop's count of iterations done in chunks from now on
+    /// (`done`), -1 to stop chunking it. A chunk undone only to widen a narrow copy goes on.
+    pub fn chunk_retry(done: i64) -> i64 {
+        if WIDENED.with(|w| w.replace(false)) { done } else { -1 }
+    }
+
     /// Starts a chunk; false (and nothing started) if there is no device or one is running.
     pub fn chunk_begin() -> bool {
         if in_chunk() || !ready() {
@@ -1153,7 +1361,13 @@ pub mod ail_gpu {
             log(&format!("chunk of {} mirrors done", recs.len()));
             return true;
         }
-        CHUNK.with(|c| c.borrow_mut().failures += 1);
+        // A chunk undone only because a narrow copy was too narrow is not a failure: the
+        // ordinary run that follows widens it.
+        if WIDEN.with(|w| w.replace(false)) {
+            WIDENED.with(|w| w.set(true));
+        } else {
+            CHUNK.with(|c| c.borrow_mut().failures += 1);
+        }
         log("chunk rolled back");
         let dead = g.map_or(true, |g| g.lock().map(|g| g.dead).unwrap_or(true));
         for r in recs {
@@ -1195,21 +1409,29 @@ pub mod ail_gpu {
         let gx = groups.min(65535) as u32;
         let gy = groups.div_ceil(gx as u64) as u32;
         let ngroups = gx as u64 * gy as u64;
-        for b in bufs.iter_mut() {
+        for (bi, b) in bufs.iter().enumerate() {
             if b.bytes / 4 > u32::MAX as u64 {
                 return None;
             }
             touch(b.mirror);
-            let size = b.bytes.max(16);
+            let narrow_ok = k.narrow & (1 << bi) != 0 && b.int;
             let mut st = b.mirror.st.borrow_mut();
-            if st.buf.as_ref().map_or(false, |x| x.size != size) {
+            // Inside a chunk a device copy keeps its buffer (its backup is a copy of it).
+            if st.buf.is_some() && (st.n != b.n || (!narrow_ok && st.w != b.esz)) {
                 return None;
             }
             if st.buf.is_none() {
-                st.buf = Some(g.alloc(size, false)?);
+                let w = if narrow_ok && !st.pin { pick_width(b.ptr, b.n, b.esz) } else { b.esz };
+                st.buf = Some(g.alloc(dev_size(b.n, w), false)?);
+                st.w = w;
+                st.n = b.n;
                 st.gpu_ok = false;
             }
             if !st.gpu_ok {
+                let w = st.w;
+                if narrow_ok && w < b.esz && pick_width(b.ptr, b.n, b.esz) > w {
+                    return None;
+                }
                 drop(st);
                 if !backup_dev(g, b.mirror) {
                     return None;
@@ -1217,7 +1439,7 @@ pub mod ail_gpu {
                 let st = b.mirror.st.borrow();
                 let dst = st.buf.as_ref().unwrap().buf;
                 drop(st);
-                if b.bytes > 0 && !g.upload(dst, b.ptr, b.bytes) {
+                if b.n > 0 && !g.upload_packed(dst, b.ptr, b.n, b.esz, w) {
                     return None;
                 }
                 b.mirror.st.borrow_mut().gpu_ok = true;
@@ -1229,7 +1451,7 @@ pub mod ail_gpu {
             }
         }
         // This launch's segment of the argument buffers.
-        let pbase = 4 + args.len() as u64;
+        let pbase = 5 + args.len() as u64;
         let words = pbase + ngroups * 2 * k.nred as u64;
         let span = words.div_ceil(SEG_ALIGN) * SEG_ALIGN;
         if g.rec && ((g.cursor + span) * 8 > g.io.as_ref().map_or(0, |x| x.0.size) || g.io_dev.as_ref().map_or(0, |x| x.size) < (g.cursor + span) * 8 || g.tsets >= TSETS || g.segs.len() >= MAX_QUEUED) {
@@ -1261,8 +1483,9 @@ pub mod ail_gpu {
         *iow.add(1) = pbase;
         *iow.add(2) = lo as u64;
         *iow.add(3) = n as u64;
+        *iow.add(4) = widths_word(k, bufs);
         for (i, a) in args.iter().enumerate() {
-            *iow.add(4 + i) = *a;
+            *iow.add(5 + i) = *a;
         }
         g.segs.push(off);
         // A descriptor set of its own, pointing at the segment.

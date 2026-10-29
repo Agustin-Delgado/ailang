@@ -90,6 +90,10 @@ pub mod op {
     pub const BITWISE_XOR: u16 = 198;
     pub const BITWISE_AND: u16 = 199;
     pub const NOT: u16 = 200;
+    pub const BITFIELD_S_EXTRACT: u16 = 202;
+    pub const ATOMIC_AND: u16 = 240;
+    pub const ATOMIC_OR: u16 = 241;
+    pub const ARRAY_LENGTH: u16 = 68;
     pub const CONTROL_BARRIER: u16 = 224;
     pub const LOOP_MERGE: u16 = 246;
     pub const SELECTION_MERGE: u16 = 247;

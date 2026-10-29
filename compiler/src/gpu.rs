@@ -19,7 +19,19 @@ pub struct KBuf {
     pub elem: Scalar,
     pub write: bool,
     pub read: bool,
+    /// Stored narrow: the device copy holds each element in 1, 2, 4 or 8 bytes (whatever the
+    /// values needed when it was uploaded), packed in 32-bit words; the width comes in the
+    /// argument buffer. A store that does not fit marks the launch as needing a wider copy.
+    pub narrow: bool,
 }
+
+/// Buffers that can be narrow: the first 16 (their widths share one 64-bit word).
+pub const MAX_NARROW: usize = 16;
+
+/// Slot of the argument buffer holding the narrow buffers' widths (log2 of the bytes per
+/// element, 4 bits per buffer); the kernel's own arguments follow it.
+pub const WIDTH_SLOT: u32 = 4;
+pub const ARGS_SLOT: u32 = 5;
 
 /// A value the kernel gets from the program when it starts (slot `4 + index` of the argument
 /// buffer, as 64 bits).
@@ -137,6 +149,9 @@ struct T<'a> {
     io_var: Id,
     loops: Vec<Loop>,
     trapped: Id,
+    /// Set by a store that did not fit its narrow buffer (with `trapped`, to stop the lane).
+    widen: Id,
+    widths: HashMap<usize, Id>,
     budget: Id,
     accs: Vec<(Id, Id)>,
     helpers: HashMap<String, HelperFn>,
@@ -170,6 +185,8 @@ pub fn build(inp: &Input) -> Option<Kernel> {
         io_var,
         loops: Vec::new(),
         trapped: 0,
+        widen: 0,
+        widths: HashMap::new(),
         budget: 0,
         accs: Vec::new(),
         helpers: HashMap::new(),
@@ -273,12 +290,14 @@ impl<'a> T<'a> {
         let bt = self.m.t_bool();
         let pb = self.m.t_ptr(6, bt);
         self.trapped = self.m.global_var(pb, 6);
+        self.widen = self.m.global_var(pb, 6);
         let i64t0 = self.m.t_int(64, true);
         let pi = self.m.t_ptr(6, i64t0);
         self.budget = self.m.global_var(pi, 6);
         let fls = self.m.c_bool(false);
         let zero = self.m.c_i64(0);
         crate::spirv::inst(&mut self.prologue, op::STORE, &[self.trapped, fls]);
+        crate::spirv::inst(&mut self.prologue, op::STORE, &[self.widen, fls]);
         crate::spirv::inst(&mut self.prologue, op::STORE, &[self.budget, zero]);
         for _ in &self.inp.sum_vars {
             let a = self.var(Scalar::Int(64, true));
@@ -326,8 +345,23 @@ impl<'a> T<'a> {
                 return None;
             }
             let nj = self.f.op(&mut self.m, op::I_SUB, i64t, &[jh, jl]);
-            let q = self.f.op(&mut self.m, op::S_DIV, i64t, &[idx, nj]);
-            let r = self.f.op(&mut self.m, op::S_REM, i64t, &[idx, nj]);
+            // In 32 bits (64-bit division is long on a GPU): idx fits in 32 bits, and when nj
+            // does not, idx < nj.
+            let bt = self.m.t_bool();
+            let lim = self.m.c_i64(u32::MAX as i64);
+            let small = self.f.op(&mut self.m, op::S_LESS_THAN_EQUAL, bt, &[nj, lim]);
+            let one64 = self.m.c_i64(1);
+            let njs = self.f.op(&mut self.m, op::SELECT, i64t, &[small, nj, one64]);
+            let nj32 = self.f.op(&mut self.m, op::U_CONVERT, u32t, &[njs]);
+            let q32 = self.f.op(&mut self.m, op::U_DIV, u32t, &[idx32, nj32]);
+            let r32 = self.f.op(&mut self.m, op::U_MOD, u32t, &[idx32, nj32]);
+            let q64 = self.f.op(&mut self.m, op::U_CONVERT, u64t, &[q32]);
+            let r64 = self.f.op(&mut self.m, op::U_CONVERT, u64t, &[r32]);
+            let qs = self.f.op(&mut self.m, op::BITCAST, i64t, &[q64]);
+            let rs = self.f.op(&mut self.m, op::BITCAST, i64t, &[r64]);
+            let zero64 = self.m.c_i64(0);
+            let q = self.f.op(&mut self.m, op::SELECT, i64t, &[small, qs, zero64]);
+            let r = self.f.op(&mut self.m, op::SELECT, i64t, &[small, rs, idx]);
             let i = self.f.op(&mut self.m, op::I_ADD, i64t, &[ilo, q]);
             self.f.store(lvv, i);
             let j = self.f.op(&mut self.m, op::I_ADD, i64t, &[jl, r]);
@@ -368,16 +402,21 @@ impl<'a> T<'a> {
         if !self.accs.is_empty() {
             self.reduce(lin, lx)?;
         }
-        // The trap flag: any trapped lane writes 1.
+        // The trap flag: any trapped lane writes 1, or 2 if it stopped at a store too wide for
+        // its narrow buffer (then the runtime widens the copy and runs the launch again).
         let tv = self.load(self.trapped, Scalar::Bool);
         let st = self.label();
         let end = self.label();
         self.f.emit(op::SELECTION_MERGE, &[end, 0]);
         self.f.branch_cond(tv, st, end);
         self.f.label(st);
+        let wv = self.load(self.widen, Scalar::Bool);
         let one = self.m.c_u64(1);
+        let two = self.m.c_u64(2);
+        let u64t_f = self.m.t_int(64, false);
+        let fv = self.f.op(&mut self.m, op::SELECT, u64t_f, &[wv, two, one]);
         let p0 = self.io_ptr_const(0);
-        self.f.store(p0, one);
+        self.f.store(p0, fv);
         self.f.branch(end);
         self.f.label(end);
         self.f.ret();
@@ -540,7 +579,7 @@ impl<'a> T<'a> {
                 let u64t = self.m.t_int(64, false);
                 let pt = self.m.t_ptr(12, u64t);
                 let z = self.m.c_u32(0);
-                let slot = self.m.c_u32(4 + self.args.len() as u32);
+                let slot = self.m.c_u32(ARGS_SLOT + self.args.len() as u32);
                 let p = self.m.id();
                 crate::spirv::inst(&mut self.prologue, op::ACCESS_CHAIN, &[pt, p, self.io_var, z, slot]);
                 let raw = self.m.id();
@@ -599,21 +638,26 @@ impl<'a> T<'a> {
         if s == Scalar::Float(64) {
             self.f64 = true;
         }
-        let t = self.ty(s);
-        let stride = match s {
-            Scalar::Int(w, _) | Scalar::Float(w) => w / 8,
-            Scalar::Bool => return None,
+        let narrow = matches!(s, Scalar::Int(64, true) | Scalar::Int(32, true)) && self.bufs.len() < MAX_NARROW;
+        let (t, stride) = if narrow {
+            (self.m.t_int(32, false), 4)
+        } else {
+            let stride = match s {
+                Scalar::Int(w, _) | Scalar::Float(w) => w / 8,
+                Scalar::Bool => return None,
+            };
+            (self.ty(s), stride)
         };
         let binding = self.bufs.len() as u32 + 1;
         let v = buffer_var(&mut self.m, t, stride, binding, &mut self.decorated);
-        self.bufs.push(KBuf { bind: b, elem: s, write, read: !write });
+        self.bufs.push(KBuf { bind: b, elem: s, write, read: !write, narrow });
         self.buf_vars.push(v);
         Some(self.bufs.len() - 1)
     }
 
-    /// Pointer to element `idx` (i64) of buffer `bi`, trapping (and using element 0) when the
-    /// index is out of range.
-    fn elem_ptr(&mut self, bi: usize, idx: Id) -> Id {
+    /// `idx` (i64) checked against the length of buffer `bi`: trapping (and giving element 0)
+    /// when out of range.
+    fn checked_index(&mut self, bi: usize, idx: Id) -> Id {
         let (len, _) = self.arg(KArg::Len(bi), Scalar::Int(64, true));
         let zero = self.m.c_i64(0);
         let neg = self.bop(op::S_LESS_THAN, &[idx, zero]);
@@ -621,7 +665,220 @@ impl<'a> T<'a> {
         let bad = self.bop(op::LOGICAL_OR, &[neg, big]);
         self.trap_if(bad);
         let i64t = self.m.t_int(64, true);
-        let safe = self.f.op(&mut self.m, op::SELECT, i64t, &[bad, zero, idx]);
+        self.f.op(&mut self.m, op::SELECT, i64t, &[bad, zero, idx])
+    }
+
+    /// log2 of the bytes per element of narrow buffer `bi` in this launch (u32).
+    fn width_log(&mut self, bi: usize) -> Id {
+        if let Some(v) = self.widths.get(&bi) {
+            let v = *v;
+            let u32t = self.m.t_int(32, false);
+            return self.f.load(&mut self.m, u32t, v);
+        }
+        let u32t = self.m.t_int(32, false);
+        let u64t = self.m.t_int(64, false);
+        let pv = self.m.t_ptr(7, u32t);
+        let var = self.f.var(&mut self.m, pv);
+        let pt = self.m.t_ptr(12, u64t);
+        let z = self.m.c_u32(0);
+        let slot = self.m.c_u32(WIDTH_SLOT);
+        let p = self.m.id();
+        crate::spirv::inst(&mut self.prologue, op::ACCESS_CHAIN, &[pt, p, self.io_var, z, slot]);
+        let raw = self.m.id();
+        crate::spirv::inst(&mut self.prologue, op::LOAD, &[u64t, raw, p]);
+        let sh = self.m.c_u64(4 * bi as u64);
+        let shifted = self.m.id();
+        crate::spirv::inst(&mut self.prologue, op::SHIFT_RIGHT_LOGICAL, &[u64t, shifted, raw, sh]);
+        let fifteen = self.m.c_u64(15);
+        let masked = self.m.id();
+        crate::spirv::inst(&mut self.prologue, op::BITWISE_AND, &[u64t, masked, shifted, fifteen]);
+        let w32 = self.m.id();
+        crate::spirv::inst(&mut self.prologue, op::U_CONVERT, &[u32t, w32, masked]);
+        crate::spirv::inst(&mut self.prologue, op::STORE, &[var, w32]);
+        self.widths.insert(bi, var);
+        self.f.load(&mut self.m, u32t, var)
+    }
+
+    /// Where element `safe` of narrow buffer `bi` lives: (word index, bit offset in it, width
+    /// log2), all u32.
+    fn narrow_at(&mut self, bi: usize, safe: Id) -> (Id, Id, Id) {
+        let l = self.width_log(bi);
+        let i64t = self.m.t_int(64, true);
+        let u32t = self.m.t_int(32, false);
+        let boff = self.f.op(&mut self.m, op::SHIFT_LEFT_LOGICAL, i64t, &[safe, l]);
+        let two = self.m.c_u32(2);
+        let wi64 = self.f.op(&mut self.m, op::SHIFT_RIGHT_LOGICAL, i64t, &[boff, two]);
+        let wi = self.f.op(&mut self.m, op::U_CONVERT, u32t, &[wi64]);
+        let b32 = self.f.op(&mut self.m, op::U_CONVERT, u32t, &[boff]);
+        let three = self.m.c_u32(3);
+        let low = self.f.op(&mut self.m, op::BITWISE_AND, u32t, &[b32, three]);
+        let sh = self.f.op(&mut self.m, op::SHIFT_LEFT_LOGICAL, u32t, &[low, three]);
+        self.cost += 4 * self.weight;
+        (wi, sh, l)
+    }
+
+    fn word_ptr(&mut self, bi: usize, wi: Id) -> Id {
+        let u32t = self.m.t_int(32, false);
+        let pt = self.m.t_ptr(12, u32t);
+        let z = self.m.c_u32(0);
+        let bv = self.buf_vars[bi];
+        self.f.op(&mut self.m, op::ACCESS_CHAIN, pt, &[bv, z, wi])
+    }
+
+    /// Bits per element (8, 16 or 32; 32 also for 64-bit elements), u32.
+    fn field_bits(&mut self, l: Id) -> Id {
+        let u32t = self.m.t_int(32, false);
+        let eight = self.m.c_u32(8);
+        let bits = self.f.op(&mut self.m, op::SHIFT_LEFT_LOGICAL, u32t, &[eight, l]);
+        let c32 = self.m.c_u32(32);
+        let bt = self.m.t_bool();
+        let big = self.f.op(&mut self.m, op::U_GREATER_THAN, bt, &[bits, c32]);
+        self.f.op(&mut self.m, op::SELECT, u32t, &[big, c32, bits])
+    }
+
+    /// Element `idx` of buffer `bi`, as its element type.
+    fn load_elem(&mut self, bi: usize, idx: Id) -> Id {
+        let s = self.bufs[bi].elem;
+        if !self.bufs[bi].narrow {
+            let p = self.elem_ptr(bi, idx);
+            return self.load(p, s);
+        }
+        let safe = self.checked_index(bi, idx);
+        let (wi, sh, l) = self.narrow_at(bi, safe);
+        let u32t = self.m.t_int(32, false);
+        let i32t = self.m.t_int(32, true);
+        let bt = self.m.t_bool();
+        let p0 = self.word_ptr(bi, wi);
+        let w0 = self.f.load(&mut self.m, u32t, p0);
+        let bits = self.field_bits(l);
+        let w0s = self.f.op(&mut self.m, op::BITCAST, i32t, &[w0]);
+        let nx = self.f.op(&mut self.m, op::BITFIELD_S_EXTRACT, i32t, &[w0s, sh, bits]);
+        if s == Scalar::Int(32, true) {
+            return nx;
+        }
+        // 64-bit elements: the next word too (clamped to the buffer, for narrow copies).
+        let i64t = self.m.t_int(64, true);
+        let u64t = self.m.t_int(64, false);
+        let nw = self.f.op(&mut self.m, op::ARRAY_LENGTH, u32t, &[self.buf_vars[bi], 0]);
+        let one = self.m.c_u32(1);
+        let wi1 = self.f.op(&mut self.m, op::I_ADD, u32t, &[wi, one]);
+        let inr = self.f.op(&mut self.m, op::U_LESS_THAN, bt, &[wi1, nw]);
+        let wj = self.f.op(&mut self.m, op::SELECT, u32t, &[inr, wi1, wi]);
+        let p1 = self.word_ptr(bi, wj);
+        let w1 = self.f.load(&mut self.m, u32t, p1);
+        let lo = self.f.op(&mut self.m, op::U_CONVERT, u64t, &[w0]);
+        let hi = self.f.op(&mut self.m, op::U_CONVERT, u64t, &[w1]);
+        let c32 = self.m.c_u32(32);
+        let hs = self.f.op(&mut self.m, op::SHIFT_LEFT_LOGICAL, u64t, &[hi, c32]);
+        let wide_u = self.f.op(&mut self.m, op::BITWISE_OR, u64t, &[hs, lo]);
+        let wide = self.f.op(&mut self.m, op::BITCAST, i64t, &[wide_u]);
+        let narrow = self.f.op(&mut self.m, op::S_CONVERT, i64t, &[nx]);
+        let c3 = self.m.c_u32(3);
+        let is8 = self.f.op(&mut self.m, op::I_EQUAL, bt, &[l, c3]);
+        self.cost += 6 * self.weight;
+        self.f.op(&mut self.m, op::SELECT, i64t, &[is8, wide, narrow])
+    }
+
+    /// Stores `v` (of the element type) at element `idx` of buffer `bi`.
+    fn store_elem(&mut self, bi: usize, idx: Id, v: Id) {
+        if !self.bufs[bi].narrow {
+            let p = self.elem_ptr(bi, idx);
+            self.f.store(p, v);
+            return;
+        }
+        let s = self.bufs[bi].elem;
+        let safe = self.checked_index(bi, idx);
+        let (wi, sh, l) = self.narrow_at(bi, safe);
+        let u32t = self.m.t_int(32, false);
+        let i32t = self.m.t_int(32, true);
+        let u64t = self.m.t_int(64, false);
+        let i64t = self.m.t_int(64, true);
+        let bt = self.m.t_bool();
+        let p0 = self.word_ptr(bi, wi);
+        let c3 = self.m.c_u32(3);
+        let is8 = self.f.op(&mut self.m, op::I_EQUAL, bt, &[l, c3]);
+        let (wide_l, narrow_l, done) = (self.label(), self.label(), self.label());
+        self.f.emit(op::SELECTION_MERGE, &[done, 0]);
+        self.f.branch_cond(is8, wide_l, narrow_l);
+        // 8 bytes: two words.
+        self.f.label(wide_l);
+        if s == Scalar::Int(64, true) {
+            let vu = self.f.op(&mut self.m, op::BITCAST, u64t, &[v]);
+            let lo = self.f.op(&mut self.m, op::U_CONVERT, u32t, &[vu]);
+            let c32 = self.m.c_u32(32);
+            let hs = self.f.op(&mut self.m, op::SHIFT_RIGHT_LOGICAL, u64t, &[vu, c32]);
+            let hi = self.f.op(&mut self.m, op::U_CONVERT, u32t, &[hs]);
+            self.f.store(p0, lo);
+            let one = self.m.c_u32(1);
+            let wi1 = self.f.op(&mut self.m, op::I_ADD, u32t, &[wi, one]);
+            let p1 = self.word_ptr(bi, wi1);
+            self.f.store(p1, hi);
+        }
+        self.f.branch(done);
+        // 1, 2 or 4 bytes: if the value fits, into its bits of the word (atomically, since
+        // neighbouring elements may belong to other lanes).
+        self.f.label(narrow_l);
+        let bits = self.field_bits(l);
+        let (t32, fits) = if s == Scalar::Int(64, true) {
+            let vu = self.f.op(&mut self.m, op::BITCAST, u64t, &[v]);
+            let t = self.f.op(&mut self.m, op::U_CONVERT, u32t, &[vu]);
+            let ts = self.f.op(&mut self.m, op::BITCAST, i32t, &[t]);
+            let z = self.m.c_u32(0);
+            let sx = self.f.op(&mut self.m, op::BITFIELD_S_EXTRACT, i32t, &[ts, z, bits]);
+            let back = self.f.op(&mut self.m, op::S_CONVERT, i64t, &[sx]);
+            let fits = self.f.op(&mut self.m, op::I_EQUAL, bt, &[back, v]);
+            (t, fits)
+        } else {
+            let t = self.f.op(&mut self.m, op::BITCAST, u32t, &[v]);
+            let z = self.m.c_u32(0);
+            let sx = self.f.op(&mut self.m, op::BITFIELD_S_EXTRACT, i32t, &[v, z, bits]);
+            let fits = self.f.op(&mut self.m, op::I_EQUAL, bt, &[sx, v]);
+            (t, fits)
+        };
+        let (put, wide, after) = (self.label(), self.label(), self.label());
+        self.f.emit(op::SELECTION_MERGE, &[after, 0]);
+        self.f.branch_cond(fits, put, wide);
+        self.f.label(put);
+        let c32 = self.m.c_u32(32);
+        let full = self.f.op(&mut self.m, op::I_EQUAL, bt, &[bits, c32]);
+        let one = self.m.c_u32(1);
+        let lowbits = self.f.op(&mut self.m, op::SHIFT_LEFT_LOGICAL, u32t, &[one, bits]);
+        let lowmask = self.f.op(&mut self.m, op::I_SUB, u32t, &[lowbits, one]);
+        let all = self.m.c_u32(u32::MAX);
+        let maskbits = self.f.op(&mut self.m, op::SELECT, u32t, &[full, all, lowmask]);
+        let mask = self.f.op(&mut self.m, op::SHIFT_LEFT_LOGICAL, u32t, &[maskbits, sh]);
+        let tv = self.f.op(&mut self.m, op::BITWISE_AND, u32t, &[t32, maskbits]);
+        let val = self.f.op(&mut self.m, op::SHIFT_LEFT_LOGICAL, u32t, &[tv, sh]);
+        let (plain, atom, stored) = (self.label(), self.label(), self.label());
+        self.f.emit(op::SELECTION_MERGE, &[stored, 0]);
+        self.f.branch_cond(full, plain, atom);
+        self.f.label(plain);
+        self.f.store(p0, val);
+        self.f.branch(stored);
+        self.f.label(atom);
+        let nmask = self.f.op(&mut self.m, op::NOT, u32t, &[mask]);
+        let scope = self.m.c_u32(1); // Device
+        let sem = self.m.c_u32(0); // Relaxed
+        self.f.op(&mut self.m, op::ATOMIC_AND, u32t, &[p0, scope, sem, nmask]);
+        self.f.op(&mut self.m, op::ATOMIC_OR, u32t, &[p0, scope, sem, val]);
+        self.f.branch(stored);
+        self.f.label(stored);
+        self.f.branch(after);
+        self.f.label(wide);
+        let tru = self.m.c_bool(true);
+        self.f.store(self.widen, tru);
+        self.f.store(self.trapped, tru);
+        self.f.branch(after);
+        self.f.label(after);
+        self.f.branch(done);
+        self.f.label(done);
+        self.cost += 6 * self.weight;
+    }
+
+    /// Pointer to element `idx` (i64) of a buffer stored at full width, trapping (and using
+    /// element 0) when the index is out of range.
+    fn elem_ptr(&mut self, bi: usize, idx: Id) -> Id {
+        let safe = self.checked_index(bi, idx);
         let u32t = self.m.t_int(32, false);
         let s32 = self.f.op(&mut self.m, op::U_CONVERT, u32t, &[safe]);
         let s = self.bufs[bi].elem;
@@ -672,6 +929,42 @@ impl<'a> T<'a> {
         r
     }
     fn mul(&mut self, a: Id, b: Id, s: Scalar) -> Id {
+        if s == Scalar::Int(64, true) {
+            // Both factors in 32 bits (the usual case) cannot overflow: a plain multiply, and
+            // the full 128-bit product only otherwise (it is long on a GPU).
+            let i32t = self.m.t_int(32, true);
+            let t = self.ty(s);
+            let bt = self.m.t_bool();
+            let a32 = self.f.op(&mut self.m, op::S_CONVERT, i32t, &[a]);
+            let a64 = self.f.op(&mut self.m, op::S_CONVERT, t, &[a32]);
+            let b32 = self.f.op(&mut self.m, op::S_CONVERT, i32t, &[b]);
+            let b64 = self.f.op(&mut self.m, op::S_CONVERT, t, &[b32]);
+            let fa = self.f.op(&mut self.m, op::I_EQUAL, bt, &[a, a64]);
+            let fb = self.f.op(&mut self.m, op::I_EQUAL, bt, &[b, b64]);
+            let small = self.f.op(&mut self.m, op::LOGICAL_AND, bt, &[fa, fb]);
+            let out = self.var(s);
+            let (fast, slow, done) = (self.label(), self.label(), self.label());
+            self.f.emit(op::SELECTION_MERGE, &[done, 0]);
+            self.f.branch_cond(small, fast, slow);
+            self.f.label(fast);
+            let p = self.f.op(&mut self.m, op::I_MUL, t, &[a, b]);
+            self.f.store(out, p);
+            self.f.branch(done);
+            self.f.label(slow);
+            let st = self.m.t_struct(&[t, t]);
+            let ext = self.f.op(&mut self.m, op::S_MUL_EXTENDED, st, &[a, b]);
+            let lo = self.f.op(&mut self.m, op::COMPOSITE_EXTRACT, t, &[ext, 0]);
+            let hi = self.f.op(&mut self.m, op::COMPOSITE_EXTRACT, t, &[ext, 1]);
+            let sh = self.m.c_u32(63);
+            let sign = self.op(op::SHIFT_RIGHT_ARITHMETIC, s, &[lo, sh]);
+            let ov = self.bop(op::I_NOT_EQUAL, &[hi, sign]);
+            self.trap_if(ov);
+            self.f.store(out, lo);
+            self.f.branch(done);
+            self.f.label(done);
+            self.cost += 6 * self.weight;
+            return self.load(out, s);
+        }
         let Scalar::Int(w, sg) = s else { unreachable!() };
         let t = self.ty(s);
         let st = self.m.t_struct(&[t, t]);
@@ -887,8 +1180,7 @@ impl<'a> T<'a> {
                 if vs != self.bufs[bi].elem {
                     return None;
                 }
-                let p = self.elem_ptr(bi, iv);
-                self.f.store(p, v);
+                self.store_elem(bi, iv, v);
                 self.cost += 2 * self.weight;
                 Some(())
             }
@@ -1373,10 +1665,9 @@ impl<'a> T<'a> {
                 if is != Scalar::Int(64, true) {
                     return None;
                 }
-                let p = self.elem_ptr(bi, iv);
                 let s = self.bufs[bi].elem;
                 self.cost += 2 * self.weight;
-                Some((self.load(p, s), s))
+                Some((self.load_elem(bi, iv), s))
             }
             "len" if args.len() == 1 => {
                 let v = a(0);
