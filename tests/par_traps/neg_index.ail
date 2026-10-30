@@ -1,4 +1,4 @@
-; A negative index in a parallel loop that writes its own elements: the trap says "negative
+; A negative index in a loop that writes its own elements: the trap says "negative
 ; index", as the sequential loop does, at the same line.
 
 (fn main (params (con Console))

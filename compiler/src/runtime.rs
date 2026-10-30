@@ -362,11 +362,15 @@ mod ail_rt {
     impl<T> std::ops::Index<Ix> for [T] {
         type Output = T;
         #[track_caller] #[inline(always)]
-        fn index(&self, i: Ix) -> &T { match self.get(i.0 as usize) { Some(x) => x, None => out_of_bounds(i.0, self.len()) } }
+        fn index(&self, i: Ix) -> &T {
+            if (i.0 as u64) < self.len() as u64 { unsafe { self.get_unchecked(i.0 as usize) } } else { out_of_bounds(i.0, self.len()) }
+        }
     }
     impl<T> std::ops::IndexMut<Ix> for [T] {
         #[track_caller] #[inline(always)]
-        fn index_mut(&mut self, i: Ix) -> &mut T { let n = self.len(); match self.get_mut(i.0 as usize) { Some(x) => x, None => out_of_bounds(i.0, n) } }
+        fn index_mut(&mut self, i: Ix) -> &mut T {
+            if (i.0 as u64) < self.len() as u64 { unsafe { self.get_unchecked_mut(i.0 as usize) } } else { out_of_bounds(i.0, self.len()) }
+        }
     }
     impl<T> std::ops::Index<Ix> for Vec<T> {
         type Output = T;
@@ -977,9 +981,8 @@ mod ail_rt {
         pub fn new(s: &mut [T]) -> Self { SharedSlice { ptr: s.as_mut_ptr(), len: s.len() } }
         #[track_caller] #[inline(always)] #[allow(clippy::mut_from_ref)]
         pub fn at(&self, i: i64) -> &mut T {
-            let u = i as usize;
-            if u >= self.len { out_of_bounds(i, self.len) }
-            unsafe { &mut *self.ptr.add(u) }
+            if i as u64 >= self.len as u64 { out_of_bounds(i, self.len) }
+            unsafe { &mut *self.ptr.add(i as usize) }
         }
         #[inline(always)]
         pub fn ptr(&self) -> *mut T { self.ptr }
@@ -1155,15 +1158,48 @@ mod ail_rt {
         if sep.is_empty() {
             Box::new(s.char_indices().map(move |(i, c)| &s[i..i + c.len_utf8()]))
         } else if sep.len() == 1 {
-            Box::new(s.split(sep.as_bytes()[0] as char))
+            Box::new(SplitByte::new(s, sep.as_bytes()[0]))
         } else {
             Box::new(s.split(sep))
         }
     }
     pub fn split(s: &str, sep: &str) -> Vec<String> {
         if sep.is_empty() { return chars(s); }
-        if sep.len() == 1 { return s.split(sep.as_bytes()[0] as char).map(String::from).collect(); }
+        if sep.len() == 1 { return SplitByte::new(s, sep.as_bytes()[0]).map(String::from).collect(); }
         s.split(sep).map(String::from).collect()
+    }
+    /// `split` as borrowed pieces of `s`, for a Vec of views (see `vec_views` in the emitter).
+    pub fn split_ref<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
+        if sep.is_empty() { return s.char_indices().map(|(i, c)| &s[i..i + c.len_utf8()]).collect(); }
+        if sep.len() == 1 { return SplitByte::new(s, sep.as_bytes()[0]).collect(); }
+        s.split(sep).collect()
+    }
+    /// The pieces of `s` between occurrences of the byte `b`, the same as `str::split` on a
+    /// one-byte (so ASCII, so never inside a longer character) separator. Fields are usually a
+    /// few bytes long, where a plain loop beats the searcher's set-up; a long one goes to it.
+    pub struct SplitByte<'a> { s: &'a str, pos: usize, b: u8, done: bool }
+    impl<'a> SplitByte<'a> {
+        #[inline]
+        pub fn new(s: &'a str, b: u8) -> Self { SplitByte { s, pos: 0, b, done: false } }
+    }
+    impl<'a> Iterator for SplitByte<'a> {
+        type Item = &'a str;
+        #[inline]
+        fn next(&mut self) -> Option<&'a str> {
+            if self.done { return None; }
+            let by = self.s.as_bytes();
+            let start = self.pos;
+            let mut i = start;
+            let near = by.len().min(start + 32);
+            while i < near && by[i] != self.b { i += 1; }
+            if i == near && near < by.len() {
+                i = match self.s[near..].find(self.b as char) { Some(k) => near + k, None => by.len() };
+            }
+            // Safety: `b` is ASCII, so both ends are character boundaries.
+            let piece = unsafe { self.s.get_unchecked(start..i) };
+            if i >= by.len() { self.done = true } else { self.pos = i + 1 }
+            Some(piece)
+        }
     }
     #[track_caller]
     pub fn from_code(n: i64) -> String {
@@ -1172,7 +1208,7 @@ mod ail_rt {
     pub fn chars(s: &str) -> Vec<String> { s.chars().map(|c| c.to_string()).collect() }
     #[track_caller]
     pub fn byte_at(s: &str, i: i64) -> i64 {
-        match s.as_bytes().get(i as usize) {
+        match s.as_bytes().get(usize::try_from(i as u64).unwrap_or(usize::MAX)) {
             Some(b) => *b as i64,
             None => {
                 if i < 0 { neg_index(i) }
@@ -1193,6 +1229,10 @@ mod ail_rt {
     }
     pub fn lines(s: &str) -> Vec<String> {
         s.lines().map(|l| l.trim_end_matches('\r').to_string()).collect()
+    }
+    /// `lines` as borrowed pieces of `s`, for a Vec of views.
+    pub fn lines_ref(s: &str) -> Vec<&str> {
+        s.lines().map(|l| l.trim_end_matches('\r')).collect()
     }
     pub fn all_chars(s: &str, f: fn(char) -> bool) -> bool { !s.is_empty() && s.chars().all(f) }
     #[track_caller]

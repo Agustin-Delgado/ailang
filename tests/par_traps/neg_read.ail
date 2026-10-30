@@ -1,0 +1,14 @@
+; A negative index in a loop that runs in parallel: indexing checks it with the same unsigned
+; comparison as an index past the end, and the trap must still say "negative index", at the
+; same line, in the sequential and in the parallel run.
+
+(fn main (params (con Console))
+  (body
+    (let n 2000000)
+    (var v (Vec I64) (vec))
+    (for i (range 0 n) (push (mut v) (% (* i 7) 1000)))
+    (var total 0)
+    (for i (range 0 n)
+      (let k (- (at v i) (if (== i 1500000) 2000 0)))
+      (set total (+ total (at v k)))) ; traps here
+    (println con total)))

@@ -78,6 +78,11 @@ machine lines to source lines that is read only when a trap happens.
   variables it changed are put back, and the loop runs again as written. The fast run computes
   the same values in the same order, so a trap inside it is the program's own trap.
 - `(pow 2 e)` is a shift while the result fits, the ordinary checked pow beyond.
+- A vector index is checked with one unsigned comparison: a negative index is a huge one and
+  fails the same test, and the trap still says "negative index". This matters most in pointer
+  chasing such as a union-find `find`, where every step is an index read from the vector itself.
+- `split` on a one-byte separator scans bytes directly instead of going through the general
+  string searcher, which costs more than the scan on the short fields of typical input lines.
 
 ## 7. Strings are values, read in place
 
@@ -90,6 +95,10 @@ compiler still avoids copying it whenever it can prove that nobody could tell th
   changed nor moved while the view is used; `lower`/`upper` give a view that is copied only when a
   character actually changes;
 - a fn whose result is always a piece of one of its `Str` parameters returns a view of it;
+- an immutable `(Vec Str)` local bound to `(lines s)` or `(split s sep)` and only read through
+  `at`, `len` and `is-empty` holds views of `s` (kept alive beside it when `s` is a temporary such
+  as `(read-all con)`), under the same rule that `s` is not changed while it lives: reading a
+  large input with `(lines (read-all con))` and splitting each line makes no copy per piece;
 - `(put (mut m) k (... (get m k) ...))` looks `k` up once, and copies `k` only if it is new.
 
 None of this is visible in the language: there are no lifetimes, and the program means the same

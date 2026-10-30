@@ -21,6 +21,8 @@ pub struct Emitter<'a> {
     /// Str locals emitted as borrowed views, and the bindings each one borrows from.
     views: HashMap<BindId, View>,
     view_roots: HashMap<BindId, Vec<BindId>>,
+    /// Vec Str locals emitted as `Vec<&str>` pieces of a string (see `plan_vec_view`).
+    vviews: HashSet<BindId>,
     /// Fns that return a view of one of their Str params: name -> (param index, kind).
     view_fns: HashMap<String, (usize, View)>,
     /// Set while emitting the body of a view fn: how its results are returned.
@@ -237,6 +239,7 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, file_lines: &[u
         fn_name: String::new(),
         views: HashMap::new(),
         view_roots: HashMap::new(),
+        vviews: HashSet::new(),
         view_fns: HashMap::new(),
         cur_view: None,
         subst: HashMap::new(),
@@ -450,6 +453,7 @@ fn emit_items(em: &mut Emitter, prog: &Program, ck: &Checked, mode: &Mode) -> St
                     em.moves = compute_moves(&t.body, ck);
                     em.epoch = 0;
                     em.views.clear();
+                    em.vviews.clear();
                     em.view_roots.clear();
                     em.plan_views(&t.body);
                     em.fn_name = format!("test \"{}\"", t.name);
@@ -782,6 +786,7 @@ impl<'a> Emitter<'a> {
         self.epoch = self.ck.fn_epoch.get(&f.name).copied().unwrap_or(0);
         self.moves = compute_moves(&f.body, self.ck);
         self.views.clear();
+        self.vviews.clear();
         self.view_roots.clear();
         self.plan_views(&f.body);
         self.fn_name = f.name.clone();
@@ -901,6 +906,7 @@ impl<'a> Emitter<'a> {
                     Some(format!("({}[ail_rt::Ix({i})] as i64)", nv.name))
                 }
             }
+            ExprKind::Call(n, _, args) if n == "at" && args.len() == 2 && self.vview_at(e).is_some() => None,
             ExprKind::Call(n, _, args) if n == "at" && args.len() == 2 => {
                 if let Some(code) = self.unchecked.get(&e.id) {
                     return Some(code.clone());
@@ -1094,6 +1100,29 @@ impl<'a> Emitter<'a> {
                     if last {
                         o.push_str("()
 ");
+                    }
+                }
+                ExprKind::Let { value, .. } if self.vviews.contains(&self.ck.decl[&(e.id as usize)]) => {
+                    let b = self.ck.decl[&(e.id as usize)];
+                    let name = self.local_name(&self.ck.bindings[b].name);
+                    let ExprKind::Call(n, _, args) = &value.kind else { unreachable!() };
+                    let (pre, src) = match self.view_of(args[0].expr()) {
+                        Some((View::Ref, _)) => (String::new(), self.vref(args[0].expr())),
+                        _ => {
+                            // A string made here (read-all, a call): kept alive beside the pieces.
+                            self.tmp += 1;
+                            let t = format!("__vs{}", self.tmp);
+                            (format!("let {t}: String = {}; ", self.val(args[0].expr())), format!("(&{t}[..])"))
+                        }
+                    };
+                    let code = if n == "lines" {
+                        format!("ail_rt::lines_ref({src})")
+                    } else {
+                        format!("ail_rt::split_ref({src}, {})", self.sv(args[1].expr()))
+                    };
+                    writeln!(o, "{m}{pre}let {name}: Vec<&str> = {code};").unwrap();
+                    if last {
+                        o.push_str("()\n");
                     }
                 }
                 ExprKind::Let { mutable, value, .. } => {
@@ -1320,10 +1349,10 @@ impl<'a> Emitter<'a> {
                             let sep = match &args[1].expr().kind {
                                 ExprKind::Str(x) if x.len() == 1 => {
                                     let s = s.clone();
-                                    let c = x.chars().next().unwrap();
+                                    let c = x.as_bytes()[0];
                                     let bd = self.block(body);
                                     return format!(
-                                        "for __p in {s}.split({c:?}) {{ let {var}: &str = __p; let _ = {bd}; }}"
+                                        "for __p in ail_rt::SplitByte::new({s}, {c}u8) {{ let {var}: &str = __p; let _ = {bd}; }}"
                                     );
                                 }
                                 _ => self.rf(args[1].expr()),
@@ -1772,6 +1801,14 @@ impl<'a> Emitter<'a> {
             }
             "len" => format!("({}.len() as i64)", self.pv(a(0))),
             "is-empty" => format!("{}.is_empty()", self.pv(a(0))),
+            "at" if self.vview_at(e).is_some() => {
+                if let Some(code) = self.unchecked.get(&e.id) {
+                    return format!("{code}.to_string()");
+                }
+                let b = self.vview_at(e).unwrap();
+                let i = self.val(a(1));
+                format!("{}[ail_rt::Ix({i})].to_string()", self.bind_place(b))
+            }
             "at" if self.unchecked.contains_key(&e.id) => {
                 let code = self.unchecked[&e.id].clone();
                 if self.is_copy(&t) { code } else { format!("{code}.clone()") }
@@ -2360,7 +2397,7 @@ impl<'a> Emitter<'a> {
                 }
                 let e = terms.join(" + ");
                 format!(
-                    "{{ let __k = ail_rt::Ix({k}); let __e = {e}; {abs} = {abs}.saturating_add(ail_rt::UAbs::uabs(__e)); {base}[__k] = {base}[__k] + __e; }}"
+                    "{{ let __k = ail_rt::ix({k}); let __e = {e}; {abs} = {abs}.saturating_add(ail_rt::UAbs::uabs(__e)); {base}[__k] = {base}[__k] + __e; }}"
                 )
             }
             ParHook::ModSum(k) => {
@@ -4258,7 +4295,8 @@ impl<'a> Emitter<'a> {
                 Some(n) => n.clone(),
                 None => self.pv(v),
             };
-            let elem = rty(&self.elem_ty(v));
+            let vview = matches!((&v.kind, self.ck.res.get(v.id as usize)), (ExprKind::Var(_), Some(Res::Local(b))) if self.vviews.contains(b));
+            let elem = if vview { "&str".to_string() } else { rty(&self.elem_ty(v)) };
             let w = written.contains(root);
             let k = match slices.iter().position(|s| s.0 == place) {
                 Some(k) => k,
@@ -5051,6 +5089,12 @@ impl<'a> Emitter<'a> {
                 }
                 Some((kind, roots))
             }
+            ExprKind::Call(n, _, args) if n == "at" && args.len() == 2 && self.vview_at(e).is_some() => {
+                let b = self.vview_at(e).unwrap();
+                let mut roots = vec![b];
+                roots.extend(self.view_roots.get(&b).into_iter().flatten().copied());
+                Some((View::Ref, roots))
+            }
             ExprKind::Call(n, _, args) => match &self.ck.res[e.id as usize] {
                 Res::Builtin(_) => match n.as_str() {
                     "substr" | "trim" => match self.view_of(args[0].expr())? {
@@ -5113,6 +5157,14 @@ impl<'a> Emitter<'a> {
                     format!("ail_rt::substr_ref({s}, {i}, {j})")
                 }
                 Res::Builtin(_) if n == "trim" => format!("{}.trim()", self.vref(args[0].expr())),
+                Res::Builtin(_) if n == "at" => {
+                    if let Some(code) = self.unchecked.get(&e.id) {
+                        return code.clone();
+                    }
+                    let b = self.vview_at(e).expect("vref of an element of a Vec of views");
+                    let i = self.val(args[1].expr());
+                    format!("{}[ail_rt::Ix({i})]", self.bind_place(b))
+                }
                 Res::UserFn(f) => self.user_call(&f, args),
                 _ => unreachable!("vref of {n}"),
             },
@@ -5187,10 +5239,12 @@ impl<'a> Emitter<'a> {
             }
             ExprKind::Var(_) => {
                 if let Res::Local(b) = self.ck.res[e.id as usize] {
-                    // A `&str` view local is never moved: using it by value copies.
+                    // A `&str` view local is never moved: using it by value copies. Nor is a
+                    // Vec of views, which is only read in place.
                     if roots.contains(&b)
                         && self.moves.contains(&e.id)
                         && self.views.get(&b) != Some(&View::Ref)
+                        && !self.vviews.contains(&b)
                     {
                         ok = false
                     }
@@ -5205,12 +5259,86 @@ impl<'a> Emitter<'a> {
         ok
     }
 
+    /// The Vec of views that `e`, an `(at v i)`, reads from.
+    fn vview_at(&self, e: &Expr) -> Option<BindId> {
+        let ExprKind::Call(n, _, args) = &e.kind else { return None };
+        if n != "at" || args.len() != 2 || !matches!(self.ck.res[e.id as usize], Res::Builtin(_)) {
+            return None;
+        }
+        let Arg::Val(v) = &args[0] else { return None };
+        match (&v.kind, &self.ck.res[v.id as usize]) {
+            (ExprKind::Var(_), Res::Local(b)) if self.vviews.contains(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// `(let parts (split line " "))` and `(let ls (lines text))` copy every piece into a
+    /// String of its own. When the Vec is only read by `at`, `len` and `is-empty` (so it is
+    /// never moved, changed or handed to anything that would need Strings), its pieces can stay
+    /// borrowed `&str`s, as long as the string they come from stays untouched while it lives:
+    /// one allocation instead of one per piece, and an element read is a view, not a copy.
+    fn plan_vec_view(&mut self, b: BindId, value: &Expr, rest: &[Expr]) -> bool {
+        if self.ck.bindings[b].ty != Ty::Vec(Box::new(Ty::Str)) {
+            return false;
+        }
+        let ExprKind::Call(n, _, args) = &value.kind else { return false };
+        let arity = match n.as_str() { "lines" => 1, "split" => 2, _ => return false };
+        if args.len() != arity
+            || !matches!(self.ck.res[value.id as usize], Res::Builtin(_))
+            || args.iter().any(|a| !matches!(a, Arg::Val(_)))
+        {
+            return false;
+        }
+        // Every use reads it in place, outside any lambda or task.
+        let ck = self.ck;
+        let is_b = |x: &Expr| matches!(x.kind, ExprKind::Var(_)) && matches!(ck.res[x.id as usize], Res::Local(u) if u == b);
+        let mut allowed = HashSet::new();
+        let mut ok = true;
+        for x in rest {
+            crate::check::walk(x, &mut |e| match &e.kind {
+                ExprKind::Call(n, _, args)
+                    if matches!(n.as_str(), "at" | "len" | "is-empty")
+                        && matches!(ck.res[e.id as usize], Res::Builtin(_)) =>
+                {
+                    if let Some(Arg::Val(v)) = args.first() {
+                        if is_b(v) {
+                            allowed.insert(v.id);
+                        }
+                    }
+                }
+                ExprKind::Lambda(..) | ExprKind::Tasks(..) => {
+                    crate::check::walk(e, &mut |y| ok &= !is_b(y));
+                }
+                _ => {}
+            });
+        }
+        for x in rest {
+            crate::check::walk(x, &mut |e| ok &= !is_b(e) || allowed.contains(&e.id));
+        }
+        if !ok {
+            return false;
+        }
+        let roots = match self.view_of(args[0].expr()) {
+            Some((View::Ref, r)) => r,
+            _ => vec![],
+        };
+        if !self.view_safe(&roots, value, rest) {
+            return false;
+        }
+        self.vviews.insert(b);
+        self.view_roots.insert(b, roots);
+        true
+    }
+
     /// Decide which immutable Str locals of a block (and nested blocks) are views.
     fn plan_views(&mut self, es: &[Expr]) {
         for (i, e) in es.iter().enumerate() {
             self.plan_views_in(e);
             if let ExprKind::Let { mutable: false, value, .. } = &e.kind {
                 let b = self.ck.decl[&(e.id as usize)];
+                if self.plan_vec_view(b, value, &es[i + 1..]) {
+                    continue;
+                }
                 if self.ck.bindings[b].ty != Ty::Str || self.ty(value) != &Ty::Str {
                     continue;
                 }
@@ -5313,6 +5441,7 @@ impl<'a> Emitter<'a> {
                 }
                 self.moves = compute_moves(&f.body, self.ck);
                 self.views.clear();
+        self.vviews.clear();
                 self.view_roots.clear();
                 self.plan_views(&f.body);
                 let mut tails: Vec<&Expr> = vec![f.body.last().unwrap()];
@@ -5346,6 +5475,7 @@ impl<'a> Emitter<'a> {
             }
         }
         self.views.clear();
+        self.vviews.clear();
         self.view_roots.clear();
         self.epoch = 0;
     }
