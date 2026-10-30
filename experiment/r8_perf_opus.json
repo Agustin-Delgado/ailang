@@ -1,0 +1,114 @@
+[
+ {
+  "run": "r8_opus",
+  "task": "csvstats",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 34.5979
+ },
+ {
+  "run": "r8_opus",
+  "task": "csvstats",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.9608
+ },
+ {
+  "run": "r8_opus",
+  "task": "factorial",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.3712
+ },
+ {
+  "run": "r8_opus",
+  "task": "factorial",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.1785
+ },
+ {
+  "run": "r8_opus",
+  "task": "leaderboard",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 2.1898
+ },
+ {
+  "run": "r8_opus",
+  "task": "leaderboard",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 2.223
+ },
+ {
+  "run": "r8_opus",
+  "task": "sandpile",
+  "lang": "ail",
+  "status": "exit 101: trap: negative index -3\n  at main.ail:170:9",
+  "seconds": null
+ },
+ {
+  "run": "r8_opus",
+  "task": "sandpile",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 4.5243
+ },
+ {
+  "run": "r8_opus",
+  "task": "scc",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.2962
+ },
+ {
+  "run": "r8_opus",
+  "task": "scc",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.1731
+ },
+ {
+  "run": "r8_opus",
+  "task": "segment",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 4.1454
+ },
+ {
+  "run": "r8_opus",
+  "task": "segment",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 3.3067
+ },
+ {
+  "run": "r8_opus",
+  "task": "sessions",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.2874
+ },
+ {
+  "run": "r8_opus",
+  "task": "sessions",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.9355
+ },
+ {
+  "run": "r8_opus",
+  "task": "spell",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.0524
+ },
+ {
+  "run": "r8_opus",
+  "task": "spell",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.7355
+ }
+]

@@ -1,0 +1,114 @@
+[
+ {
+  "run": "r8_sonnet",
+  "task": "csvstats",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 2.2646
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "csvstats",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.9908
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "factorial",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.7045
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "factorial",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.4731
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "leaderboard",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.5485
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "leaderboard",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.7018
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "sandpile",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 13.0263
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "sandpile",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 5.9527
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "scc",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.4007
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "scc",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.8024
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "segment",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 4.0586
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "segment",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 3.5904
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "sessions",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.8859
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "sessions",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.7231
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "spell",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.5503
+ },
+ {
+  "run": "r8_sonnet",
+  "task": "spell",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 3.8987
+ }
+]

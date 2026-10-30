@@ -367,3 +367,48 @@ What the run showed:
 3. **The remaining losses are sequential code** (logstats and rooms parse and sort; mst is a
    union-find; terrain is a shortest-path search with a heap), which is where Rust and ail compile
    to nearly the same machine code and the checks ail keeps (overflow, bounds) show.
+
+## Run r8: eight more held-out tasks (2026-10-30)
+
+Eight tasks unlike any earlier round: strongly connected components (scc), a leaderboard with rank
+queries, CSV statistics with quoting (csvstats), splitting text into dictionary words (segment),
+grouping page views into sessions, a sandpile, exact 50000! in decimal (factorial) and spelling
+suggestions at edit distance one (spell). Same protocol as r6 and r7: one fresh agent per model,
+language and task, no compiling and no testing. The compiler is the one after the r7 work above.
+
+**Correctness: 32 of 32 on the hidden tests**, every ail and Rust program on the first attempt.
+On the large timing input one ail program failed, and the fault is the compiler's, not the
+model's: Opus's sandpile gives the right answer on the CPU but a wrong one when a loop runs on
+the GPU (it then traps on a negative index). That is a correctness bug in the GPU path, being
+fixed.
+
+**Speed:** ail time divided by the Rust time of the same model and task, best of 3 interleaved
+runs (`r8_perf_opus.json`, `r8_perf_sonnet.json`). Other jobs loaded the machine during these
+runs, so the seconds are inflated; the ratios are what to read.
+
+| model | task | ail / Rust |
+|---|---|---|
+| Opus | csvstats | 17.64 |
+| Opus | factorial | 1.16 |
+| Opus | leaderboard | 0.99 |
+| Opus | sandpile | wrong output (GPU bug) |
+| Opus | scc | 1.10 |
+| Opus | segment | 1.25 |
+| Opus | sessions | 1.38 |
+| Opus | spell | 0.61 |
+| Sonnet | csvstats | 1.14 |
+| Sonnet | factorial | 1.16 |
+| Sonnet | leaderboard | 0.91 |
+| Sonnet | sandpile | 2.19 |
+| Sonnet | scc | 1.75 |
+| Sonnet | segment | 1.13 |
+| Sonnet | sessions | 1.23 |
+| Sonnet | spell | 0.14 |
+| | **geometric mean (15 programs)** | **1.22** |
+
+This is the honest number for unseen code with the compiler as it stands: slower than Rust by a
+fifth, faster in 4 of 15. It is close to r7's first measurement (1.18), so the r7 work did not carry
+over to new tasks as much as r7's own 0.88 suggests. The large
+losses are Opus's csvstats (17.6 times the Rust: something in the generated code is far worse
+than linear) and Sonnet's sandpile and scc (2.2 and 1.75). Spell is where ail wins big
+(0.14 and 0.61).
