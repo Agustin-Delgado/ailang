@@ -35,6 +35,7 @@ def main():
     for run in args:
         for task in sorted(os.listdir(TASKS_DIR)):
             inp = open(os.path.join(TASKS_DIR, task, "perf", "00.in"), encoding="utf8", newline="").read()
+            inp_b = inp.encode("utf8")
             want = open(os.path.join(TASKS_DIR, task, "perf", "00.out"), encoding="utf8", newline="").read()
             built = {}
             for lang in ("ail", "rust", "ts"):
@@ -53,14 +54,15 @@ def main():
                     cmd = exe if isinstance(exe, list) else [exe]
                     t = time.perf_counter()
                     try:
-                        p = subprocess.run(cmd, input=inp, capture_output=True, text=True, encoding="utf8", timeout=LIMIT)
+                        # Bytes, not text (see grade.py): no CR LF on Windows.
+                        p = subprocess.run(cmd, input=inp_b, capture_output=True, timeout=LIMIT)
                     except subprocess.TimeoutExpired:
                         status[lang] = "timeout"
                         continue
                     dt = time.perf_counter() - t
                     if p.returncode != 0:
-                        status[lang] = f"exit {p.returncode}: {p.stderr.strip()[-120:]}"
-                    elif grade.norm(p.stdout) != grade.norm(want):
+                        status[lang] = f"exit {p.returncode}: {p.stderr.decode('utf8', 'replace').strip()[-120:]}"
+                    elif grade.norm(p.stdout.decode("utf8", "replace")) != grade.norm(want):
                         status[lang] = "wrong output"
                     else:
                         times[lang].append(dt)

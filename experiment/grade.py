@@ -54,8 +54,10 @@ def main():
             inp = open(os.path.join(tdir, f), encoding="utf8", newline="").read()
             want = open(os.path.join(tdir, f[:-3] + ".out"), encoding="utf8", newline="").read()
             try:
-                p = subprocess.run(cmd, input=inp, capture_output=True, text=True, encoding="utf8", timeout=TIMEOUT)
-                got, err, code = p.stdout, p.stderr, p.returncode
+                # Bytes, not text: in text mode Python on Windows turns every line feed sent to
+                # stdin into CR LF, and the statements promise plain line feeds.
+                p = subprocess.run(cmd, input=inp.encode("utf8"), capture_output=True, timeout=TIMEOUT)
+                got, err, code = p.stdout.decode("utf8", "replace"), p.stderr.decode("utf8", "replace"), p.returncode
             except subprocess.TimeoutExpired:
                 got, err, code = "", "timeout", -1
             if norm(got) == norm(want) and code == 0:

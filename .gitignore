@@ -25,3 +25,6 @@ experiment/tasks_r5/*/perf/
 experiment/tasks_r6/*/tests/
 experiment/tasks_r6/*/perf/
 experiment/r6_tasks.py
+experiment/tasks_r7/*/tests/
+experiment/tasks_r7/*/perf/
+experiment/r7_tasks.py

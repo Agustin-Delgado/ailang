@@ -1,0 +1,226 @@
+[
+ {
+  "run": "r7_opus",
+  "task": "logstats",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 2.9605
+ },
+ {
+  "run": "r7_opus",
+  "task": "logstats",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 2.1543
+ },
+ {
+  "run": "r7_opus",
+  "task": "median",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.4434
+ },
+ {
+  "run": "r7_opus",
+  "task": "median",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.2679
+ },
+ {
+  "run": "r7_opus",
+  "task": "mst",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.5462
+ },
+ {
+  "run": "r7_opus",
+  "task": "mst",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.5147
+ },
+ {
+  "run": "r7_opus",
+  "task": "nonce",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.2533
+ },
+ {
+  "run": "r7_opus",
+  "task": "nonce",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.4202
+ },
+ {
+  "run": "r7_opus",
+  "task": "particles",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.9094
+ },
+ {
+  "run": "r7_opus",
+  "task": "particles",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.0116
+ },
+ {
+  "run": "r7_opus",
+  "task": "patterns",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.839
+ },
+ {
+  "run": "r7_opus",
+  "task": "patterns",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.7271
+ },
+ {
+  "run": "r7_opus",
+  "task": "rooms",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.7386
+ },
+ {
+  "run": "r7_opus",
+  "task": "rooms",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.6527
+ },
+ {
+  "run": "r7_opus",
+  "task": "terrain",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.5251
+ },
+ {
+  "run": "r7_opus",
+  "task": "terrain",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.6395
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "logstats",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 2.6802
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "logstats",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.7735
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "median",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.8152
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "median",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.5385
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "mst",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 2.2642
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "mst",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.2667
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "nonce",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.7217
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "nonce",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.3563
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "particles",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.8484
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "particles",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 2.174
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "patterns",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.6408
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "patterns",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.8911
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "rooms",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 3.2162
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "rooms",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.3759
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "terrain",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.0483
+ },
+ {
+  "run": "r7_sonnet",
+  "task": "terrain",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.7357
+ }
+]
