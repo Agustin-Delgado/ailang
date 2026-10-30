@@ -264,22 +264,40 @@ pub mod ail_gpu {
         }
     }
 
-    /// Worth sending `n` iterations of a body of about `cost` operations to the GPU.
-    pub fn worth(n: i64, cost: u64) -> bool {
+    /// Worth sending `n` iterations of a body of about `cost` operations to the GPU, for kernel
+    /// `id`, when its vectors are on the CPU.
+    pub fn worth(id: usize, n: i64, cost: u64) -> bool {
         match mode() {
             0 => false,
             2 => n > 0,
-            _ => n >= 4096 && (n as u64).saturating_mul(cost.max(1)) >= 1 << 22,
+            _ => n >= 4096 && (n as u64).saturating_mul(cost.max(1)) >= 1 << 22 && cold_ok(id, cost),
         }
+    }
+
+    /// A launch whose vectors must first be uploaded. A cheap body over them (a sum, a copy)
+    /// is faster on the cores than the upload alone, so the first time it stays on the CPU; a
+    /// kernel asked for again (inside a longer loop) goes to the device, where its vectors then
+    /// stay. A costly body goes at once.
+    fn cold_ok(id: usize, cost: u64) -> bool {
+        static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        if cost >= 256 {
+            return true;
+        }
+        let mut s = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if s.contains(&id) {
+            return true;
+        }
+        s.push(id);
+        false
     }
 
     /// `worth`, or yes when some of the kernel's vectors are current only on the device (running
     /// on the CPU would first download them).
-    pub fn worth_at(n: i64, cost: u64, ms: &[&Mirror]) -> bool {
+    pub fn worth_at(id: usize, n: i64, cost: u64, ms: &[&Mirror]) -> bool {
         if mode() == 0 || n <= 0 {
             return false;
         }
-        ms.iter().any(|m| !m.on_cpu()) || worth(n, cost)
+        ms.iter().any(|m| !m.on_cpu()) || worth(id, n, cost)
     }
 
     unsafe fn open() -> Option<Gpu> {

@@ -3299,9 +3299,9 @@ impl<'a> Emitter<'a> {
             .map(|(m, kind)| if kind == MirrorKind::Owned { format!("&{m}") } else { m })
             .collect();
         let mut cond = vec![if resident.is_empty() {
-            format!("ail_gpu::worth({count}, {})", k.cost)
+            format!("ail_gpu::worth({id}, {count}, {})", k.cost)
         } else {
-            format!("ail_gpu::worth_at({count}, {}, &[{}])", k.cost, resident.join(", "))
+            format!("ail_gpu::worth_at({id}, {count}, {}, &[{}])", k.cost, resident.join(", "))
         }];
         if collapsed.is_some() {
             cond.insert(0, "__gn > 0".into());
