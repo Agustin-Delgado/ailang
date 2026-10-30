@@ -1,0 +1,226 @@
+[
+ {
+  "run": "r6_opus",
+  "task": "floyd",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.344
+ },
+ {
+  "run": "r6_opus",
+  "task": "floyd",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.0281
+ },
+ {
+  "run": "r6_opus",
+  "task": "knapsack",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.8169
+ },
+ {
+  "run": "r6_opus",
+  "task": "knapsack",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.3971
+ },
+ {
+  "run": "r6_opus",
+  "task": "lcs",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.0516
+ },
+ {
+  "run": "r6_opus",
+  "task": "lcs",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.0808
+ },
+ {
+  "run": "r6_opus",
+  "task": "life",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.6654
+ },
+ {
+  "run": "r6_opus",
+  "task": "life",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.347
+ },
+ {
+  "run": "r6_opus",
+  "task": "mandel",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.2741
+ },
+ {
+  "run": "r6_opus",
+  "task": "mandel",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.202
+ },
+ {
+  "run": "r6_opus",
+  "task": "queens",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 1.9031
+ },
+ {
+  "run": "r6_opus",
+  "task": "queens",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.5229
+ },
+ {
+  "run": "r6_opus",
+  "task": "reach",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 5.9804
+ },
+ {
+  "run": "r6_opus",
+  "task": "reach",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 3.8971
+ },
+ {
+  "run": "r6_opus",
+  "task": "sortgen",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.4907
+ },
+ {
+  "run": "r6_opus",
+  "task": "sortgen",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.2927
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "floyd",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.423
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "floyd",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.9693
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "knapsack",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.6075
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "knapsack",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 2.0637
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "lcs",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.7345
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "lcs",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.1048
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "life",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.4939
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "life",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.2002
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "mandel",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.2875
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "mandel",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 0.3517
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "queens",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 12.6886
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "queens",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 13.5865
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "reach",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 3.6483
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "reach",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 3.5705
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "sortgen",
+  "lang": "ail",
+  "status": "ok",
+  "seconds": 0.5904
+ },
+ {
+  "run": "r6_sonnet",
+  "task": "sortgen",
+  "lang": "rust",
+  "status": "ok",
+  "seconds": 1.3357
+ }
+]

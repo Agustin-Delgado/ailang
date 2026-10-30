@@ -279,3 +279,75 @@ computes the window again from the columns before it. Re-timed afterwards
 (`r6_perf_gpu2.json`), Opus's life goes from 9.53 to 3.93 and the geometric mean is 0.92;
 the other ratios move within the noise (Sonnet's Rust lcs measured 0.06 s here and 0.16 s
 before).
+
+**Afterwards: graph walks and backtracking.** reach and queens were the losses the GPU could not
+touch. Three compiler changes, none visible in the language (DESIGN.md, sections 6 and 10): a loop
+whose inner loops index vectors with values read from other vectors (a breadth-first search over
+offset and adjacency lists) runs on 32-bit copies of its vectors, with the loaded indices proven
+in range so their bounds checks go away, and goes back to running as written if a store does not
+fit; `(pow 2 e)` is a shift while it fits; and a few heavy iterations that do not split evenly over
+the cores (16 queens rows on 12 cores) get a thread each. Re-timed (`r6_perf_gpu3.json`): Sonnet's
+reach 1.30 -> 1.02, Sonnet's queens 1.05 -> 0.93, Opus's queens 1.45 -> 1.25, Opus's life 3.93
+-> 1.92; the geometric mean is **0.86**, ail faster in 9 of 16. Opus's reach still measures about
+1.3 to 1.5: its ail program keeps a `dist` vector per node that its Rust program does not, and even
+with every check removed by hand it ran at 1.12 of the Rust.
+
+## Run r7: eight new tasks, held out (2026-10-29)
+
+r7 is a check that the compiler work of r4 to r6 was not tuned to the tasks it was measured on.
+Eight tasks that no part of the compiler had seen: summarize a web server log (logstats), a
+repeated median filter over a grayscale image (median), a minimum spanning forest (mst),
+proof-of-work nonces over a 64-bit hash (nonce), an n-body particle simulation (particles), word
+counting for many patterns in a text (patterns), assigning meetings to rooms (rooms) and cheapest
+routes over a terrain map (terrain). Same rules as r6: one attempt per model and language, no
+compiling, no testing, the "timed on one input" note and nothing about cores or GPUs.
+
+**Correctness: 32 of 32.** Every ail and Rust program passed every hidden test. The first grading
+said 30 of 32, with both ail logstats programs failing: the grader sent stdin in text mode, so on
+Windows every newline reached the program as CR LF, and the log lines carried a stray `\r`. The
+grader now sends bytes (`experiment/grade.py`); with that fix the same programs pass.
+
+**Speed:** ail time divided by the Rust time of the same model and task, best of 3 interleaved
+runs. The first column is the compiler as it was when the tasks were written (`r7_perf_base.json`);
+the second adds only what came after it: the cheap-kernel rule for the GPU and the graph-walk,
+pow and thread-pool changes above (`r7_perf_now.json`). The machine was noisier during the first
+run (the Rust times are about twice the second run's), so compare the ratios, not the seconds.
+
+| model | task | base | now |
+|---|---|---|---|
+| Opus | logstats | 1.37 | 1.52 |
+| Opus | median | 5.39 | 2.01 |
+| Opus | mst | 1.02 | 1.07 |
+| Opus | nonce | 0.18 | 0.21 |
+| Opus | particles | 0.90 | 0.71 |
+| Opus | patterns | 1.15 | 0.85 |
+| Opus | rooms | 1.05 | 1.18 |
+| Opus | terrain | 2.38 | 2.01 |
+| Sonnet | logstats | 1.51 | 1.42 |
+| Sonnet | median | 1.18 | 0.76 |
+| Sonnet | mst | 1.79 | 1.74 |
+| Sonnet | nonce | 1.27 | 2.01 |
+| Sonnet | particles | 0.39 | 0.31 |
+| Sonnet | patterns | 0.72 | 0.55 |
+| Sonnet | rooms | 2.34 | 1.79 |
+| Sonnet | terrain | 1.42 | 1.24 |
+| | **geometric mean** | **1.18** | **1.02** |
+
+On tasks it had never seen, ail is about as fast as Rust written by the same model, and faster in
+6 of 16. That is short of r6's 0.86, which is the honest number to quote for unseen code.
+
+What the run showed:
+
+1. **A cold GPU launch can cost more than it saves.** Opus's median sent its final checksum, one
+   cheap pass over a vector still on the CPU, to the GPU: uploading the vector took longer than
+   the sum. A cheap kernel whose data is on the CPU now stays on the CPU the first time it runs and
+   goes to the GPU only when it is requested again (median 5.39 -> 2.01). The rest of that gap is
+   the program: its Rust version keeps pixels as `u8`, the ail one as I64.
+2. **Sonnet's nonce did not get slower; the first run was noisier.** Timed side by side, the
+   compilers before and after these changes give the same time on it (1.2 to 1.3 s, Rust 0.7 s).
+   The gap is parallelism: ail parallelizes the loop over queries, and inner loops of a parallel
+   loop stay sequential, so the 20 queries of unequal difficulty spread unevenly over the cores;
+   the Rust program splits each query's search among all threads and stops at the first hit.
+3. **The remaining losses are sequential code** (logstats and rooms parse and sort; mst is a
+   union-find; terrain is a shortest-path search with a heap), which is where Rust and ail compile
+   to nearly the same machine code and the checks ail keeps (overflow, bounds) show.
