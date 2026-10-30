@@ -63,7 +63,9 @@ machine lines to source lines that is read only when a trap happens.
 - Small allocations come from a size-class allocator with per-class free lists.
 - Output is buffered and flushed at exit, before reading input, and on traps.
 - Overflow and bounds checks stay on; they are the price of having no UB and are measured in the
-  benchmarks as such. In an innermost loop whose vector indices are `j + c`, one test before the
+  benchmarks as such. An index is an I64, and one unsigned comparison against the length covers
+  both a negative index and one past the end (a negative value is above any length as unsigned);
+  only the trap message tells the two apart. In an innermost loop whose vector indices are `j + c`, one test before the
   loop finds the iterations where every access is in range; those run without bounds checks and
   the edges run checked. If that loop only computes, its integer operations record overflow in a
   flag instead of branching, so LLVM can vectorize it; on overflow that part runs again checked

@@ -1,0 +1,13 @@
+; A negative index in a parallel loop that writes its own elements: the trap says "negative
+; index", as the sequential loop does, at the same line.
+
+(fn main (params (con Console))
+  (body
+    (let n 200000)
+    (var out (Vec I64) (fill n 0))
+    (for i (range 0 n)
+      (var x i)
+      (for k (range 0 4) (set x (% (+ (* x 7) 1) 1000003)))
+      (let at-i (if (== i 150000) (- 0 3) i))
+      (set (at out at-i) x)) ; traps here
+    (println con (at out 7))))

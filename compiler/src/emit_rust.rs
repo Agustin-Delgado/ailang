@@ -898,7 +898,7 @@ impl<'a> Emitter<'a> {
                 if self.nr.as_ref().is_some_and(|c| c.unchecked.contains(&e.id)) {
                     Some(format!("((*unsafe {{ {}.get_unchecked(({i}) as usize) }}) as i64)", nv.name))
                 } else {
-                    Some(format!("({}[ail_rt::ix({i})] as i64)", nv.name))
+                    Some(format!("({}[ail_rt::Ix({i})] as i64)", nv.name))
                 }
             }
             ExprKind::Call(n, _, args) if n == "at" && args.len() == 2 => {
@@ -907,7 +907,7 @@ impl<'a> Emitter<'a> {
                 }
                 let p = self.place(args[0].expr())?;
                 let i = self.val(args[1].expr());
-                Some(format!("{p}[ail_rt::ix({i})]"))
+                Some(format!("{p}[ail_rt::Ix({i})]"))
             }
             ExprKind::Copy(_) => None,
             _ => None,
@@ -1210,7 +1210,7 @@ impl<'a> Emitter<'a> {
                 if sure && fast {
                     format!("{{ let __v = {v}; let __i = ({i}) as usize; unsafe {{ *{}.get_unchecked_mut(__i) = __v as i32; }} }}", nv.name)
                 } else if sure {
-                    format!("{{ let __v = {v}; let __i = ail_rt::ix({i}); {}[__i] = __v as i32; }}", nv.name)
+                    format!("{{ let __v = {v}; let __i = ail_rt::Ix({i}); {}[__i] = __v as i32; }}", nv.name)
                 } else if fast {
                     format!(
                         "{{ let __v = {v}; let __i = ({i}) as usize; if !unsafe {{ ail_rt::nput_unchecked(&mut {}, __i, __v, {}, {}) }} {{ break {label} false; }} }}",
@@ -1780,9 +1780,9 @@ impl<'a> Emitter<'a> {
                 let b = self.rvalue(a(0));
                 let i = self.val(a(1));
                 if self.is_copy(&t) {
-                    format!("({b})[ail_rt::ix({i})]")
+                    format!("({b})[ail_rt::Ix({i})]")
                 } else {
-                    format!("({b})[ail_rt::ix({i})].clone()")
+                    format!("({b})[ail_rt::Ix({i})].clone()")
                 }
             }
             "vec" => {
@@ -2360,7 +2360,7 @@ impl<'a> Emitter<'a> {
                 }
                 let e = terms.join(" + ");
                 format!(
-                    "{{ let __k = ail_rt::ix({k}); let __e = {e}; {abs} = {abs}.saturating_add(ail_rt::UAbs::uabs(__e)); {base}[__k] = {base}[__k] + __e; }}"
+                    "{{ let __k = ail_rt::Ix({k}); let __e = {e}; {abs} = {abs}.saturating_add(ail_rt::UAbs::uabs(__e)); {base}[__k] = {base}[__k] + __e; }}"
                 )
             }
             ParHook::ModSum(k) => {
@@ -3252,7 +3252,7 @@ impl<'a> Emitter<'a> {
                 setup.insert_str(0, &format!("let {sn} = {pl}.clone(); "));
                 for (_, rid, idx) in stale.iter().filter(|x| x.0 == *b) {
                     let ic = self.val(idx);
-                    unchecked.push((*rid, format!("{sn}[ail_rt::ix({ic})]")));
+                    unchecked.push((*rid, format!("{sn}[ail_rt::Ix({ic})]")));
                 }
             }
         }

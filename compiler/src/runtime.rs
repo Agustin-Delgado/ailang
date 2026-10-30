@@ -350,6 +350,34 @@ mod ail_rt {
     #[track_caller] #[cold]
     fn neg_index(i: i64) -> ! { panic!("negative index {i}") }
 
+    // `(at v i)`: one unsigned comparison covers both a negative index and one past the end (a
+    // negative i64 is above any length as usize); only the message tells them apart.
+    #[derive(Clone, Copy)]
+    pub struct Ix(pub i64);
+    #[track_caller] #[cold] #[inline(never)]
+    fn out_of_bounds(i: i64, len: usize) -> ! {
+        if i < 0 { neg_index(i) }
+        panic!("index out of bounds: the len is {len} but the index is {i}")
+    }
+    impl<T> std::ops::Index<Ix> for [T] {
+        type Output = T;
+        #[track_caller] #[inline(always)]
+        fn index(&self, i: Ix) -> &T { match self.get(i.0 as usize) { Some(x) => x, None => out_of_bounds(i.0, self.len()) } }
+    }
+    impl<T> std::ops::IndexMut<Ix> for [T] {
+        #[track_caller] #[inline(always)]
+        fn index_mut(&mut self, i: Ix) -> &mut T { let n = self.len(); match self.get_mut(i.0 as usize) { Some(x) => x, None => out_of_bounds(i.0, n) } }
+    }
+    impl<T> std::ops::Index<Ix> for Vec<T> {
+        type Output = T;
+        #[track_caller] #[inline(always)]
+        fn index(&self, i: Ix) -> &T { &self[..][i] }
+    }
+    impl<T> std::ops::IndexMut<Ix> for Vec<T> {
+        #[track_caller] #[inline(always)]
+        fn index_mut(&mut self, i: Ix) -> &mut T { &mut self[..][i] }
+    }
+
     // Loops that run on 32-bit copies of their vectors (see `narrow_region` in the emitter):
     // every element stays within [lo, hi], a range that fits i32 and that the loop's index
     // reads rely on. A store outside it stops the fast run, which is then thrown away.
@@ -949,8 +977,8 @@ mod ail_rt {
         pub fn new(s: &mut [T]) -> Self { SharedSlice { ptr: s.as_mut_ptr(), len: s.len() } }
         #[track_caller] #[inline(always)] #[allow(clippy::mut_from_ref)]
         pub fn at(&self, i: i64) -> &mut T {
-            let u = ix(i);
-            if u >= self.len { index_out(u, self.len) }
+            let u = i as usize;
+            if u >= self.len { out_of_bounds(i, self.len) }
             unsafe { &mut *self.ptr.add(u) }
         }
         #[inline(always)]
@@ -958,8 +986,6 @@ mod ail_rt {
         #[inline(always)]
         pub fn len(&self) -> usize { self.len }
     }
-    #[track_caller] #[cold]
-    fn index_out(u: usize, len: usize) -> ! { panic!("index out of bounds: the len is {len} but the index is {u}") }
 
     /// Writes of iteration i fall in [i*s + lo, i*s + hi] for each window (lo, hi), empty when
     /// lo > hi: iterations write disjoint elements if the windows together span less than s.
@@ -1146,8 +1172,13 @@ mod ail_rt {
     pub fn chars(s: &str) -> Vec<String> { s.chars().map(|c| c.to_string()).collect() }
     #[track_caller]
     pub fn byte_at(s: &str, i: i64) -> i64 {
-        let i = ix(i);
-        match s.as_bytes().get(i) { Some(b) => *b as i64, None => panic!("byte index {i} out of bounds for string of {} bytes", s.len()) }
+        match s.as_bytes().get(i as usize) {
+            Some(b) => *b as i64,
+            None => {
+                if i < 0 { neg_index(i) }
+                panic!("byte index {i} out of bounds for string of {} bytes", s.len())
+            }
+        }
     }
 
     pub fn read_all() -> String {
