@@ -348,6 +348,13 @@ What the run showed:
    The gap is parallelism: ail parallelizes the loop over queries, and inner loops of a parallel
    loop stay sequential, so the 20 queries of unequal difficulty spread unevenly over the cores;
    the Rust program splits each query's search among all threads and stops at the first hit.
+   Afterwards, a parallel loop nested in another one became parallel too (one level deep, when
+   the outer loop has few iterations or a thread is idle; DESIGN.md, section 10), and a running
+   minimum may now carry a condition that does not read it, which is how Sonnet wrote the search.
+   Timed side by side with the compiler before it: 1.6 s -> 0.9 s, against 0.7 to 1.0 s for the
+   Rust. What is left is the program: it extracts each digit with a division and hashes every
+   candidate from the start, where the Rust shares the hash of the leading digits and stops at
+   the first hit (about 8 times less work in total, 0.8 s of CPU against 6 s).
 3. **The remaining losses are sequential code** (logstats and rooms parse and sort; mst is a
    union-find; terrain is a shortest-path search with a heap), which is where Rust and ail compile
    to nearly the same machine code and the checks ail keeps (overflow, bounds) show.
