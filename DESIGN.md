@@ -91,15 +91,18 @@ compiler still avoids copying it whenever it can prove that nobody could tell th
 
 - read-only `Str` parameters are passed as `&str`;
 - an immutable local bound to a piece of another string (`substr`, `trim`, a literal, a branch
-  that picks one of several) is a borrowed view, as long as the string it comes from is neither
-  changed nor moved while the view is used; `lower`/`upper` give a view that is copied only when a
-  character actually changes;
+  that picks one of several, an element `(at v i)` of a vector) is a borrowed view, as long as
+  the string it comes from is neither changed nor moved while the view is used; `lower`/`upper`
+  give a view that is copied only when a character actually changes;
 - a fn whose result is always a piece of one of its `Str` parameters returns a view of it;
-- an immutable `(Vec Str)` local bound to `(lines s)` or `(split s sep)` and only read through
-  `at`, `len` and `is-empty` holds views of `s` (kept alive beside it when `s` is a temporary such
-  as `(read-all con)`), under the same rule that `s` is not changed while it lives: reading a
-  large input with `(lines (read-all con))` and splitting each line makes no copy per piece;
-- `(put (mut m) k (... (get m k) ...))` looks `k` up once, and copies `k` only if it is new.
+- a `(Vec Str)` that is only read by element (`len`, `at`, `for`, passing it on) holds views
+  instead of copies: `(let f (split line " "))` and `(let ls (lines (read-all con)))` are
+  vectors of pieces of the string, and a `(var parts (Vec Str) (vec))` that is only pushed
+  pieces of strings that outlive it (and literals) is joined with a single copy. A read-only
+  `(Vec Str)` parameter used that way accepts either kind of vector;
+- `(put (mut m) k (... (get m k) ...))` looks `k` up once, and copies `k` only if it is new; so
+  does `(let c (... (get m k) ...))` right before `(put (mut m) k (... c ...))`, and `k` may be a
+  field `(. r name)`.
 
 None of this is visible in the language: there are no lifetimes, and the program means the same
 with or without it. It is what lets idiomatic ail match hand-tuned Rust on text processing.

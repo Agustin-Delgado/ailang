@@ -1163,16 +1163,20 @@ mod ail_rt {
             Box::new(s.split(sep))
         }
     }
+    /// `split` into borrowed pieces, for a vector that is only read (string views).
+    pub fn split_views<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
+        if sep.is_empty() { return s.char_indices().map(|(i, c)| &s[i..i + c.len_utf8()]).collect(); }
+        if sep.len() == 1 { return SplitByte::new(s, sep.as_bytes()[0]).collect(); }
+        s.split(sep).collect()
+    }
+    /// `lines` into borrowed pieces.
+    pub fn lines_views(s: &str) -> Vec<&str> {
+        s.lines().map(|l| l.trim_end_matches('\r')).collect()
+    }
     pub fn split(s: &str, sep: &str) -> Vec<String> {
         if sep.is_empty() { return chars(s); }
         if sep.len() == 1 { return SplitByte::new(s, sep.as_bytes()[0]).map(String::from).collect(); }
         s.split(sep).map(String::from).collect()
-    }
-    /// `split` as borrowed pieces of `s`, for a Vec of views (see `vec_views` in the emitter).
-    pub fn split_ref<'a>(s: &'a str, sep: &str) -> Vec<&'a str> {
-        if sep.is_empty() { return s.char_indices().map(|(i, c)| &s[i..i + c.len_utf8()]).collect(); }
-        if sep.len() == 1 { return SplitByte::new(s, sep.as_bytes()[0]).collect(); }
-        s.split(sep).collect()
     }
     /// The pieces of `s` between occurrences of the byte `b`, the same as `str::split` on a
     /// one-byte (so ASCII, so never inside a longer character) separator. Fields are usually a
@@ -1229,10 +1233,6 @@ mod ail_rt {
     }
     pub fn lines(s: &str) -> Vec<String> {
         s.lines().map(|l| l.trim_end_matches('\r').to_string()).collect()
-    }
-    /// `lines` as borrowed pieces of `s`, for a Vec of views.
-    pub fn lines_ref(s: &str) -> Vec<&str> {
-        s.lines().map(|l| l.trim_end_matches('\r')).collect()
     }
     pub fn all_chars(s: &str, f: fn(char) -> bool) -> bool { !s.is_empty() && s.chars().all(f) }
     #[track_caller]
