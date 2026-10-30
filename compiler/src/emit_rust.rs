@@ -4399,8 +4399,8 @@ impl<'a> Emitter<'a> {
         // the condition always picks the same branch, here `j - 1`. The fast iterations are
         // narrowed to where it does, and there the let is just that branch (the condition only
         // compares, so not evaluating it changes nothing). Each pick: (if id, branch, bound on
-        // j as (fixed side, offset terms of j, `>`-like?, +1?), offset nodes of the condition).
-        type Pick<'e> = (u32, &'e Expr, &'e Expr, Vec<(bool, &'e Expr)>, bool, bool);
+        // j as (fixed side, offset terms of j, `>`-like?, +1?), the let's binding).
+        type Pick<'e> = (u32, &'e Expr, &'e Expr, Vec<(bool, &'e Expr)>, bool, bool, BindId);
         let mut picks: Vec<Pick> = Vec::new();
         let mut aff_nodes_pre: Vec<(u32, Vec<(bool, &Expr)>)> = Vec::new();
         if !breaks_out(body) {
@@ -4446,7 +4446,9 @@ impl<'a> Emitter<'a> {
                         _ => false,
                     }
                 }
-                if !simple(k, 0) {
+                // The condition is not evaluated in the fast iterations, so the terms of its
+                // offset must not trap there either: they are simple too, and tested to fit.
+                if !simple(k, 0) || !x.iter().all(|(_, t)| simple(t, 0)) {
                     continue;
                 }
                 let mut scratch = Vec::new();
@@ -4461,7 +4463,7 @@ impl<'a> Emitter<'a> {
                 let lower = op == ">" || op == ">=";
                 let plus1 = op == ">" || op == "<=";
                 aff_nodes_pre.extend(rec);
-                picks.push((v.id, branch, k, x, lower, plus1));
+                picks.push((v.id, branch, k, x, lower, plus1, b));
                 lets.insert(b, branch);
             }
         }
@@ -4469,7 +4471,6 @@ impl<'a> Emitter<'a> {
         let mut plan: Vec<(u32, &Expr, Vec<(bool, &Expr)>, &Expr, bool, BindId)> = Vec::new();
         let mut row_tests: Vec<(&Expr, &Expr)> = Vec::new();
         let mut aff_nodes: Vec<(u32, Vec<(bool, &Expr)>)> = Vec::new();
-        let pre_ids: HashSet<u32> = aff_nodes_pre.iter().map(|x| x.0).collect();
         aff_nodes.append(&mut aff_nodes_pre);
         for (rid, v, i) in accs {
             let root = path_ok(self, v, fixed_ref, &mut row_tests)?;
@@ -4479,9 +4480,26 @@ impl<'a> Emitter<'a> {
             let off = offset(self, i, lv, &lets, fixed_ref, 0, &mut aff_nodes)?;
             plan.push((rid, v, off, i, writes.contains(&rid), root));
         }
-        // Only the clamps that some index goes through narrow the fast iterations.
-        let used: HashSet<u32> = aff_nodes.iter().map(|x| x.0).filter(|id| !pre_ids.contains(id)).collect();
-        picks.retain(|p| used.contains(&p.1.id));
+        // Only the clamps that some index goes through (through the body's `let`s) narrow the
+        // fast iterations. The others stay ifs, and no index reads their let as the branch.
+        let mut used: HashSet<BindId> = HashSet::new();
+        let mut todo: Vec<&Expr> = plan.iter().map(|x| x.3).collect();
+        while let Some(e) = todo.pop() {
+            let mut found: Vec<BindId> = Vec::new();
+            walk_ref(e, &mut |y| {
+                if let (ExprKind::Var(_), Some(Res::Local(b))) = (&y.kind, self.ck.res.get(y.id as usize)) {
+                    found.push(*b);
+                }
+            });
+            for b in found {
+                if let Some(v) = lets.get(&b) {
+                    if used.insert(b) {
+                        todo.push(v);
+                    }
+                }
+            }
+        }
+        picks.retain(|p| used.contains(&p.6));
         // A written vector changes only through the planned element writes, and is reached
         // through one path only (it is borrowed mutably for the whole loop).
         let written: HashSet<BindId> = plan.iter().filter(|x| x.4).map(|x| x.5).collect();
@@ -4539,6 +4557,16 @@ impl<'a> Emitter<'a> {
         let mut other_sets: HashSet<BindId> = HashSet::new();
         for x in body {
             walk_ref(x, &mut |e| {
+                // A `(mut x)` argument changes x too, by any amount.
+                if let ExprKind::Call(_, _, args) = &e.kind {
+                    for a in args {
+                        if let Arg::Mut(m, _) = a {
+                            if let Some(r) = self.root_of(m) {
+                                other_sets.insert(r);
+                            }
+                        }
+                    }
+                }
                 if let ExprKind::Set(pl, v) = &e.kind {
                     let Some(Res::Local(b)) = (match &pl.kind {
                         ExprKind::Var(_) => self.ck.res.get(pl.id as usize),
@@ -4652,7 +4680,7 @@ impl<'a> Emitter<'a> {
         let mut aff_t: Vec<String> = Vec::new();
         // A clamped index leaves its edges to the checked iterations; the fixed side of its
         // condition is computed once here and must fit, as the program computes it each time.
-        for (_, _, k, x, lower, plus1) in &picks {
+        for (_, _, k, x, lower, plus1, _) in &picks {
             let kw = wide(self, k);
             let mut o = String::from("0i128");
             for (plus, c) in x {
@@ -4665,9 +4693,12 @@ impl<'a> Emitter<'a> {
             } else {
                 highs.push(bound);
             }
-            if let (ExprKind::Call(..), Ty::Int(ik)) = (&k.kind, self.ty(k)) {
-                let r = ik.rust();
-                aff_t.push(format!("({kw} >= ({r}::MIN as i128) && {kw} <= ({r}::MAX as i128))"));
+            for t in std::iter::once(*k).chain(x.iter().map(|(_, t)| *t)) {
+                if let (ExprKind::Call(..), Ty::Int(ik)) = (&t.kind, self.ty(t).clone()) {
+                    let tw = wide(self, t);
+                    let r = ik.rust();
+                    aff_t.push(format!("({tw} >= ({r}::MIN as i128) && {tw} <= ({r}::MAX as i128))"));
+                }
             }
         }
         for (id, terms) in &aff_nodes {
@@ -5472,9 +5503,16 @@ impl<'a> Emitter<'a> {
                 _ => unreachable!("narrow variable"),
             },
             ExprKind::If(c, a, Some(b)) => {
+                // Each branch on its own line, as the plain `if` is written: a trap in one is
+                // placed at that branch.
                 let c = self.val(c);
+                let (ma, mb) = (self.mark(a), self.mark(b));
                 let (a, b) = (self.nval(a), self.nval(b));
-                format!("(if {c} {{ {a} }} else {{ {b} }})")
+                format!("(if {c} {{
+{ma}{a}
+}} else {{
+{mb}{b}
+}})")
             }
             ExprKind::Call(n, _, xs) => match self.ck.res[e.id as usize].clone() {
                 Res::Builtin(_) if n == "at" => {

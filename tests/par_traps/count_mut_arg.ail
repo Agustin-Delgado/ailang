@@ -1,0 +1,16 @@
+; A count (set n (+ n 1)) in a loop whose indices are tested once adds without a check after one
+; test that n plus one per iteration fits. A (mut n) argument changes n too, so there the count
+; must keep its check and trap where the plain loop does.
+
+(fn bump (params (x (mut I64)) (k I64)) (returns Unit)
+  (body (set x (+ x k))))
+
+(fn main (params (con Console))
+  (body
+    (var v (fill 10 0))
+    (var n (- 9223372036854775807 10))
+    (for j (range 0 5)
+      (set (at v j) (+ (at v j) 1))
+      (set n (+ n 1)) ; traps here
+      (bump (mut n) (if (== j 0) 9 0)))
+    (println con "n " n)))

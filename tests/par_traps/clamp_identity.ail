@@ -1,0 +1,17 @@
+; A let shaped like a clamp whose kept branch is the loop variable itself,
+; (if (< j (- w 1)) j far): its other branch is any index, so a read through it keeps its bounds
+; check (it used to read far past the end without one).
+
+(fn run (params (v (Vec I64)) (w I64) (far I64)) (returns I64)
+  (body
+    (var s 0)
+    (for j (range 0 (len v))
+      (let cl (if (< j (- w 1)) j far))
+      (set s (+ s (at v cl)))) ; traps here
+    s))
+
+(fn main (params (con Console))
+  (body
+    (var v (fill 1000 1))
+    (println con (run v 1000 3))
+    (println con (run v 1000 5000000))))

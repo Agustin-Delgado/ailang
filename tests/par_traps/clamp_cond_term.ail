@@ -1,0 +1,17 @@
+; An index clamped at the edges, (if (> x k) (- j 1) 0), is just j - 1 in the iterations away from
+; the edges, where its condition is not evaluated. A term of the condition that overflows must
+; still trap, as the plain loop evaluates it every time.
+
+(fn run (params (v (Vec I64)) (m I64) (k I64)) (returns I64)
+  (body
+    (var s 0)
+    (for j (range 10 100)
+      (let cl (if (> (+ j (- m 5)) k) (- j 1) 0)) ; traps here
+      (set s (+ s (at v cl))))
+    s))
+
+(fn main (params (con Console))
+  (body
+    (var v (fill 100 1))
+    (println con "ok " (run v 1000 0))
+    (println con "trap " (run v -9223372036854775808 -9223372036854775808))))
