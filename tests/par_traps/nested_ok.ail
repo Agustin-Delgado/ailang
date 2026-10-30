@@ -1,0 +1,16 @@
+; Histograms in nested loops: no trap, same output.
+
+(fn hist (params (n I64) (seed I64)) (returns (Vec I64))
+  (body
+    (var h (Vec I64) (fill 16 0))
+    (for i (range 0 n)
+      (var x I64 (+ i seed))
+      (for k (range 0 4) (set x (% (+ (* x 13) 5) 65521)))
+      (set (at h (% x 16)) (+ (at h (% x 16)) 1)))
+    h))
+
+(fn main (params (con Console))
+  (body
+    (for q (range 0 6)
+      (let h (hist (* (- 6 q) 300000) q))
+      (println con (str q " " (at h 0) " " (at h 7) " " (at h 15))))))

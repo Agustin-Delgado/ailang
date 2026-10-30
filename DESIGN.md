@@ -138,7 +138,8 @@ thread pool, with no change to the program:
   overflowed (otherwise the loop runs sequentially); the same for elements of a vector (a
   histogram) and for sums modulo a constant;
 - a running maximum or minimum with its position (`(if (> e best) (do (set best e) (set at i)))`)
-  combines chunk by chunk in order, so ties resolve as in the sequential loop;
+  combines chunk by chunk in order, so ties resolve as in the sequential loop; the comparison may
+  come with a condition that does not read the maximum (`(if (and ok (< e best)) ...)`);
 - an outside variable that the body only assigns takes the value of the last assignment;
 - `(set (at v k) x)` is allowed when each iteration writes its own elements: `k` is the loop index,
   or `i * w + j` with `j` from an inner range no wider than `w` (checked before the loop); the
@@ -153,9 +154,16 @@ thread pool, with no change to the program:
 A loop of a few heavy iterations that do not split evenly over the cores (16 on 12) gives each
 one a thread of its own, so the cores share the last ones instead of letting them run alone.
 
+A parallel loop inside another one (in the body, or in a function it calls) runs in parallel too,
+one level deep, when the outer loop has only a few iterations or some thread has run out of work:
+the thread that reaches it posts its chunks, and every thread that becomes idle joins in until
+they run out. A loop over a handful of queries of unequal size, each scanning a large range, then
+keeps every core busy to the end instead of leaving the biggest query to one thread.
+
 If any chunk traps, the parallel run is thrown away and the loop runs again sequentially, so the
-output and the trap are exactly the sequential ones. A loop that already uses `par-map` keeps that
-parallelism, and loops inside a parallel one stay sequential.
+output and the trap are exactly the sequential ones (for a nested loop, the chunk of the outer loop
+that contains it stops too). `tools/partraps.py` checks the programs in `tests/par_traps/` against
+a run on one thread. A loop that already uses `par-map` keeps that parallelism.
 
 ### Loops that run on the GPU
 

@@ -1,0 +1,21 @@
+; A trap inside a loop nested in another parallel loop (few heavy outer iterations):
+; the output of the earlier queries and the trap are the sequential ones.
+
+(fn scan (params (seed I64) (n I64) (bad I64)) (returns I64)
+  (body
+    (var best I64 9223372036854775807)
+    (for i (range 0 n)
+      (var x I64 (+ seed i))
+      (for k (range 0 10)
+        (set x (% (+ (* x 31) 7) 1000003)))
+      (let y I64 (/ x (- i bad))) ; traps here
+      (if (and (> y 10) (< x best))
+        (set best x)))
+    best))
+
+(fn main (params (con Console))
+  (body
+    (let sizes (vec 3000000 200000 200000 200000))
+    (let bads (vec -1 -1 150000 -1))
+    (for q (range 0 4)
+      (println con (scan q (at sizes q) (at bads q))))))

@@ -1,0 +1,17 @@
+; The trap is near the end of the last, biggest inner loop, after other chunks finished.
+
+(fn total (params (n I64) (bad I64)) (returns I64)
+  (body
+    (var s I64 0)
+    (for i (range 0 n)
+      (var x I64 i)
+      (for k (range 0 5)
+        (set x (% (+ (* x 17) 3) 999983)))
+      (if (== i bad) (set x (at (vec 1 2) 5))) ; traps here
+      (set s (+ s x)))
+    s))
+
+(fn main (params (con Console))
+  (body
+    (for q (range 0 5)
+      (println con (total (* (+ q 1) 400000) (if (== q 4) 1999990 -1))))))

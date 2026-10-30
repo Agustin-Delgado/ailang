@@ -343,3 +343,42 @@
   (assert (== (pow (as U8 2) (as U32 7)) (as U8 128)))
   (assert (== (pow (as I32 2) (as U32 30)) (as I32 1073741824)))
   (assert (== (pow (as U64 2) (as U32 63)) (* (as U64 4611686018427387904) (as U64 2)))))
+
+(fn lowest (params (seed I64) (n I64)) (returns I64)
+  (body
+    (var best 9223372036854775807)
+    (for i (range 0 n)
+      (var x (+ seed i))
+      (for k (range 0 8) (set x (% (+ (* x 31) 7) 1000003)))
+      (if (and (> (% x 3) 0) (< x best))
+        (set best x)))
+    best))
+
+(fn lowest-seq (params (seed I64) (n I64)) (returns I64)
+  (body
+    (var best 9223372036854775807)
+    (var i 0)
+    (while (< i n)
+      (var x (+ seed i))
+      (var k 0)
+      (while (< k 8)
+        (set x (% (+ (* x 31) 7) 1000003))
+        (set k (+ k 1)))
+      (if (and (> (% x 3) 0) (< x best))
+        (set best x))
+      (set i (+ i 1)))
+    best))
+
+; A running minimum under a condition that does not read it, in a loop nested inside another
+; parallel loop of a few uneven iterations: the inner loops are shared by the idle threads.
+(test "a guarded minimum, nested in a loop of few iterations"
+  (let sizes (vec 600000 3000 20000 1))
+  (var got (Vec I64) (vec))
+  (for q (range 0 4)
+    (push (mut got) (lowest (* q 7) (at sizes q))))
+  (var want (Vec I64) (vec))
+  (var q 0)
+  (while (< q 4)
+    (push (mut want) (lowest-seq (* q 7) (at sizes q)))
+    (set q (+ q 1)))
+  (assert (== got want)))

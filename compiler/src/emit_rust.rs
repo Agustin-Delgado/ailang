@@ -2730,15 +2730,18 @@ impl<'a> Emitter<'a> {
         if fail {
             return None;
         }
-        // Running maxima and minima: `(if (op e m) (do (set m e) (set w x)...))`.
-        let mut maxes: Vec<(u32, Vec<BindId>, bool)> = Vec::new(); // if id, [m, w...], m on the left
+        // Running maxima and minima: `(if (op e m) (do (set m e) (set w x)...))`, also with a
+        // condition that does not read m: `(if (and g (op e m)) ...)`. A chunk starts from m as
+        // it was before the loop, so it evaluates `g` wherever the sequential loop would (and
+        // maybe more often): a trap there is still found, by the sequential run.
+        let mut maxes: Vec<(u32, Vec<BindId>, bool, u32)> = Vec::new(); // if id, [m, w...], m on the left, comparison id
         let mut grouped: HashSet<u32> = HashSet::new();
         for &f in &ifs {
-            let ExprKind::If(c, th, None) = &f.kind else { continue };
-            let ExprKind::Call(op, _, cx) = &c.kind else { continue };
-            if !builtin(c) || !matches!(op.as_str(), "<" | ">" | "<=" | ">=") || cx.len() != 2 {
-                continue;
-            }
+            let ExprKind::If(c0, th, None) = &f.kind else { continue };
+            let cands: Vec<&Expr> = match &c0.kind {
+                ExprKind::Call(n, _, xs) if n == "and" && xs.len() == 2 && builtin(c0) => vec![xs[1].expr(), xs[0].expr()],
+                _ => vec![&**c0],
+            };
             let sets: Vec<&Expr> = match &th.kind {
                 ExprKind::Set(..) => vec![&**th],
                 ExprKind::Do(es) => es.iter().collect(),
@@ -2747,29 +2750,35 @@ impl<'a> Emitter<'a> {
             if !sets.iter().all(|x| matches!(&x.kind, ExprKind::Set(p, _) if local_of(p).is_some_and(|b| !inner.contains(&b)))) {
                 continue;
             }
-            for (left, (mx, ev)) in [(true, (cx[0].expr(), cx[1].expr())), (false, (cx[1].expr(), cx[0].expr()))] {
-                let Some(m) = local_of(mx) else { continue };
-                if inner.contains(&m) || m == lv {
+            'cand: for c in cands {
+                let ExprKind::Call(op, _, cx) = &c.kind else { continue };
+                if !builtin(c) || !matches!(op.as_str(), "<" | ">" | "<=" | ">=") || cx.len() != 2 {
                     continue;
                 }
-                let ev_src = self.src_of(ev);
-                let mut group = vec![m];
-                let mut ok = false;
-                for x in &sets {
-                    let ExprKind::Set(p, v) = &x.kind else { unreachable!() };
-                    let b = local_of(p).unwrap();
-                    if b == m {
-                        ok |= self.src_of(v) == ev_src;
-                    } else if !group.contains(&b) {
-                        group.push(b);
+                for (left, (mx, ev)) in [(true, (cx[0].expr(), cx[1].expr())), (false, (cx[1].expr(), cx[0].expr()))] {
+                    let Some(m) = local_of(mx) else { continue };
+                    if inner.contains(&m) || m == lv {
+                        continue;
                     }
-                }
-                if ok && group.iter().all(|b| self.is_copy(&self.ck.bindings[*b].ty)) {
-                    maxes.push((f.id, group, left));
+                    let ev_src = self.src_of(ev);
+                    let mut group = vec![m];
+                    let mut ok = false;
                     for x in &sets {
-                        grouped.insert(x.id);
+                        let ExprKind::Set(p, v) = &x.kind else { unreachable!() };
+                        let b = local_of(p).unwrap();
+                        if b == m {
+                            ok |= self.src_of(v) == ev_src;
+                        } else if !group.contains(&b) {
+                            group.push(b);
+                        }
                     }
-                    break;
+                    if ok && group.iter().all(|b| self.is_copy(&self.ck.bindings[*b].ty)) {
+                        maxes.push((f.id, group, left, c.id));
+                        for x in &sets {
+                            grouped.insert(x.id);
+                        }
+                        break 'cand;
+                    }
                 }
             }
         }
@@ -2854,7 +2863,7 @@ impl<'a> Emitter<'a> {
             }
             claim(*r, 1);
         }
-        for (fid, group, _) in &maxes {
+        for (fid, group, _, _) in &maxes {
             let ExprKind::If(_, th, _) = &find_expr(body, *fid)?.kind else { unreachable!() };
             let n_sets = match &th.kind {
                 ExprKind::Do(es) => es.len(),
@@ -3122,7 +3131,7 @@ impl<'a> Emitter<'a> {
             ));
             chunks = "1";
         }
-        for (i, (fid, group, left)) in maxes.iter().enumerate() {
+        for (i, (fid, group, left, cid)) in maxes.iter().enumerate() {
             let k = format!("m{i}");
             let mut fields = Vec::new();
             for (gi, b) in group.iter().enumerate() {
@@ -3137,8 +3146,7 @@ impl<'a> Emitter<'a> {
             let ui = ret.len();
             ret.push(format!("__upd{k}"));
             hooks.push((*fid, ParHook::Flag(format!("__upd{k}"))));
-            let ExprKind::If(c, _, _) = &find_expr(body, *fid)?.kind else { unreachable!() };
-            let ExprKind::Call(op, _, _) = &c.kind else { unreachable!() };
+            let ExprKind::Call(op, _, _) = &find_expr(body, *cid)?.kind else { unreachable!() };
             let mpl = self.bind_place(group[0]);
             let cond = if *left { format!("{mpl} {op} __p.{}", fields[0]) } else { format!("__p.{} {op} {mpl}", fields[0]) };
             let mut assign = String::new();

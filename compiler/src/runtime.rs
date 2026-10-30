@@ -239,6 +239,11 @@ mod ail_rt {
             let par = PAR_TRAP.with(|t| t.get());
             if !par.is_null() {
                 unsafe { (*par).store(true, std::sync::atomic::Ordering::Release) };
+                // A loop nested in another on this thread: the outer chunk stops here too.
+                let up = PAR_TRAP_UP.with(|t| t.get());
+                if !up.is_null() {
+                    unsafe { (*up).store(true, std::sync::atomic::Ordering::Release) };
+                }
                 if cfg!(panic = "unwind") {
                     return;
                 }
@@ -607,12 +612,28 @@ mod ail_rt {
 
         struct Job(*const (dyn Fn() + Sync));
         unsafe impl Send for Job {}
+        // A parallel loop started on a pool thread (see `run_nested`): its work, and the idle
+        // threads that joined it. Lives on the starting thread's stack; read under the lock.
+        struct Nest { work: Job, helpers: Cell<usize> }
+        struct NestPtr(*const Nest);
+        unsafe impl Send for NestPtr {}
         // `base` threads are the ones a job normally runs on; a job may ask for more (`run_wide`),
         // which are started then and kept. `limit`: the threads (by index) the current job runs on.
-        struct State { generation: u64, job: Option<Job>, running: usize, alive: usize, trapped: bool, base: usize, spawned: usize, limit: usize }
+        struct State { generation: u64, job: Option<Job>, running: usize, alive: usize, trapped: bool, base: usize, spawned: usize, limit: usize, nested: Vec<NestPtr> }
         struct Pool { state: Mutex<State>, start: Condvar, end: Condvar, busy: Mutex<()> }
 
         thread_local! { static INSIDE: Cell<bool> = const { Cell::new(false) }; }
+        // On a pool thread: running a nested loop (as its starter or a helper), so loops inside it
+        // stay sequential. HELPING: the nested loop this idle thread joined.
+        thread_local! { static NESTED: Cell<bool> = const { Cell::new(false) }; }
+        thread_local! { static HELPING: Cell<*const Nest> = const { Cell::new(std::ptr::null()) }; }
+        // The nested loop this thread started and is running.
+        thread_local! { static STARTED: Cell<*const Nest> = const { Cell::new(std::ptr::null()) }; }
+        // Running a chunk of a loop with few iterations (each chunk is one or a few of them): the
+        // threads that run out of chunks soon have nothing to do, so loops inside start nested.
+        thread_local! { static FEW: Cell<bool> = const { Cell::new(false) }; }
+        // Pool threads waiting for work.
+        static IDLE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
         fn get() -> &'static Pool {
             static POOL: OnceLock<&'static Pool> = OnceLock::new();
@@ -623,7 +644,7 @@ mod ail_rt {
                 let workers = wanted.unwrap_or(cores);
                 let workers = if workers <= 1 { 0 } else { workers };
                 let p: &'static Pool = Box::leak(Box::new(Pool {
-                    state: Mutex::new(State { generation: 0, job: None, running: 0, alive: workers, trapped: false, base: workers, spawned: workers, limit: workers }),
+                    state: Mutex::new(State { generation: 0, job: None, running: 0, alive: workers, trapped: false, base: workers, spawned: workers, limit: workers, nested: Vec::new() }),
                     start: Condvar::new(),
                     end: Condvar::new(),
                     busy: Mutex::new(()),
@@ -636,12 +657,26 @@ mod ail_rt {
         }
 
         fn worker(p: &'static Pool, idx: usize, mut seen: u64) {
+            use std::sync::atomic::Ordering;
             INSIDE.with(|c| c.set(true));
             loop {
                 let job = {
                     let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut help: *const Nest = std::ptr::null();
                     while st.generation == seen {
+                        if let Some(n) = st.nested.last() {
+                            help = n.0;
+                            unsafe { (*help).helpers.set((*help).helpers.get() + 1) };
+                            break;
+                        }
+                        IDLE.fetch_add(1, Ordering::Relaxed);
                         st = p.start.wait(st).unwrap_or_else(|e| e.into_inner());
+                        IDLE.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    if !help.is_null() {
+                        drop(st);
+                        help_nested(p, help);
+                        continue;
                     }
                     seen = st.generation;
                     if idx < st.limit { st.job.as_ref().map(|j| j.0) } else { None }
@@ -656,6 +691,55 @@ mod ail_rt {
                 if st.running == 0 {
                     p.end.notify_all();
                 }
+            }
+        }
+
+        // An idle thread runs the work of a nested loop with its starter; the work returns once
+        // every chunk is taken, so the loop leaves the list then.
+        fn help_nested(p: &'static Pool, n: *const Nest) {
+            HELPING.with(|h| h.set(n));
+            NESTED.with(|c| c.set(true));
+            let f = unsafe { (*n).work.0 };
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*f)() }));
+            NESTED.with(|c| c.set(false));
+            HELPING.with(|h| h.set(std::ptr::null()));
+            let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.nested.retain(|x| x.0 != n);
+            unsafe { (*n).helpers.set((*n).helpers.get() - 1) };
+            p.end.notify_all();
+        }
+
+        /// On a pool thread outside a nested loop, with some thread idle or about to be: a loop
+        /// here may start a nested one (`run_nested`).
+        pub fn can_nest() -> bool {
+            !NESTED.with(|c| c.get()) && (FEW.with(|c| c.get()) || IDLE.load(std::sync::atomic::Ordering::Relaxed) > 0)
+        }
+
+        /// Sets FEW for the chunks this thread runs; returns the value to put back.
+        pub fn set_few(v: bool) -> bool {
+            FEW.with(|c| c.replace(v))
+        }
+
+        /// Runs `work` on this pool thread, joined by the threads that are idle now or become
+        /// idle before it ends; returns once every thread has left it. `work` must take its
+        /// share of a common supply until it runs out (as the work of `par_for` does).
+        pub fn run_nested(work: &(dyn Fn() + Sync)) {
+            let p = get();
+            let job: *const (dyn Fn() + Sync) = work;
+            // As in `run_on`: the pointer is used only while this call waits below.
+            let nest = Nest { work: Job(unsafe { std::mem::transmute::<*const (dyn Fn() + Sync + '_), *const (dyn Fn() + Sync + 'static)>(job) }), helpers: Cell::new(0) };
+            let np: *const Nest = &nest;
+            p.state.lock().unwrap_or_else(|e| e.into_inner()).nested.push(NestPtr(np));
+            p.start.notify_all();
+            NESTED.with(|c| c.set(true));
+            STARTED.with(|c| c.set(np));
+            work();
+            STARTED.with(|c| c.set(std::ptr::null()));
+            NESTED.with(|c| c.set(false));
+            let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.nested.retain(|x| x.0 != np);
+            while nest.helpers.get() > 0 {
+                st = p.end.wait(st).unwrap_or_else(|e| e.into_inner());
             }
         }
 
@@ -675,6 +759,24 @@ mod ail_rt {
         pub fn abandon() {
             let p = get();
             let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
+            let n = HELPING.with(|h| h.get());
+            if !n.is_null() {
+                // An idle thread helping a nested loop: it leaves that loop, not the pool's job.
+                st.alive = st.alive.saturating_sub(1);
+                st.nested.retain(|x| x.0 != n);
+                unsafe { (*n).helpers.set((*n).helpers.get() - 1) };
+                p.end.notify_all();
+                return;
+            }
+            let n = STARTED.with(|h| h.get());
+            if !n.is_null() {
+                // The starter of a nested loop: its helpers may still use this thread's stack and
+                // what the loop around it borrows, so they leave before the loop is given up.
+                st.nested.retain(|x| x.0 != n);
+                while unsafe { (*n).helpers.get() } > 0 {
+                    st = p.end.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+            }
             st.alive = st.alive.saturating_sub(1);
             st.running = st.running.saturating_sub(1);
             if st.running == 0 {
@@ -738,14 +840,20 @@ mod ail_rt {
     // as failed and parks the thread instead of ending the program, and the caller runs the
     // whole loop again sequentially, which reaches the first trap in program order.
     thread_local! { pub static PAR_TRAP: std::cell::Cell<*const std::sync::atomic::AtomicBool> = const { std::cell::Cell::new(std::ptr::null()) }; }
+    // The flag of the loop around a nested one on the same thread (see `pool::run_nested`).
+    thread_local! { pub static PAR_TRAP_UP: std::cell::Cell<*const std::sync::atomic::AtomicBool> = const { std::cell::Cell::new(std::ptr::null()) }; }
 
     /// Worth running `lo..hi` in parallel: enough iterations (any count above one when the body
-    /// itself loops or calls functions), not already on a pool thread, and threads to spare.
+    /// itself loops or calls functions), threads to spare, and not already on a pool thread
+    /// unless some thread is idle there (a nested loop, one level deep).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn par_worth(lo: i64, hi: i64, heavy: bool) -> bool {
         let n = hi as i128 - lo as i128;
-        if n < 2 || (!heavy && n < 1 << 15) || pool::inside() || SOFT_TRAP.with(|s| s.get()) {
+        if n < 2 || (!heavy && n < 1 << 15) || SOFT_TRAP.with(|s| s.get()) {
             return false;
+        }
+        if pool::inside() {
+            return pool::can_nest();
         }
         pool::size() > 1
     }
@@ -778,8 +886,13 @@ mod ail_rt {
             unsafe fn put(&self, c: usize, r: R) { (*self.0.add(c)).write(r); }
         }
         let slots = Slots(out.as_mut_ptr());
+        let nested = pool::inside();
+        let few = !nested && n <= threads * 4;
         let work = || {
+            let few_was = pool::set_few(few);
+            let up = PAR_TRAP.with(|t| t.get());
             PAR_TRAP.with(|t| t.set(&trapped));
+            PAR_TRAP_UP.with(|t| t.set(up));
             loop {
                 if trapped.load(Ordering::Relaxed) {
                     break;
@@ -801,9 +914,18 @@ mod ail_rt {
                     Err(_) => trapped.store(true, Ordering::Release),
                 }
             }
-            PAR_TRAP.with(|t| t.set(std::ptr::null()));
+            PAR_TRAP.with(|t| t.set(up));
+            PAR_TRAP_UP.with(|t| t.set(std::ptr::null()));
+            pool::set_few(few_was);
         };
-        let ran = if wide { pool::run_wide(&work, n) } else { pool::run(&work) };
+        let ran = if nested {
+            pool::run_nested(&work);
+            true
+        } else if wide {
+            pool::run_wide(&work, n)
+        } else {
+            pool::run(&work)
+        };
         let ok = ran && !trapped.load(Ordering::Acquire);
         if !ok {
             for (c, d) in done.iter().enumerate() {
