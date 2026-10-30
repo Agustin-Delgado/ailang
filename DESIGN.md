@@ -83,6 +83,20 @@ machine lines to source lines that is read only when a trap happens.
   chasing such as a union-find `find`, where every step is an index read from the vector itself.
 - `split` on a one-byte separator scans bytes directly instead of going through the general
   string searcher, which costs more than the scan on the short fields of typical input lines.
+- A loop that calls fns with I64 vectors which they only index (a filter applied T times to an
+  image, a step of a cellular automaton) runs, when every element fits in u8, i16 or i32
+  (measured on entry), on copies of that width; the fns it calls run as copies generic over
+  the width, their own `fill` vectors narrow too, and the copies that changed are written back
+  at the end. Min, max, `if` and comparisons of such elements (and fns made only of those, like
+  a median of three) are computed in the narrow type, which LLVM vectorizes; anything else
+  widens to I64 first. A store that does not fit throws the run away as for the graph walks.
+  Parallel loops inside those fns stay parallel: a chunk that would throw the run away stops
+  and the run is thrown away after the loop.
+- An index clamped at the edges, `(let cl (if (> j 0) (- j 1) 0))`, is the plain `j - 1` in the
+  iterations away from the edges, so those run without bounds checks too; a count
+  `(set n (+ n 1))` in such a loop adds without a check when `n + iterations` fits.
+- Blocks above 1 MB reserve 64 times their size of address space (64-bit Windows), so a vector
+  grown by `push` stays in place; big copies of plain values use several threads.
 
 ## 7. Strings are values, read in place
 
@@ -199,6 +213,10 @@ per element, chosen when it is uploaded); the kernel reads and writes it at that
 that does not fit stops the launch like a trap, but instead of running the loop on the CPU the
 launch is undone, the copy goes back to full width for good, and the launch runs again.
 `AIL_GPU_NARROW=0` keeps every copy at full width.
+
+A program whose only kernels are cheap and run once (in `main`, outside any loop) never sends
+them to the device the first time, so it does not open the device at all: opening it costs a
+core while the program runs and more time when it exits.
 
 Waiting for each launch costs more than most launches, so an outer loop that only computes (it
 uses no capability, does not leave early, and changes outside itself only plain values and

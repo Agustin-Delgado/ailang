@@ -92,12 +92,82 @@ mod ail_alloc {
         unlock(m);
     }
 
+    // Big blocks (above 1 MB) on 64-bit Windows get their own reservation of address space,
+    // sixty-four times their size, of which only the pages in use are committed. A vector that grows
+    // by pushing then commits more pages where it is instead of moving: no copy, and every page
+    // is touched once. Fresh pages are zero, so a zeroed block costs nothing until written.
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    mod big {
+        #[repr(C)]
+        struct Mbi { base: *mut u8, alloc_base: *mut u8, alloc_protect: u32, partition: u16, size: usize, state: u32, protect: u32, typ: u32 }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn VirtualAlloc(addr: *mut u8, size: usize, typ: u32, protect: u32) -> *mut u8;
+            fn VirtualFree(addr: *mut u8, size: usize, typ: u32) -> i32;
+            fn VirtualQuery(addr: *const u8, info: *mut Mbi, len: usize) -> usize;
+        }
+        const COMMIT: u32 = 0x1000;
+        const RESERVE: u32 = 0x2000;
+        const RELEASE: u32 = 0x8000;
+        const RW: u32 = 0x04;
+        #[inline(always)]
+        fn pages(n: usize) -> usize { (n + 4095) & !4095 }
+        #[inline(always)]
+        pub fn fits(size: usize, align: usize) -> bool { size > super::MEDIUM_MAX && align <= 65536 }
+        pub unsafe fn alloc(size: usize) -> *mut u8 {
+            let n = pages(size);
+            let mut base = match n.checked_mul(64) {
+                Some(r) => VirtualAlloc(std::ptr::null_mut(), r, RESERVE, RW),
+                None => std::ptr::null_mut(),
+            };
+            if base.is_null() {
+                base = VirtualAlloc(std::ptr::null_mut(), n, RESERVE, RW);
+                if base.is_null() { return base; }
+            }
+            if VirtualAlloc(base, n, COMMIT, RW).is_null() {
+                VirtualFree(base, 0, RELEASE);
+                return std::ptr::null_mut();
+            }
+            base
+        }
+        /// Bytes reserved for the block at `p`, from `p`.
+        unsafe fn reserved(p: *mut u8) -> usize {
+            let mut q = p as *const u8;
+            loop {
+                let mut m: Mbi = std::mem::zeroed();
+                if VirtualQuery(q, &mut m, std::mem::size_of::<Mbi>()) == 0 || m.alloc_base != p { break; }
+                q = m.base.add(m.size);
+            }
+            q as usize - p as usize
+        }
+        pub unsafe fn grow(p: *mut u8, old: usize, new: usize) -> *mut u8 {
+            if pages(new) <= reserved(p) {
+                return if VirtualAlloc(p, pages(new), COMMIT, RW).is_null() { std::ptr::null_mut() } else { p };
+            }
+            let q = alloc(new);
+            if !q.is_null() {
+                std::ptr::copy_nonoverlapping(p, q, old);
+                free(p);
+            }
+            q
+        }
+        pub unsafe fn free(p: *mut u8) { VirtualFree(p, 0, RELEASE); }
+    }
+    #[cfg(not(all(windows, target_pointer_width = "64")))]
+    mod big {
+        pub fn fits(_size: usize, _align: usize) -> bool { false }
+        pub unsafe fn alloc(_size: usize) -> *mut u8 { unreachable!() }
+        pub unsafe fn grow(_p: *mut u8, _old: usize, _new: usize) -> *mut u8 { unreachable!() }
+        pub unsafe fn free(_p: *mut u8) { unreachable!() }
+    }
+
     unsafe impl GlobalAlloc for SizeClassAlloc {
         #[inline(always)]
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
             if l.size() > MAX_SMALL || l.align() > CLASS {
                 return match kind(l.size(), l.align()) {
                     Kind::Medium(c) => medium_alloc(c),
+                    _ if big::fits(l.size(), l.align()) => big::alloc(l.size()),
                     _ => System.alloc(l),
                 };
             }
@@ -121,6 +191,7 @@ mod ail_alloc {
             if l.size() > MAX_SMALL || l.align() > CLASS {
                 return match kind(l.size(), l.align()) {
                     Kind::Medium(c) => medium_free(p, c),
+                    _ if big::fits(l.size(), l.align()) => big::free(p),
                     _ => System.dealloc(p, l),
                 };
             }
@@ -130,9 +201,20 @@ mod ail_alloc {
             st.free[c] = p;
         }
         #[inline]
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            if big::fits(l.size(), l.align()) { return big::alloc(l.size()); }
+            let p = self.alloc(l);
+            if !p.is_null() { std::ptr::write_bytes(p, 0, l.size()); }
+            p
+        }
+        #[inline]
         unsafe fn realloc(&self, p: *mut u8, l: Layout, new_size: usize) -> *mut u8 {
+            let (bo, bn) = (big::fits(l.size(), l.align()), big::fits(new_size, l.align()));
+            if bo && bn {
+                return if new_size > l.size() { big::grow(p, l.size(), new_size) } else { p };
+            }
             let (old, new) = (kind(l.size(), l.align()), kind(new_size, l.align()));
-            if old == Kind::Large && new == Kind::Large { return System.realloc(p, l, new_size); }
+            if old == Kind::Large && new == Kind::Large && !bo && !bn { return System.realloc(p, l, new_size); }
             if old == new && old != Kind::Large { return p; }
             let nl = Layout::from_size_align_unchecked(new_size, l.align());
             let q = self.alloc(nl);
@@ -409,6 +491,65 @@ mod ail_rt {
         for (d, s) in dst.iter_mut().zip(src) { *d = *s as i64; }
     }
 
+    /// An element type that a loop over I64 vectors runs on when every value fits in it (the
+    /// dense narrow regions of the compiler): the vectors take a fraction of the memory, and
+    /// min, max and comparisons of their elements vectorize.
+    pub trait Nar: Copy + Ord + Default + Send + Sync + 'static {
+        const LO: i64;
+        const HI: i64;
+        fn w(self) -> i64;
+        fn fit(x: i64) -> Option<Self>;
+        fn cut(x: i64) -> Self;
+    }
+    macro_rules! nar_impl { ($($t:ty),*) => { $(
+        impl Nar for $t {
+            const LO: i64 = <$t>::MIN as i64;
+            const HI: i64 = <$t>::MAX as i64;
+            #[inline(always)] fn w(self) -> i64 { self as i64 }
+            #[inline(always)] fn fit(x: i64) -> Option<Self> { if x >= Self::LO && x <= Self::HI { Some(x as $t) } else { None } }
+            #[inline(always)] fn cut(x: i64) -> Self { x as $t }
+        }
+    )* } }
+    nar_impl!(u8, i16, i32);
+    /// Runs `f` over [0, n) in pieces on the thread pool when n is large.
+    fn nar_split<R: Send>(n: usize, f: &(dyn Fn(usize, usize) -> R + Sync)) -> Vec<R> {
+        if n >= (1 << 20) {
+            if let Some(r) = par_for(0, n as i64, 1, &|a, b| f(a as usize, b as usize)) { return r; }
+        }
+        vec![f(0, n)]
+    }
+    /// The narrowest of u8 (1), i16 (2) and i32 (4) that holds every element, or 0.
+    pub fn nar_width(vs: &[&[i64]]) -> u8 {
+        let (mut lo, mut hi) = (0i64, 0i64);
+        for v in vs {
+            for (l, h) in nar_split(v.len(), &|a, b| v[a..b].iter().fold((i64::MAX, i64::MIN), |(l, h), &x| (l.min(x), h.max(x)))) {
+                lo = lo.min(l);
+                hi = hi.max(h);
+            }
+        }
+        if lo >= 0 && hi <= 255 { 1 } else if lo >= -32768 && hi <= 32767 { 2 } else if lo >= i32::MIN as i64 && hi <= i32::MAX as i64 { 4 } else { 0 }
+    }
+    /// A narrow copy of a vector whose elements are known to fit (see `nar_width`).
+    pub fn nar_to<T: Nar>(v: &[i64]) -> Vec<T> {
+        let mut r: Vec<T> = vec![T::default(); v.len()];
+        let out = SharedSlice::new(&mut r[..]);
+        nar_split(v.len(), &|a, b| {
+            let o = unsafe { std::slice::from_raw_parts_mut(out.ptr().add(a), b - a) };
+            for (d, s) in o.iter_mut().zip(&v[a..b]) { *d = T::cut(*s); }
+        });
+        r
+    }
+    /// Writes a narrow copy back into the vector it was made from.
+    pub fn nar_back<T: Nar>(dst: &mut [i64], src: &[T]) {
+        let out = SharedSlice::new(dst);
+        nar_split(src.len().min(out.len()), &|a, b| {
+            let o = unsafe { std::slice::from_raw_parts_mut(out.ptr().add(a), b - a) };
+            for (d, s) in o.iter_mut().zip(&src[a..b]) { *d = s.w(); }
+        });
+    }
+    #[inline(always)]
+    pub fn nar_fill<T: Nar>(n: usize, x: i64) -> Option<Vec<T>> { T::fit(x).map(|t| vec![t; n]) }
+
     pub trait ShiftAil: Sized { fn checked_shl_ail(self, s: u32) -> Self; fn checked_shr_ail(self, s: u32) -> Self; }
     macro_rules! shift_impl { ($($t:ty),*) => { $(
         impl ShiftAil for $t {
@@ -512,7 +653,27 @@ mod ail_rt {
     #[track_caller]
     pub fn slice<T: Clone>(v: &Vec<T>, a: i64, b: i64) -> Vec<T> {
         let (a, b) = slice_bounds(v.len(), a, b);
-        v[a..b].to_vec()
+        copy_of(&v[a..b])
+    }
+    /// A copy of a vector of plain values.
+    pub fn vclone<T: Clone>(v: &Vec<T>) -> Vec<T> { copy_of(&v[..]) }
+    /// `to_vec`, but a big block of plain values (no drop glue, so cloning is copying the bytes)
+    /// is copied by several threads: most of the time of such a copy goes to the fresh pages it
+    /// touches, and the system serves those faster in parallel.
+    fn copy_of<T: Clone>(v: &[T]) -> Vec<T> {
+        let bytes = std::mem::size_of_val(v);
+        if !std::mem::needs_drop::<T>() && std::mem::size_of::<T>() > 0 && bytes >= (8 << 20) {
+            let mut r: Vec<T> = Vec::with_capacity(v.len());
+            let (d, s) = (r.as_mut_ptr() as usize, v.as_ptr() as usize);
+            let done = par_for(0, bytes as i64, 1, &|a, b| unsafe {
+                std::ptr::copy_nonoverlapping((s + a as usize) as *const u8, (d + a as usize) as *mut u8, (b - a) as usize)
+            });
+            if done.is_some() {
+                unsafe { r.set_len(v.len()) };
+                return r;
+            }
+        }
+        v.to_vec()
     }
     pub fn concat<T: Clone>(a: &Vec<T>, b: &Vec<T>) -> Vec<T> {
         let mut r = Vec::with_capacity(a.len() + b.len());

@@ -73,6 +73,9 @@ pub struct Emitter<'a> {
     /// Found by the first pass: loops that became kernels, and the fns that hold them.
     kernel_loops: HashSet<u32>,
     kernel_fns: HashSet<String>,
+    /// Some kernel may run on the device the first time it is reached: open the device at the
+    /// start, in the background (see `gpu_attempt`).
+    gpu_eager: bool,
     /// Fns with kernels and the fns that call them: their vectors keep device copies.
     aware: HashSet<String>,
     /// Mirror of each vector binding in the fn being emitted: (Rust name, kind).
@@ -91,6 +94,21 @@ pub struct Emitter<'a> {
     nr_off: bool,
     /// Above zero inside a lambda: a `break` out of the fast copy cannot be written there.
     nr_lam: u32,
+    /// Expressions computed in the narrow element type `nt_ety` (see `nt_scan`), the `let`s
+    /// bound to them, and whether that is on.
+    nt: HashSet<u32>,
+    nt_binds: HashSet<BindId>,
+    nt_on: bool,
+    nt_ety: String,
+    /// Fn copies for dense regions still to emit, and the ones emitted: (fn, narrow params).
+    dense_q: Vec<(String, u64)>,
+    dense_done: HashSet<(String, u64)>,
+    /// Fns of min and max only, wanted generic over the element type (see `tfn_ok`).
+    tfn_q: Vec<String>,
+    tfn_done: HashSet<String>,
+    tfn_memo: std::cell::RefCell<HashMap<String, bool>>,
+    /// `(set x (+ x k))` counted without a check in the fast copy of a loop: id -> k.
+    counts: HashMap<u32, String>,
     web: bool,
 }
 
@@ -106,6 +124,13 @@ struct NarrowCtx {
     inner: HashSet<BindId>,
     /// Stores whose value is known to be in range (see `NarrowPlan::copies`).
     nocheck: HashSet<u32>,
+    /// A dense region or a fn copy made for one (see `dense_region`): the narrow vectors hold
+    /// a generic element type, every store checks it fits.
+    dense: bool,
+    /// The code that throws the fast run away where it stands.
+    bail: String,
+    /// The Rust element type of the narrow vectors.
+    ety: String,
 }
 
 #[derive(Clone)]
@@ -270,6 +295,7 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, file_lines: &[u
         pass2: false,
         kernel_loops: HashSet::new(),
         kernel_fns: HashSet::new(),
+        gpu_eager: false,
         aware: HashSet::new(),
         mirrors: HashMap::new(),
         gpu_quiet: 0,
@@ -278,6 +304,16 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, file_lines: &[u
         nr: None,
         nr_off: false,
         nr_lam: 0,
+        nt: HashSet::new(),
+        nt_binds: HashSet::new(),
+        nt_on: false,
+        nt_ety: String::new(),
+        dense_q: Vec::new(),
+        dense_done: HashSet::new(),
+        tfn_q: Vec::new(),
+        tfn_done: HashSet::new(),
+        tfn_memo: std::cell::RefCell::new(HashMap::new()),
+        counts: HashMap::new(),
         web: matches!(mode_kind, ModeKind::Web),
     };
     em.infer_view_fns(prog);
@@ -290,6 +326,7 @@ pub fn emit(prog: &Program, ck: &Checked, src: &str, file: &str, file_lines: &[u
         em.aware = gpu_aware(prog, ck, &em.kernel_fns);
         em.pass2 = true;
         em.kernels.clear();
+        em.gpu_eager = false;
         em.tmp = 0;
         out = emit_items(&mut em, prog, ck, &mode);
     }
@@ -380,9 +417,14 @@ fn emit_items(em: &mut Emitter, prog: &Program, ck: &Checked, mode: &Mode) -> St
             em.emit_enum(n, &mut out);
         }
     }
+    em.dense_q.clear();
+    em.dense_done.clear();
+    em.tfn_q.clear();
+    em.tfn_done.clear();
     for f in concrete_fns(prog, ck) {
         em.emit_fn(f, &mut out);
     }
+    em.emit_dense_fns(&mut out);
     match mode {
         Mode::Run => {
             if let Some(main) = prog.items.iter().find_map(|i| match i {
@@ -392,7 +434,7 @@ fn emit_items(em: &mut Emitter, prog: &Program, ck: &Checked, mode: &Mode) -> St
                 let sig = &ck.info.fns["main"];
                 let caps: Vec<String> = sig.params.iter().map(|(_, t, _)| rty(t)).collect();
                 out.push_str("fn main() {\n    ail_rt::init(&AIL_LINES, AIL_FILE);\n");
-                if !em.kernels.is_empty() {
+                if !em.kernels.is_empty() && em.gpu_eager {
                     out.push_str("    ail_gpu::start();\n");
                 }
                 let call = format!("f_main({})", caps.join(", "));
@@ -976,6 +1018,9 @@ impl<'a> Emitter<'a> {
 
     /// Owned value of the expression.
     pub fn val(&mut self, e: &Expr) -> String {
+        if self.is_nt(e) {
+            return format!("ail_rt::Nar::w({})", self.nval(e));
+        }
         if let (ExprKind::Var(_), Res::Local(b)) = (&e.kind, &self.ck.res[e.id as usize]) {
             if let Some(k) = self.views.get(b) {
                 let n = self.local_name(&self.ck.bindings[*b].name);
@@ -999,6 +1044,9 @@ impl<'a> Emitter<'a> {
             if t == Ty::Str {
                 // The place may be a borrowed `str` (a param), which has no `clone`.
                 return format!("String::from(&{p}[..])");
+            }
+            if matches!(&t, Ty::Vec(et) if matches!(**et, Ty::Int(_) | Ty::F64 | Ty::F32 | Ty::Bool)) {
+                return format!("ail_rt::vclone(&{p})");
             }
             return format!("{p}.clone()");
         }
@@ -1127,14 +1175,22 @@ impl<'a> Emitter<'a> {
                     // `(fill n x)` made narrow; x out of range stops the fast run.
                     let b = self.ck.decl[&(e.id as usize)];
                     let nv = self.narrow_of(b).unwrap();
-                    let label = self.nr.as_ref().unwrap().label.clone();
+                    let (bail, dense, ety) = {
+                        let c = self.nr.as_ref().unwrap();
+                        (c.bail.clone(), c.dense, c.ety.clone())
+                    };
                     let ExprKind::Call(_, _, fa) = &value.kind else { unreachable!() };
                     let x = self.val(fa[1].expr());
                     let n = self.val(fa[0].expr());
+                    let make = if dense {
+                        format!("ail_rt::nar_fill::<{ety}>(__c, __x)")
+                    } else {
+                        format!("ail_rt::narrow_fill(__c, __x, {}, {})", nv.lo, nv.hi)
+                    };
                     writeln!(
                         o,
-                        "{m}let mut {}: Vec<i32> = {{ let __x: i64 = {x}; let __c = ail_rt::count({n}); match ail_rt::narrow_fill(__c, __x, {}, {}) {{ Some(__w) => __w, None => break {label} false }} }};",
-                        nv.name, nv.lo, nv.hi
+                        "{m}let mut {}: Vec<{ety}> = {{ let __x: i64 = {x}; let __c = ail_rt::count({n}); match {make} {{ Some(__w) => __w, None => {bail} }} }};",
+                        nv.name
                     )
                     .unwrap();
                     if last {
@@ -1163,6 +1219,16 @@ impl<'a> Emitter<'a> {
                         };
                         writeln!(o, "{m}let {name}: Vec<&str> = {v};").unwrap();
                     }
+                    if last {
+                        o.push_str("(
+");
+                    }
+                }
+                ExprKind::Let { mutable: false, value, .. } if self.nt_on && self.nt_binds.contains(&self.ck.decl[&(e.id as usize)]) => {
+                    let b = self.ck.decl[&(e.id as usize)];
+                    let name = self.local_name(&self.ck.bindings[b].name);
+                    let v = self.nval(value);
+                    writeln!(o, "{m}let {name}: {} = {v};", self.nt_ety).unwrap();
                     if last {
                         o.push_str("()\n");
                     }
@@ -1247,6 +1313,9 @@ impl<'a> Emitter<'a> {
         if let Some(code) = self.subst.get(&e.id) {
             return code.clone();
         }
+        if self.is_nt(e) {
+            return format!("ail_rt::Nar::w({})", self.nval(e));
+        }
         let t = self.ty(e).clone();
         match &e.kind {
             ExprKind::Int(v) => self.lit_int(*v, &t),
@@ -1269,13 +1338,36 @@ impl<'a> Emitter<'a> {
                 other => unreachable!("var resolved to {other:?}"),
             },
             ExprKind::Let { .. } => format!("{{ {} }}", self.block(std::slice::from_ref(e))),
+            ExprKind::Set(place, value) if self.narrow_at(place).is_some() && self.nr.as_ref().is_some_and(|c| c.dense) => {
+                // The value is already narrow, or is stored only if it fits.
+                let nv = self.narrow_at(place).unwrap();
+                let (bail, ety) = {
+                    let c = self.nr.as_ref().unwrap();
+                    (c.bail.clone(), c.ety.clone())
+                };
+                let ExprKind::Call(_, _, args) = &place.kind else { unreachable!() };
+                let v = if self.is_nt(value) {
+                    self.nval(value)
+                } else {
+                    let v = self.val(value);
+                    format!("match <{ety} as ail_rt::Nar>::fit({v}) {{ Some(__x) => __x, None => {bail} }}")
+                };
+                let slot = match self.unchecked.get(&place.id).cloned() {
+                    Some(c) => c,
+                    None => {
+                        let i = self.val(args[1].expr());
+                        format!("{}[ail_rt::Ix({i})]", nv.name)
+                    }
+                };
+                format!("{{ let __v: {ety} = {v}; {slot} = __v; }}")
+            }
             ExprKind::Set(place, value) if self.narrow_at(place).is_some() => {
                 // Stored narrow only if it stays in range; otherwise the fast run stops here.
                 let nv = self.narrow_at(place).unwrap();
                 let ExprKind::Call(_, _, args) = &place.kind else { unreachable!() };
                 let v = self.val(value);
                 let i = self.val(args[1].expr());
-                let label = self.nr.as_ref().unwrap().label.clone();
+                let label = self.nr.as_ref().unwrap().bail.clone();
                 let sure = self.nr.as_ref().unwrap().nocheck.contains(&e.id);
                 let fast = self.nr.as_ref().unwrap().unchecked.contains(&place.id);
                 if sure && fast {
@@ -1284,17 +1376,21 @@ impl<'a> Emitter<'a> {
                     format!("{{ let __v = {v}; let __i = ail_rt::Ix({i}); {}[__i] = __v as i32; }}", nv.name)
                 } else if fast {
                     format!(
-                        "{{ let __v = {v}; let __i = ({i}) as usize; if !unsafe {{ ail_rt::nput_unchecked(&mut {}, __i, __v, {}, {}) }} {{ break {label} false; }} }}",
+                        "{{ let __v = {v}; let __i = ({i}) as usize; if !unsafe {{ ail_rt::nput_unchecked(&mut {}, __i, __v, {}, {}) }} {{ {label}; }} }}",
                         nv.name, nv.lo, nv.hi
                     )
                 } else {
                     format!(
-                        "{{ let __v = {v}; let __i = ail_rt::ix({i}); if !ail_rt::nput(&mut {}, __i, __v, {}, {}) {{ break {label} false; }} }}",
+                        "{{ let __v = {v}; let __i = ail_rt::ix({i}); if !ail_rt::nput(&mut {}, __i, __v, {}, {}) {{ {label}; }} }}",
                         nv.name, nv.lo, nv.hi
                     )
                 }
             }
             ExprKind::Set(place, value) => {
+                if let Some(k) = self.counts.get(&e.id).cloned() {
+                    let p = self.place(place).expect("checked place");
+                    return format!("{{ {p} = {p}.wrapping_add({k}); }}");
+                }
                 if let Some(h) = self.par_hooks.get(&e.id).cloned() {
                     return self.par_update(h, place, value);
                 }
@@ -1332,6 +1428,11 @@ impl<'a> Emitter<'a> {
                         return code;
                     }
                 }
+                if self.dense_ok(e) {
+                    if let Some(code) = self.dense_region(e) {
+                        return code;
+                    }
+                }
                 // Kernels in the body may change what the condition reads: sync it each time.
                 let sync = if self.gpu_hooks() { self.gpu_sync_vars(c, false) } else { String::new() };
                 let c = self.val(c);
@@ -1352,6 +1453,11 @@ impl<'a> Emitter<'a> {
                 }
                 if self.narrow_ok() {
                     if let Some(code) = self.narrow_region(e) {
+                        return code;
+                    }
+                }
+                if self.dense_ok(e) {
+                    if let Some(code) = self.dense_region(e) {
                         return code;
                     }
                 }
@@ -1469,6 +1575,7 @@ impl<'a> Emitter<'a> {
             }
             ExprKind::Copy(inner) => match self.place(inner) {
                 Some(p) if t == Ty::Str => format!("String::from(&{p}[..])"),
+                Some(p) if matches!(&t, Ty::Vec(et) if matches!(**et, Ty::Int(_) | Ty::F64 | Ty::F32 | Ty::Bool)) => format!("ail_rt::vclone(&{p})"),
                 Some(p) => format!("{p}.clone()"),
                 None => self.rvalue(inner),
             },
@@ -1505,6 +1612,11 @@ impl<'a> Emitter<'a> {
     }
 
     fn user_call(&mut self, name: &str, args: &[Arg]) -> String {
+        if self.nr.as_ref().is_some_and(|c| c.dense) {
+            if let Some(code) = self.dense_call(name, args) {
+                return code;
+            }
+        }
         let sig = self.ck.info.fns[name].clone();
         let has_mut = sig.params.iter().any(|p| p.2);
         let mut pre = String::new();
@@ -1763,6 +1875,9 @@ impl<'a> Emitter<'a> {
                 }
             }
             "/" | "%" => format!("({} {name} {})", self.val(a(0)), self.val(a(1))),
+            "==" | "!=" | "<" | "<=" | ">" | ">=" if self.is_nt(a(0)) && self.is_nt(a(1)) => {
+                format!("({} {name} {})", self.nval(a(0)), self.nval(a(1)))
+            }
             "==" | "!=" | "<" | "<=" | ">" | ">=" => {
                 let ot = at(self, 0);
                 if self.is_copy(&ot) {
@@ -1833,8 +1948,8 @@ impl<'a> Emitter<'a> {
                 if self.nr_lam > 0 {
                     format!("ail_rt::hold_{name}(&{f})")
                 } else {
-                    let label = self.nr.as_ref().unwrap().label.clone();
-                    format!("{{ ail_rt::hold_{name}(&{f}); if ail_rt::hold_len() > (1 << 26) {{ break {label} false; }} }}")
+                    let bail = self.nr.as_ref().unwrap().bail.clone();
+                    format!("{{ ail_rt::hold_{name}(&{f}); if ail_rt::hold_len() > (1 << 26) {{ {bail}; }} }}")
                 }
             }
             "print" | "println" | "eprintln" => {
@@ -3249,6 +3364,9 @@ impl<'a> Emitter<'a> {
             // Each running chunk holds its own copies: no more chunks at once than cores.
             chunks = "2";
         }
+        if scratch.iter().map(|x| x.0).chain(hists.iter().map(|x| x.0)).any(|b| self.narrow_of(b).is_some()) {
+            return None;
+        }
         for (i, (b, kill)) in scratch.iter().enumerate() {
             let ty = rty(&self.ck.bindings[*b].ty);
             let k = format!("w{i}");
@@ -3355,9 +3473,26 @@ impl<'a> Emitter<'a> {
         for (id, c) in &unchecked {
             saved_unchecked.push((*id, self.unchecked.insert(*id, c.clone())));
         }
+        // In a dense region a chunk that must throw the run away notes it and stops; the
+        // whole run is thrown away after the loop.
+        let nbail = format!("__nb{}", whole.id);
+        let outer_bail = self.nr.as_ref().filter(|c| c.dense).map(|c| c.bail.clone());
+        if let Some(c) = self.nr.as_mut().filter(|c| c.dense) {
+            c.bail = format!("{{ {nbail}.store(true, std::sync::atomic::Ordering::Relaxed); return Default::default(); }}");
+        }
         self.in_par = true;
         let pbody = self.block(body);
         self.in_par = false;
+        if let (Some(c), Some(ob)) = (self.nr.as_mut(), outer_bail.as_ref()) {
+            c.bail = ob.clone();
+        }
+        let (nb_decl, nb_check) = match &outer_bail {
+            Some(ob) => (
+                format!("let {nbail} = std::sync::atomic::AtomicBool::new(false); "),
+                format!("if {nbail}.load(std::sync::atomic::Ordering::Relaxed) {{ {ob}; }} "),
+            ),
+            None => (String::new(), String::new()),
+        };
         self.par_hooks = saved_hooks;
         self.par_shared = saved_shared;
         for (id, old) in saved_unchecked {
@@ -3374,7 +3509,7 @@ impl<'a> Emitter<'a> {
         };
         self.no_par = was;
         let tuple = if ret.is_empty() { "()".to_string() } else { format!("({},)", ret.join(", ")) };
-        let gpu = if range.is_some() && self.gpu_on && hists.is_empty() && pushes.is_empty() && maxes.is_empty() && modsums.is_empty() && lasts.is_empty() && scratch.is_empty() && !prints {
+        let gpu = if range.is_some() && self.gpu_on && self.nr.is_none() && hists.is_empty() && pushes.is_empty() && maxes.is_empty() && modsums.is_empty() && lasts.is_empty() && scratch.is_empty() && !prints {
             self.gpu_attempt(whole.id, lv, body, &sums, &writes, &own_reads, &stale, &tests)
         } else {
             None
@@ -3385,8 +3520,8 @@ impl<'a> Emitter<'a> {
         let worth = format!("!__pdone && ail_rt::par_worth(__plo, __phi, {heavy})");
         let cond = std::iter::once(worth).chain(tests).collect::<Vec<_>>().join(" && ");
         pre.push_str(&format!(
-            "if {cond} {{ {setup}let __pr = ail_rt::par_for(__plo, __phi, {chunks}, &|__a: i64, __b: i64| {{ {privs}{head} let _ = {pbody}; }} {tuple} }}); \
-             if let Some(mut __parts) = __pr {{ let mut __ok = true; {combine_check}if __ok {{ {combine_ref}for __p in __parts.iter_mut() {{ let _ = &__p; {combine_own}}} __pdone = true; }} }} }} "
+            "if {cond} {{ {nb_decl}{setup}let __pr = ail_rt::par_for(__plo, __phi, {chunks}, &|__a: i64, __b: i64| {{ {privs}{head} let _ = {pbody}; }} {tuple} }}); \
+             {nb_check}if let Some(mut __parts) = __pr {{ let mut __ok = true; {combine_check}if __ok {{ {combine_ref}for __p in __parts.iter_mut() {{ let _ = &__p; {combine_own}}} __pdone = true; }} }} }} "
         ));
         if gpu.is_some() {
             // The CPU run after a kernel trap without backups must trap too.
@@ -3434,6 +3569,20 @@ impl<'a> Emitter<'a> {
         let k = crate::gpu::build(&inp);
         drop(inp);
         let k = k?;
+        // A cheap kernel that runs once (in main, outside any loop) never goes to the device
+        // the first time (see `ail_gpu::cold_ok`): opening the device for it would only cost,
+        // on another core while the program runs and again when it exits. Any other kernel
+        // has the device opened in the background as the program starts.
+        let once = k.cost < 256
+            && self.fn_name == "main"
+            && self.fn_defs.get("main").is_some_and(|f| {
+                let mut top = false;
+                for x in &f.body {
+                    walk_depth(x, 0, 0, &mut |e, d, lam| top |= e.id == loop_id && d == 0 && lam == 0);
+                }
+                top
+            });
+        self.gpu_eager |= !once;
         self.kernel_loops.insert(loop_id);
         self.kernel_fns.insert(self.fn_name.clone());
         let id = self.kernels.len();
@@ -4043,7 +4192,7 @@ impl<'a> Emitter<'a> {
         if !self.defer {
             return None;
         }
-        if !matches!(&place.kind, ExprKind::Call(n, _, xs) if n == "at" && xs.len() == 2) || self.par_hooks.contains_key(&th.id) {
+        if !matches!(&place.kind, ExprKind::Call(n, _, xs) if n == "at" && xs.len() == 2) || self.par_hooks.contains_key(&th.id) || self.narrow_at(place).is_some() {
             return None;
         }
         let slot = self.unchecked.get(&place.id)?.clone();
@@ -4112,7 +4261,7 @@ impl<'a> Emitter<'a> {
     /// can vectorize it; on overflow the loop runs again with every check and traps where it
     /// would have. If the test fails, the ordinary checked loop runs.
     fn for_unchecked(&mut self, lv: BindId, var: &str, lo: &str, hi: &str, a: &Expr, body: &[Expr]) -> Option<String> {
-        if self.nr.is_some() {
+        if self.nr.as_ref().is_some_and(|c| !c.dense) {
             return None;
         }
         let mut nested = false;
@@ -4246,10 +4395,82 @@ impl<'a> Emitter<'a> {
             }
         }
         let fixed_ref: &dyn Fn(&Expr) -> bool = &fixed;
+        // An index clamped at the edges, `(let cl (if (> j 0) (- j 1) 0))`: away from the edges
+        // the condition always picks the same branch, here `j - 1`. The fast iterations are
+        // narrowed to where it does, and there the let is just that branch (the condition only
+        // compares, so not evaluating it changes nothing). Each pick: (if id, branch, bound on
+        // j as (fixed side, offset terms of j, `>`-like?, +1?), offset nodes of the condition).
+        type Pick<'e> = (u32, &'e Expr, &'e Expr, Vec<(bool, &'e Expr)>, bool, bool);
+        let mut picks: Vec<Pick> = Vec::new();
+        let mut aff_nodes_pre: Vec<(u32, Vec<(bool, &Expr)>)> = Vec::new();
+        if !breaks_out(body) {
+            let mut ids: Vec<BindId> = lets.keys().copied().collect();
+            ids.sort_unstable();
+            for b in ids {
+                let v = lets[&b];
+                let ExprKind::If(c, th, Some(el)) = &v.kind else { continue };
+                let ExprKind::Call(op, _, cs) = &c.kind else { continue };
+                if cs.len() != 2 || !matches!(self.ck.res.get(c.id as usize), Some(Res::Builtin(_))) {
+                    continue;
+                }
+                let mut op = match op.as_str() {
+                    o @ ("<" | "<=" | ">" | ">=") => o,
+                    _ => continue,
+                };
+                let mut rec = Vec::new();
+                let (x, k) = if fixed(cs[1].expr()) {
+                    match offset(self, cs[0].expr(), lv, &lets, fixed_ref, 0, &mut rec) {
+                        Some(o) => (o, cs[1].expr()),
+                        None => continue,
+                    }
+                } else if fixed(cs[0].expr()) {
+                    match offset(self, cs[1].expr(), lv, &lets, fixed_ref, 0, &mut rec) {
+                        Some(o) => {
+                            op = match op { "<" => ">", "<=" => ">=", ">" => "<", _ => "<=" };
+                            (o, cs[0].expr())
+                        }
+                        None => continue,
+                    }
+                } else {
+                    continue;
+                };
+                // Only a fixed side that is a variable, a literal or a length plus or minus one
+                // of those: its value is tested to fit before the loop, as the program computes it.
+                fn simple(e: &Expr, d: u32) -> bool {
+                    match &e.kind {
+                        ExprKind::Int(_) | ExprKind::Var(_) => true,
+                        ExprKind::Call(n, _, xs) if n == "len" && xs.len() == 1 => true,
+                        ExprKind::Call(n, _, xs) if d == 0 && (n == "+" || n == "-") && xs.len() == 2 => {
+                            simple(xs[0].expr(), 1) && simple(xs[1].expr(), 1)
+                        }
+                        _ => false,
+                    }
+                }
+                if !simple(k, 0) {
+                    continue;
+                }
+                let mut scratch = Vec::new();
+                let ta = offset(self, th, lv, &lets, fixed_ref, 0, &mut scratch).is_some();
+                let ea = offset(self, el, lv, &lets, fixed_ref, 0, &mut scratch).is_some();
+                let (branch, op) = match (ta, ea) {
+                    (true, false) => (&**th, op),
+                    (false, true) => (&**el, match op { "<" => ">=", "<=" => ">", ">" => "<=", _ => "<" }),
+                    _ => continue,
+                };
+                // j + o op k: `>` gives j >= k - o + 1, `>=` j >= k - o, `<` j < k - o, `<=` j < k - o + 1.
+                let lower = op == ">" || op == ">=";
+                let plus1 = op == ">" || op == "<=";
+                aff_nodes_pre.extend(rec);
+                picks.push((v.id, branch, k, x, lower, plus1));
+                lets.insert(b, branch);
+            }
+        }
         // Each access: (id, vector, offset terms, index, write?, root).
         let mut plan: Vec<(u32, &Expr, Vec<(bool, &Expr)>, &Expr, bool, BindId)> = Vec::new();
         let mut row_tests: Vec<(&Expr, &Expr)> = Vec::new();
         let mut aff_nodes: Vec<(u32, Vec<(bool, &Expr)>)> = Vec::new();
+        let pre_ids: HashSet<u32> = aff_nodes_pre.iter().map(|x| x.0).collect();
+        aff_nodes.append(&mut aff_nodes_pre);
         for (rid, v, i) in accs {
             let root = path_ok(self, v, fixed_ref, &mut row_tests)?;
             if root == lv || inner.contains(&root) || !matches!(self.ty(v), Ty::Vec(_)) {
@@ -4258,6 +4479,9 @@ impl<'a> Emitter<'a> {
             let off = offset(self, i, lv, &lets, fixed_ref, 0, &mut aff_nodes)?;
             plan.push((rid, v, off, i, writes.contains(&rid), root));
         }
+        // Only the clamps that some index goes through narrow the fast iterations.
+        let used: HashSet<u32> = aff_nodes.iter().map(|x| x.0).filter(|id| !pre_ids.contains(id)).collect();
+        picks.retain(|p| used.contains(&p.1.id));
         // A written vector changes only through the planned element writes, and is reached
         // through one path only (it is borrowed mutably for the whole loop).
         let written: HashSet<BindId> = plan.iter().filter(|x| x.4).map(|x| x.5).collect();
@@ -4306,6 +4530,43 @@ impl<'a> Emitter<'a> {
                 return None;
             }
         }
+        // `(set x (+ x k))` with k > 0 and x from before the loop, the only change of x in the
+        // body (a count, often under an `if`): with x + n * (sum of the k) within the type,
+        // tested before the fast iterations, none of them can overflow, so they add without a
+        // check and the loop can vectorize. A parallel chunk's bound on its sum takes the
+        // whole n * k at once.
+        let mut counts: Vec<(u32, BindId, i128)> = Vec::new();
+        let mut other_sets: HashSet<BindId> = HashSet::new();
+        for x in body {
+            walk_ref(x, &mut |e| {
+                if let ExprKind::Set(pl, v) = &e.kind {
+                    let Some(Res::Local(b)) = (match &pl.kind {
+                        ExprKind::Var(_) => self.ck.res.get(pl.id as usize),
+                        _ => None,
+                    }) else {
+                        return;
+                    };
+                    let k = match &v.kind {
+                        ExprKind::Call(n, _, xs)
+                            if n == "+" && xs.len() == 2 && matches!(self.ck.res.get(v.id as usize), Some(Res::Builtin(_))) =>
+                        {
+                            match (&xs[0].expr().kind, self.ck.res.get(xs[0].expr().id as usize), &xs[1].expr().kind) {
+                                (ExprKind::Var(_), Some(Res::Local(y)), ExprKind::Int(k)) if y == b && *k > 0 => Some(*k),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    match k {
+                        Some(k) if !inner.contains(b) && matches!(self.ck.bindings[*b].ty, Ty::Int(_)) => counts.push((e.id, *b, k)),
+                        _ => {
+                            other_sets.insert(*b);
+                        }
+                    }
+                }
+            });
+        }
+        counts.retain(|c| !other_sets.contains(&c.1));
         // Deferred overflow: the body only computes, the vectors it writes are not read, and
         // outer variables it sets are plain values restored before the checked run.
         let reads_written = plan.iter().any(|x| !x.4 && written.contains(&x.5));
@@ -4351,7 +4612,10 @@ impl<'a> Emitter<'a> {
                 Some(n) => n.clone(),
                 None => self.pv(v),
             };
-            let elem = rty(&self.elem_ty(v));
+            let elem = match (&v.kind, self.narrow_of(*root)) {
+                (ExprKind::Var(_), Some(_)) => self.nr.as_ref().unwrap().ety.clone(),
+                _ => rty(&self.elem_ty(v)),
+            };
             let w = written.contains(root);
             let k = match slices.iter().position(|s| s.0 == place) {
                 Some(k) => k,
@@ -4386,6 +4650,26 @@ impl<'a> Emitter<'a> {
         // that run fast, so the fast copy computes it without a check.
         let mut aff_ids: HashSet<u32> = HashSet::new();
         let mut aff_t: Vec<String> = Vec::new();
+        // A clamped index leaves its edges to the checked iterations; the fixed side of its
+        // condition is computed once here and must fit, as the program computes it each time.
+        for (_, _, k, x, lower, plus1) in &picks {
+            let kw = wide(self, k);
+            let mut o = String::from("0i128");
+            for (plus, c) in x {
+                o.push_str(if *plus { " + " } else { " - " });
+                o.push_str(&wide(self, c));
+            }
+            let bound = format!("({kw}) - ({o}){}", if *plus1 { " + 1" } else { "" });
+            if *lower {
+                lows.push(bound);
+            } else {
+                highs.push(bound);
+            }
+            if let (ExprKind::Call(..), Ty::Int(ik)) = (&k.kind, self.ty(k)) {
+                let r = ik.rust();
+                aff_t.push(format!("({kw} >= ({r}::MIN as i128) && {kw} <= ({r}::MAX as i128))"));
+            }
+        }
         for (id, terms) in &aff_nodes {
             if !aff_ids.insert(*id) {
                 continue;
@@ -4398,6 +4682,23 @@ impl<'a> Emitter<'a> {
             }
             let r = k.rust();
             aff_t.push(format!("((__flo as i128) + ({o}) >= ({r}::MIN as i128) && (__fhi as i128) - 1 + ({o}) <= ({r}::MAX as i128))"));
+        }
+        let mut count_pre = String::new();
+        let mut counted: Vec<BindId> = Vec::new();
+        for (sid, b, _) in &counts {
+            if counted.contains(b) {
+                continue;
+            }
+            counted.push(*b);
+            let ktot: i128 = counts.iter().filter(|c| c.1 == *b).map(|c| c.2).sum();
+            let Ty::Int(ik) = self.ck.bindings[*b].ty.clone() else { continue };
+            let Some(ExprKind::Set(pl, _)) = find_expr(body, *sid).map(|x| &x.kind) else { continue };
+            let Some(place) = self.place(pl) else { continue };
+            let r = ik.rust();
+            aff_t.push(format!("(({place}) as i128) + ((__fhi as i128) - (__flo as i128)) * {ktot} <= ({r}::MAX as i128)"));
+            if let Some(ParHook::Sum(abs)) = self.par_hooks.get(sid) {
+                count_pre.push_str(&format!("{abs} = {abs}.saturating_add(((__fhi - __flo) as u64).saturating_mul({ktot})); "));
+            }
         }
         let aff_ok = if aff_t.is_empty() { String::from("true") } else { aff_t.join(" && ") };
         let was_aff = std::mem::replace(&mut self.affine, aff_ids);
@@ -4421,7 +4722,20 @@ impl<'a> Emitter<'a> {
         for (id, c) in codes {
             self.unchecked.insert(id, c);
         }
+        for (id, branch, ..) in &picks {
+            let code = self.val(branch);
+            self.subst.insert(*id, code);
+        }
+        for (sid, _, k) in &counts {
+            self.counts.insert(*sid, k.to_string());
+        }
         let fast = self.block(body);
+        for (id, ..) in &picks {
+            self.subst.remove(id);
+        }
+        for (sid, ..) in &counts {
+            self.counts.remove(sid);
+        }
         self.affine = was_aff;
         self.defer = was;
         for (id, old) in saved {
@@ -4435,7 +4749,7 @@ impl<'a> Emitter<'a> {
             // Split the range: checked iterations at the edges, where some access would be out
             // of range (an `(at v (- j 1))` guarded by `(> j 0)`, say), unchecked in between.
             let slow_in = |a: &str, b: &str| format!("for {var} in {a}..{b} {{ let _ = {slow}; }}");
-            let fast_loop = format!("for {var} in __flo..__fhi {{ let _ = unsafe {{ {fast} }}; }}");
+            let fast_loop = format!("{count_pre}for {var} in __flo..__fhi {{ let _ = unsafe {{ {fast} }}; }}");
             let fast_run = if defer {
                 let mut snap = String::new();
                 let mut restore = String::new();
@@ -4471,10 +4785,10 @@ impl<'a> Emitter<'a> {
                 restore.push_str(&format!("{pl} = __sn{k}; "));
             }
             format!(
-                "{snap}let __of = {{ {take}let mut __of = false; for {var} in __ulo..__uhi {{ let _ = unsafe {{ {fast} }}; }} __of }}; if __of {{ {restore}{slow_loop} }}"
+                "{snap}let __of = {{ {take}let mut __of = false; {count_pre}for {var} in __ulo..__uhi {{ let _ = unsafe {{ {fast} }}; }} __of }}; if __of {{ {restore}{slow_loop} }}"
             )
         } else {
-            format!("{take}for {var} in __ulo..__uhi {{ let _ = unsafe {{ {fast} }}; }}")
+            format!("{take}{count_pre}for {var} in __ulo..__uhi {{ let _ = unsafe {{ {fast} }}; }}")
         };
         Some(format!(
             "{{ let __ulo: i64 = {lo}; let __uhi: i64 = {hi}; let (__flo, __fhi) = (__ulo, __uhi); if __ulo < __uhi && {} && {aff_ok} {{ {fast_run} }} else {{ {slow_loop} }} }}",
@@ -4875,7 +5189,16 @@ impl<'a> Emitter<'a> {
             .iter()
             .map(|b| format!("ail_rt::widen_into(&mut {}, &{}); ", self.bind_place(*b), vecs[b].name))
             .collect();
-        self.nr = Some(NarrowCtx { label: label.clone(), vecs, unchecked: plan.unchecked, inner: plan.inner.iter().copied().collect(), nocheck });
+        self.nr = Some(NarrowCtx {
+            label: label.clone(),
+            vecs,
+            unchecked: plan.unchecked,
+            inner: plan.inner.iter().copied().collect(),
+            nocheck,
+            dense: false,
+            bail: format!("break {label} false"),
+            ety: "i32".into(),
+        });
         let was = self.no_par;
         self.no_par = true;
         let fast = self.rvalue(e);
@@ -5043,6 +5366,639 @@ impl<'a> Emitter<'a> {
 }
 
 /// An Ordering between two keys of type `k`, given as places of type K.
+/// What a dense region or fn copy found about one body (see `dense_scan`).
+#[derive(Default)]
+struct DScan {
+    decl: HashSet<BindId>,
+    /// I64 vectors made by `(fill n x)` inside.
+    fills: HashSet<BindId>,
+    /// Every occurrence of an I64 vector variable, and the ones that are fine on a narrow copy:
+    /// read or written with `at`, measured with `len`, or passed whole to a fn.
+    occ: Vec<(u32, BindId)>,
+    ok_occ: HashSet<u32>,
+    /// Vectors passed whole to a fn (an inner one then stays wide).
+    passed: HashSet<BindId>,
+    /// Calls of fns with I64 vector variables as arguments: (fn, [(position, vector)]).
+    calls: Vec<(String, Vec<(usize, BindId)>)>,
+    set_vars: HashSet<BindId>,
+    set_roots: HashSet<BindId>,
+    mut_roots: HashSet<BindId>,
+    /// Roots of `(mut ...)` arguments that are not a bare variable.
+    mut_deep: HashSet<BindId>,
+    bad: bool,
+}
+
+/// A dense region: the vectors it converts on entry (and writes back), the ones it makes
+/// inside, and the plain variables it may change.
+struct DensePlan {
+    outer: Vec<BindId>,
+    written: Vec<BindId>,
+    inner: Vec<BindId>,
+    scalars: Vec<BindId>,
+}
+
+impl<'a> Emitter<'a> {
+    fn is_nt(&self, e: &Expr) -> bool {
+        self.nt_on && self.nt.contains(&e.id)
+    }
+
+    /// Whether `e` is computed in the narrow element type: an element of a narrow vector, a
+    /// `let` of one, min or max of two, an `if` choosing between two, or a call of a fn made of
+    /// those (`tfn_ok`). These values are exactly the program's (min, max and comparisons do
+    /// not depend on the width), and LLVM vectorizes them where it cannot with I64.
+    fn t_of(&self, e: &Expr, binds: &HashSet<BindId>) -> bool {
+        match &e.kind {
+            ExprKind::Var(_) => matches!(self.ck.res.get(e.id as usize), Some(Res::Local(b)) if binds.contains(b)),
+            ExprKind::If(_, a, Some(b)) => self.t_of(a, binds) && self.t_of(b, binds),
+            ExprKind::Call(n, _, xs) => match self.ck.res.get(e.id as usize) {
+                Some(Res::Builtin(_)) if n == "at" => xs.len() == 2 && self.narrow_at(e).is_some(),
+                Some(Res::Builtin(_)) if n == "min" || n == "max" => {
+                    xs.len() == 2 && xs.iter().all(|x| matches!(x, Arg::Val(_)) && self.t_of(x.expr(), binds))
+                }
+                Some(Res::UserFn(f)) => {
+                    self.tfn_ok(f) && xs.iter().all(|x| matches!(x, Arg::Val(_)) && self.t_of(x.expr(), binds))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Finds the expressions of `roots` computed in the narrow type, and the `let`s bound to them.
+    fn nt_scan(&mut self, roots: &[&Expr], mut binds: HashSet<BindId>, ety: &str) {
+        loop {
+            let mut grew = false;
+            for r in roots {
+                walk_ref(r, &mut |e| {
+                    if let ExprKind::Let { mutable: false, value, .. } = &e.kind {
+                        if let Some(b) = self.ck.decl.get(&(e.id as usize)) {
+                            if self.ck.bindings[*b].ty == Ty::Int(IntK::I64) && !binds.contains(b) && self.t_of(value, &binds) {
+                                binds.insert(*b);
+                                grew = true;
+                            }
+                        }
+                    }
+                });
+            }
+            if !grew {
+                break;
+            }
+        }
+        let mut nt = HashSet::new();
+        for r in roots {
+            walk_ref(r, &mut |e| {
+                if self.ck.ty.get(e.id as usize) == Some(&Ty::Int(IntK::I64)) && self.t_of(e, &binds) {
+                    nt.insert(e.id);
+                }
+            });
+        }
+        self.nt = nt;
+        self.nt_binds = binds;
+        self.nt_on = true;
+        self.nt_ety = ety.to_string();
+    }
+
+    fn nt_off(&mut self) {
+        self.nt.clear();
+        self.nt_binds.clear();
+        self.nt_on = false;
+    }
+
+    /// The narrow-typed code of an expression `t_of` accepts.
+    fn nval(&mut self, e: &Expr) -> String {
+        match &e.kind {
+            ExprKind::Var(_) => match self.ck.res[e.id as usize] {
+                Res::Local(b) => self.bind_place(b),
+                _ => unreachable!("narrow variable"),
+            },
+            ExprKind::If(c, a, Some(b)) => {
+                let c = self.val(c);
+                let (a, b) = (self.nval(a), self.nval(b));
+                format!("(if {c} {{ {a} }} else {{ {b} }})")
+            }
+            ExprKind::Call(n, _, xs) => match self.ck.res[e.id as usize].clone() {
+                Res::Builtin(_) if n == "at" => {
+                    if let Some(code) = self.unchecked.get(&e.id) {
+                        return code.clone();
+                    }
+                    let nv = self.narrow_at(e).expect("narrow vector");
+                    let i = self.val(xs[1].expr());
+                    format!("{}[ail_rt::Ix({i})]", nv.name)
+                }
+                Res::Builtin(_) => {
+                    let (a, b) = (self.nval(xs[0].expr()), self.nval(xs[1].expr()));
+                    format!("std::cmp::{n}({a}, {b})")
+                }
+                Res::UserFn(f) => {
+                    if self.tfn_done.insert(f.clone()) {
+                        self.tfn_q.push(f.clone());
+                    }
+                    let parts: Vec<String> = xs.iter().map(|x| self.nval(x.expr())).collect();
+                    format!("{}__t({})", fn_name(&f), parts.join(", "))
+                }
+                _ => unreachable!("narrow call"),
+            },
+            _ => unreachable!("narrow expression"),
+        }
+    }
+
+    /// A fn of I64 parameters made only of min, max and `if`s on comparisons of them (a median
+    /// of three, a clamp between parameters): it has a copy generic over the element type.
+    fn tfn_ok(&self, f: &str) -> bool {
+        if let Some(r) = self.tfn_memo.borrow().get(f) {
+            return *r;
+        }
+        self.tfn_memo.borrow_mut().insert(f.to_string(), false);
+        let ok = (|| {
+            let fd = self.fn_defs.get(f)?;
+            let sig = self.ck.info.fns.get(f)?;
+            if !fd.type_params.is_empty() || !fd.requires.is_empty() || !fd.ensures.is_empty() || fd.body.len() != 1 {
+                return None;
+            }
+            if sig.ret != Ty::Int(IntK::I64) || sig.params.iter().any(|p| p.1 != Ty::Int(IntK::I64) || p.2) {
+                return None;
+            }
+            let binds: HashSet<BindId> = self.ck.fn_params.get(f)?.iter().copied().collect();
+            if !self.t_of(&fd.body[0], &binds) {
+                return None;
+            }
+            let mut conds_ok = true;
+            walk_ref(&fd.body[0], &mut |e| {
+                if let ExprKind::If(c, _, _) = &e.kind {
+                    conds_ok &= matches!(&c.kind, ExprKind::Call(n, _, xs) if matches!(n.as_str(), "<" | "<=" | ">" | ">=" | "==" | "!=")
+                        && matches!(self.ck.res.get(c.id as usize), Some(Res::Builtin(_)))
+                        && xs.iter().all(|x| self.t_of(x.expr(), &binds)));
+                }
+            });
+            conds_ok.then_some(())
+        })()
+        .is_some();
+        self.tfn_memo.borrow_mut().insert(f.to_string(), ok);
+        ok
+    }
+
+    fn dense_ok(&self, e: &Expr) -> bool {
+        self.nr.is_none()
+            && !self.nr_off
+            && !self.in_par
+            && !self.defer
+            && !self.no_par
+            && !self.web
+            && self.nr_lam == 0
+            && !self.has_gpu(e)
+    }
+
+    /// Collects what `dense_plan` and `dense_fn_ok` look at in a body.
+    fn dense_scan(&self, roots: &[&Expr], prints_ok: bool) -> DScan {
+        let i64v = |t: &Ty| matches!(t, Ty::Vec(et) if **et == Ty::Int(IntK::I64));
+        let var_of = |e: &Expr| -> Option<BindId> {
+            match (&e.kind, self.ck.res.get(e.id as usize)) {
+                (ExprKind::Var(_), Some(Res::Local(b))) => Some(*b),
+                _ => None,
+            }
+        };
+        let mut s = DScan::default();
+        for r in roots {
+            walk_depth(r, 0, 0, &mut |e, _, _| {
+                if let Some(&b) = self.ck.decl.get(&(e.id as usize)) {
+                    s.decl.insert(b);
+                    if let ExprKind::Let { value, .. } = &e.kind {
+                        if let ExprKind::Call(n, _, fa) = &value.kind {
+                            if n == "fill" && fa.len() == 2 && matches!(self.ck.res.get(value.id as usize), Some(Res::Builtin(_))) && i64v(&self.ck.bindings[b].ty) {
+                                s.fills.insert(b);
+                            }
+                        }
+                    }
+                }
+                match &e.kind {
+                    ExprKind::Return(_) | ExprKind::Try(_) | ExprKind::Tasks(..) | ExprKind::Lambda(..) => s.bad = true,
+                    ExprKind::Match(_, arms) => {
+                        for arm in arms {
+                            pat_binds(&arm.pat, self.ck, self.epoch, &mut s.decl);
+                        }
+                    }
+                    ExprKind::Var(_) => {
+                        if let Some(b) = var_of(e) {
+                            if i64v(&self.ck.bindings[b].ty) {
+                                s.occ.push((e.id, b));
+                            }
+                        }
+                    }
+                    ExprKind::Set(pl, _) => match &pl.kind {
+                        ExprKind::Var(_) => match var_of(pl) {
+                            Some(b) => {
+                                s.set_vars.insert(b);
+                            }
+                            None => s.bad = true,
+                        },
+                        _ => match self.root_of(pl) {
+                            Some(r) => {
+                                s.set_roots.insert(r);
+                            }
+                            None => s.bad = true,
+                        },
+                    },
+                    ExprKind::Call(n, _, args) => {
+                        let caps = args.iter().any(|a| matches!(self.ty(a.expr()), Ty::Cap(_)));
+                        match self.ck.res.get(e.id as usize) {
+                            Some(Res::Builtin(_)) => match n.as_str() {
+                                "at" | "len" if !args.is_empty() => {
+                                    if var_of(args[0].expr()).is_some() {
+                                        s.ok_occ.insert(args[0].expr().id);
+                                    }
+                                }
+                                "print" | "println" if prints_ok => {
+                                    s.bad |= !matches!(self.ty(args[0].expr()), Ty::Cap(crate::types::Cap::Console))
+                                        || args[1..].iter().any(|a| matches!(self.ty(a.expr()), Ty::Cap(_)));
+                                }
+                                _ => s.bad |= caps || matches!(n.as_str(), "print" | "println" | "eprintln" | "par-map" | "par-run" | "http-serve" | "http-request" | "send" | "recv"),
+                            },
+                            Some(Res::UserFn(f)) => {
+                                s.bad |= caps;
+                                let mut vs = Vec::new();
+                                for (i, a) in args.iter().enumerate() {
+                                    if let Some(b) = var_of(a.expr()) {
+                                        if i64v(&self.ck.bindings[b].ty) {
+                                            s.ok_occ.insert(a.expr().id);
+                                            s.passed.insert(b);
+                                            vs.push((i, b));
+                                        }
+                                    }
+                                }
+                                if !vs.is_empty() {
+                                    s.calls.push((f.clone(), vs));
+                                }
+                            }
+                            Some(Res::Variant(..)) => {}
+                            _ => s.bad = true,
+                        }
+                        for a in args {
+                            if let Arg::Mut(m, _) = a {
+                                match self.root_of(m) {
+                                    Some(r) => {
+                                        s.mut_roots.insert(r);
+                                        if var_of(m).is_none() {
+                                            s.mut_deep.insert(r);
+                                        }
+                                    }
+                                    None => s.bad = true,
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        }
+        s
+    }
+
+    /// The vectors of `s` that a narrow copy can stand for: every occurrence is fine, not
+    /// changed as a whole, and (for one made inside) not passed to a fn.
+    fn dense_fit(&self, s: &DScan, b: BindId) -> bool {
+        s.occ.iter().filter(|o| o.1 == b).all(|o| s.ok_occ.contains(&o.0))
+            && !s.set_vars.contains(&b)
+            && !s.mut_deep.contains(&b)
+    }
+
+    fn mask_of(vs: &[(usize, BindId)], narrowed: &dyn Fn(BindId) -> bool) -> u64 {
+        vs.iter().filter(|(i, b)| *i < 64 && narrowed(*b)).map(|(i, _)| 1u64 << i).sum()
+    }
+
+    /// Whether fn `f` can run with the vector parameters in `mask` narrow: they are only
+    /// indexed, measured or passed on to fns that can do the same; it takes no capabilities or
+    /// functions, does not return early, and keeps no device copies.
+    fn dense_fn_ok(&self, f: &str, mask: u64, stack: &mut Vec<(String, u64)>) -> bool {
+        if stack.iter().any(|x| x.0 == f && x.1 == mask) {
+            return true;
+        }
+        let Some(fd) = self.fn_defs.get(f) else { return false };
+        let Some(sig) = self.ck.info.fns.get(f) else { return false };
+        if !fd.type_params.is_empty() || !fd.ensures.is_empty() || self.view_fns.contains_key(f) || (self.pass2 && self.aware.contains(f)) {
+            return false;
+        }
+        if sig.params.iter().any(|p| matches!(p.1, Ty::Cap(_) | Ty::Fn(..))) {
+            return false;
+        }
+        let Some(pbinds) = self.ck.fn_params.get(f) else { return false };
+        let roots: Vec<&Expr> = fd.requires.iter().chain(fd.body.iter()).collect();
+        let s = self.dense_scan(&roots, false);
+        if s.bad {
+            return false;
+        }
+        let mut narrowed: HashSet<BindId> = HashSet::new();
+        for (i, b) in pbinds.iter().enumerate() {
+            if i < 64 && mask & (1 << i) != 0 {
+                if sig.params[i].1 != Ty::Vec(Box::new(Ty::Int(IntK::I64))) || !self.dense_fit(&s, *b) {
+                    return false;
+                }
+                narrowed.insert(*b);
+            }
+        }
+        for b in &s.fills {
+            if self.dense_fit(&s, *b) && !s.passed.contains(b) {
+                narrowed.insert(*b);
+            }
+        }
+        stack.push((f.to_string(), mask));
+        let mut ok = true;
+        for (g, vs) in &s.calls {
+            let m = Self::mask_of(vs, &|b| narrowed.contains(&b));
+            if m != 0 && !self.dense_fn_ok(g, m, stack) {
+                ok = false;
+                break;
+            }
+        }
+        stack.pop();
+        ok
+    }
+
+    /// A loop that calls fns with I64 vectors which they only index (a filter over an image
+    /// applied T times, a step of a cellular automaton) is limited by moving 8 bytes per
+    /// element, and its min/max/compare arithmetic cannot vectorize on I64. When every element
+    /// fits in u8, i16 or i32 (tested on entry), the loop runs on copies of that width and the
+    /// fns it calls on copies made for it (generic over the width); the copies that changed
+    /// are written back at the end. A store that does not fit throws the run away and the loop
+    /// runs again as written, as for the graph walks of `narrow_region`.
+    fn dense_plan(&self, whole: &Expr) -> Option<DensePlan> {
+        let s = self.dense_scan(&[whole], true);
+        if s.bad {
+            return None;
+        }
+        let outer = |b: &BindId| !s.decl.contains(b);
+        let mut scalars: Vec<BindId> = s.set_vars.iter().filter(|b| outer(b)).copied().collect();
+        scalars.sort_unstable();
+        for b in &scalars {
+            if !matches!(self.ck.bindings[*b].ty, Ty::Int(_) | Ty::F64 | Ty::F32 | Ty::Bool) {
+                return None;
+            }
+        }
+        let cand = |b: BindId| -> bool {
+            self.dense_fit(&s, b)
+                && if s.decl.contains(&b) {
+                    s.fills.contains(&b) && !s.passed.contains(&b)
+                } else {
+                    matches!(self.ck.bindings[b].kind, BindKind::Local { .. } | BindKind::Param { .. }) && !self.views.contains_key(&b)
+                }
+        };
+        let mut seen: Vec<BindId> = s.occ.iter().map(|o| o.1).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        let narrowed: HashSet<BindId> = seen.iter().copied().filter(|b| cand(*b)).collect();
+        // Whatever the loop changes from outside must be a narrow copy or a plain variable.
+        if s.set_roots.iter().chain(s.mut_roots.iter()).any(|r| outer(r) && !narrowed.contains(r)) {
+            return None;
+        }
+        let mut any = false;
+        let mut stack = Vec::new();
+        for (g, vs) in &s.calls {
+            let m = Self::mask_of(vs, &|b| narrowed.contains(&b));
+            if m != 0 {
+                if !self.dense_fn_ok(g, m, &mut stack) {
+                    return None;
+                }
+                any = true;
+            }
+        }
+        if !any {
+            return None;
+        }
+        let mut outer_n: Vec<BindId> = narrowed.iter().copied().filter(|b| outer(b)).collect();
+        outer_n.sort_unstable();
+        let mut inner: Vec<BindId> = narrowed.iter().copied().filter(|b| !outer(b)).collect();
+        inner.sort_unstable();
+        let written: Vec<BindId> = outer_n.iter().copied().filter(|b| s.set_roots.contains(b) || s.mut_roots.contains(b)).collect();
+        if outer_n.is_empty() {
+            return None;
+        }
+        Some(DensePlan { outer: outer_n, written, inner, scalars })
+    }
+
+    fn dense_region(&mut self, e: &Expr) -> Option<String> {
+        let plan = self.dense_plan(e)?;
+        let k = e.id;
+        let label = format!("'__nd{k}");
+        let lim = |s: &str| NarrowVec { name: s.to_string(), lo: "<$T as ail_rt::Nar>::LO".into(), hi: "<$T as ail_rt::Nar>::HI".into() };
+        let mut vecs: HashMap<BindId, NarrowVec> = HashMap::new();
+        for &b in plan.outer.iter().chain(plan.inner.iter()) {
+            vecs.insert(b, lim(&format!("__nv{b}")));
+        }
+        let size = {
+            let lens: Vec<String> = plan.outer.iter().map(|b| format!("{}.len()", self.bind_place(*b))).collect();
+            format!("({}) >= (1 << 15)", lens.join(" + "))
+        };
+        let slices: Vec<String> = plan.outer.iter().map(|b| format!("&{}[..]", self.bind_place(*b))).collect();
+        let convs: String = plan
+            .outer
+            .iter()
+            .map(|b| format!("let mut __nv{b}: Vec<$T> = ail_rt::nar_to::<$T>(&{}); ", self.bind_place(*b)))
+            .collect();
+        let back: String = plan
+            .written
+            .iter()
+            .map(|b| format!("ail_rt::nar_back(&mut {}, &__nv{b}); ", self.bind_place(*b)))
+            .collect();
+        let mut snap = String::new();
+        let mut restore = String::new();
+        for (i, b) in plan.scalars.iter().enumerate() {
+            let pl = self.bind_place(*b);
+            snap.push_str(&format!("let __ns{k}_{i} = {pl}; "));
+            restore.push_str(&format!("{pl} = __ns{k}_{i}; "));
+        }
+        self.nr = Some(NarrowCtx {
+            label: label.clone(),
+            vecs,
+            unchecked: HashSet::new(),
+            inner: plan.inner.iter().copied().collect(),
+            nocheck: HashSet::new(),
+            dense: true,
+            bail: format!("break {label} false"),
+            ety: "$T".into(),
+        });
+        self.nt_scan(&[e], HashSet::new(), "$T");
+        let was = self.no_par;
+        self.no_par = true;
+        let fast = self.rvalue(e);
+        self.no_par = was;
+        self.nr = None;
+        self.nt_off();
+        let was_off = self.nr_off;
+        self.nr_off = true;
+        let slow = self.rvalue(e);
+        self.nr_off = was_off;
+        Some(format!(
+            "{{ let mut __nrd{k} = false; if {size} {{ macro_rules! __nr{k} {{ ($T:ty) => {{{{ {convs}{snap}let __nh{k} = ail_rt::hold_begin(); \
+             let __nok{k}: bool = {label}: {{ let _ = {fast}; true }}; \
+             if __nok{k} {{ ail_rt::hold_commit(); {back}true }} else {{ ail_rt::hold_discard(__nh{k}); {restore}false }} }}}} }} \
+             __nrd{k} = match ail_rt::nar_width(&[{}]) {{ 1 => __nr{k}!(u8), 2 => __nr{k}!(i16), 4 => __nr{k}!(i32), _ => false }}; }} \
+             if !__nrd{k} {{ let _ = {slow}; }} }}",
+            slices.join(", ")
+        ))
+    }
+
+    /// A call inside a dense region or fn copy with narrow vectors among its arguments: the
+    /// copy of the fn made for them, which gives None when its run must be thrown away.
+    fn dense_call(&mut self, name: &str, args: &[Arg]) -> Option<String> {
+        let mut mask = 0u64;
+        for (i, a) in args.iter().enumerate() {
+            if let (ExprKind::Var(_), Some(Res::Local(b))) = (&a.expr().kind, self.ck.res.get(a.expr().id as usize)) {
+                if i < 64 && self.narrow_of(*b).is_some() {
+                    mask |= 1 << i;
+                }
+            }
+        }
+        if mask == 0 {
+            return None;
+        }
+        let sig = self.ck.info.fns[name].clone();
+        let has_mut = sig.params.iter().any(|p| p.2);
+        let (bail, ety) = {
+            let c = self.nr.as_ref().unwrap();
+            (c.bail.clone(), c.ety.clone())
+        };
+        let mut pre = String::new();
+        let mut parts = Vec::new();
+        for (i, (a, (_, pt, pm))) in args.iter().zip(sig.params.iter()).enumerate() {
+            let x = a.expr();
+            if mask & (1 << i) != 0 {
+                let p = self.place(x).expect("narrow vector");
+                parts.push(if *pm { format!("&mut {p}") } else { format!("&{p}") });
+            } else if *pm {
+                let p = self.place(x).expect("checked mutable place");
+                parts.push(format!("&mut {p}"));
+            } else if self.is_copy(pt) {
+                let v = self.val(x);
+                if has_mut {
+                    let t = self.fresh();
+                    write!(pre, "let {t} = {v}; ").unwrap();
+                    parts.push(t);
+                } else {
+                    parts.push(v);
+                }
+            } else {
+                match self.place(x) {
+                    Some(p) => parts.push(format!("&{p}")),
+                    None => {
+                        let v = self.rvalue(x);
+                        let t = self.fresh();
+                        write!(pre, "let {t} = {v}; ").unwrap();
+                        parts.push(format!("&{t}"));
+                    }
+                }
+            }
+        }
+        if self.dense_done.insert((name.to_string(), mask)) {
+            self.dense_q.push((name.to_string(), mask));
+        }
+        let sv = if (0..64).any(|k| self.strvec_params.contains(&(name.to_string(), k))) { ", _" } else { "" };
+        Some(format!(
+            "{{ {pre}match {}__d{mask}::<{ety}{sv}>({}) {{ Some(__x) => __x, None => {bail} }} }}",
+            fn_name(name),
+            parts.join(", ")
+        ))
+    }
+
+    /// Emits the fn copies dense regions asked for (which may ask for more).
+    fn emit_dense_fns(&mut self, out: &mut String) {
+        loop {
+            if let Some((f, mask)) = self.dense_q.pop() {
+                self.emit_dense_fn(&f, mask, out);
+            } else if let Some(f) = self.tfn_q.pop() {
+                self.emit_tfn(&f, out);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn emit_dense_fn(&mut self, name: &str, mask: u64, out: &mut String) {
+        let fd = self.fn_defs[name].clone();
+        let sig = self.ck.info.fns[name].clone();
+        self.epoch = self.ck.fn_epoch.get(name).copied().unwrap_or(0);
+        self.moves = compute_moves(&fd.body, self.ck);
+        self.views.clear();
+        self.view_roots.clear();
+        self.plan_views(&fd.body);
+        self.fn_name = name.to_string();
+        self.cur_view = None;
+        self.mirrors.clear();
+        self.viewed.clear();
+        let pbinds = self.ck.fn_params.get(name).cloned().unwrap_or_default();
+        self.strvec_pbinds = (0..pbinds.len())
+            .filter(|k| self.strvec_params.contains(&(name.to_string(), *k)))
+            .map(|k| pbinds[k])
+            .collect();
+        let roots: Vec<&Expr> = fd.requires.iter().chain(fd.body.iter()).collect();
+        let s = self.dense_scan(&roots, false);
+        let lim = |s: String| NarrowVec { name: s, lo: "<T as ail_rt::Nar>::LO".into(), hi: "<T as ail_rt::Nar>::HI".into() };
+        let mut vecs: HashMap<BindId, NarrowVec> = HashMap::new();
+        let mut params: Vec<String> = Vec::new();
+        for (i, (p, (_, t, m))) in fd.params.iter().zip(sig.params.iter()).enumerate() {
+            let n = self.local_name(&p.name);
+            if i < 64 && mask & (1 << i) != 0 {
+                params.push(format!("{n}: {}Vec<T>", if *m { "&mut " } else { "&" }));
+                vecs.insert(pbinds[i], lim(self.bind_place(pbinds[i])));
+            } else if self.strvec_params.contains(&(name.to_string(), i)) {
+                // As in the fn itself: its callers may hold `&[String]` or `&[&str]`.
+                params.push(format!("{n}: &[AilS]"));
+            } else {
+                params.push(format!("{n}: {}", self.param_rty(t, *m)));
+            }
+        }
+        let mut inner = HashSet::new();
+        let mut fills: Vec<BindId> = s.fills.iter().copied().collect();
+        fills.sort_unstable();
+        for b in fills {
+            if self.dense_fit(&s, b) && !s.passed.contains(&b) {
+                inner.insert(b);
+                vecs.insert(b, lim(self.bind_place(b)));
+            }
+        }
+        self.nr = Some(NarrowCtx {
+            label: String::new(),
+            vecs,
+            unchecked: HashSet::new(),
+            inner,
+            nocheck: HashSet::new(),
+            dense: true,
+            bail: "return None".into(),
+            ety: "T".into(),
+        });
+        self.nt_scan(&roots, HashSet::new(), "T");
+        let ret = rty(&sig.ret);
+        let sgen = if self.strvec_pbinds.is_empty() { "" } else { ", AilS: std::ops::Deref<Target = str> + Sync" };
+        writeln!(out, "fn {}__d{mask}<T: ail_rt::Nar{sgen}>({}) -> Option<{ret}> {{", fn_name(name), params.join(", ")).unwrap();
+        for r in &fd.requires {
+            let c = self.val(r);
+            writeln!(
+                out,
+                "    {}if !({c}) {{ ail_rt::contract(\"requires\", {:?}, {:?}); }}",
+                self.mark(r),
+                name,
+                self.src_of(r)
+            )
+            .unwrap();
+        }
+        let tail = if sig.ret == Ty::Unit { Tail::Unit } else { Tail::Val };
+        let body = self.block_tail(&fd.body, tail);
+        writeln!(out, "    let __r: {ret} = {body};\n    Some(__r)\n}}").unwrap();
+        self.nr = None;
+        self.nt_off();
+    }
+
+    fn emit_tfn(&mut self, name: &str, out: &mut String) {
+        let fd = self.fn_defs[name].clone();
+        self.epoch = self.ck.fn_epoch.get(name).copied().unwrap_or(0);
+        self.fn_name = name.to_string();
+        let pbinds: HashSet<BindId> = self.ck.fn_params.get(name).cloned().unwrap_or_default().into_iter().collect();
+        let params: Vec<String> = fd.params.iter().map(|p| format!("{}: T", self.local_name(&p.name))).collect();
+        self.nt_scan(&[&fd.body[0]], pbinds, "T");
+        let body = self.nval(&fd.body[0]);
+        self.nt_off();
+        writeln!(out, "#[inline(always)]\nfn {}__t<T: Copy + Ord>({}) -> T {{\n    {body}\n}}", fn_name(name), params.join(", ")).unwrap();
+    }
+}
+
 fn key_cmp(k: &Ty, a: &str, b: &str) -> String {
     match k {
         Ty::F32 | Ty::F64 => format!("({a}).total_cmp(&{b})"),

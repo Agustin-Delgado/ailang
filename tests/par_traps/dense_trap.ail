@@ -1,0 +1,41 @@
+; A trap inside a fn that a dense region runs on u8 copies of its vectors (a filter applied
+; several times, rows in parallel): the lines printed before, and the trap, are the sequential
+; ones. On the fourth pass one row reads past the end of the image.
+
+(fn pass (params (src (Vec I64)) (dst (mut (Vec I64))) (w I64) (h I64) (bad I64)) (returns I64)
+  (body
+    (var changed 0)
+    (for r (range 0 h)
+      (let up (if (> r 0) (- r 1) 0))
+      (let dn (if (== r bad) h (if (< r (- h 1)) (+ r 1) (- h 1))))
+      (var lo (fill w 0))
+      (for c (range 0 w)
+        (let x (at src (+ (* up w) c)))
+        (let y (at src (+ (* r w) c)))
+        (let z (at src (+ (* dn w) c))) ; traps here
+        (set (at lo c) (max x (min y z))))
+      (for c (range 0 w)
+        (let cl (if (> c 0) (- c 1) 0))
+        (let v (min (at lo cl) (at lo c)))
+        (if (!= v (at src (+ (* r w) c))) (set changed (+ changed 1)))
+        (set (at dst (+ (* r w) c)) v)))
+    changed))
+
+(fn main (params (con Console))
+  (body
+    (let w 600)
+    (let h 600)
+    (var a (fill (* w h) 0))
+    (var x 7)
+    (for i (range 0 (* w h))
+      (set x (% (+ (* x 1103515245) 12345) 2147483648))
+      (set (at a i) (% (/ x 7) 256)))
+    (var b (fill (* w h) 0))
+    (var k 0)
+    (while (< k 6)
+      (let bad (if (== k 3) 450 -1))
+      (var d 0)
+      (if (== (% k 2) 0) (set d (pass a (mut b) w h bad)) (set d (pass b (mut a) w h bad)))
+      (println con "pass " k " changed " d)
+      (set k (+ k 1)))
+    (println con "done")))
