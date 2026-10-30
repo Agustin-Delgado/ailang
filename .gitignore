@@ -28,3 +28,6 @@ experiment/r6_tasks.py
 experiment/tasks_r7/*/tests/
 experiment/tasks_r7/*/perf/
 experiment/r7_tasks.py
+experiment/tasks_r8/*/tests/
+experiment/tasks_r8/*/perf/
+experiment/r8_tasks.py
