@@ -313,28 +313,37 @@ the second adds only what came after it: the cheap-kernel rule for the GPU and t
 pow and thread-pool changes above (`r7_perf_now.json`). The machine was noisier during the first
 run (the Rust times are about twice the second run's), so compare the ratios, not the seconds.
 
-| model | task | base | now |
-|---|---|---|---|
-| Opus | logstats | 1.37 | 1.52 |
-| Opus | median | 5.39 | 2.01 |
-| Opus | mst | 1.02 | 1.07 |
-| Opus | nonce | 0.18 | 0.21 |
-| Opus | particles | 0.90 | 0.71 |
-| Opus | patterns | 1.15 | 0.85 |
-| Opus | rooms | 1.05 | 1.18 |
-| Opus | terrain | 2.38 | 2.01 |
-| Sonnet | logstats | 1.51 | 1.42 |
-| Sonnet | median | 1.18 | 0.76 |
-| Sonnet | mst | 1.79 | 1.74 |
-| Sonnet | nonce | 1.27 | 2.01 |
-| Sonnet | particles | 0.39 | 0.31 |
-| Sonnet | patterns | 0.72 | 0.55 |
-| Sonnet | rooms | 2.34 | 1.79 |
-| Sonnet | terrain | 1.42 | 1.24 |
-| | **geometric mean** | **1.18** | **1.02** |
+| model | task | base | now | later |
+|---|---|---|---|---|
+| Opus | logstats | 1.37 | 1.52 | 1.40 |
+| Opus | median | 5.39 | 2.01 | 1.02 |
+| Opus | mst | 1.02 | 1.07 | 0.92 |
+| Opus | nonce | 0.18 | 0.21 | 0.17 |
+| Opus | particles | 0.90 | 0.71 | 0.93 |
+| Opus | patterns | 1.15 | 0.85 | 1.18 |
+| Opus | rooms | 1.05 | 1.18 | 1.16 |
+| Opus | terrain | 2.38 | 2.01 | 1.89 |
+| Sonnet | logstats | 1.51 | 1.42 | 0.89 |
+| Sonnet | median | 1.18 | 0.76 | 0.81 |
+| Sonnet | mst | 1.79 | 1.74 | 1.14 |
+| Sonnet | nonce | 1.27 | 2.01 | 0.94 |
+| Sonnet | particles | 0.39 | 0.31 | 0.44 |
+| Sonnet | patterns | 0.72 | 0.55 | 0.40 |
+| Sonnet | rooms | 2.34 | 1.79 | 1.28 |
+| Sonnet | terrain | 1.42 | 1.24 | 1.27 |
+| | **geometric mean** | **1.18** | **1.02** | **0.88** |
 
 On tasks it had never seen, ail is about as fast as Rust written by the same model, and faster in
 6 of 16. That is short of r6's 0.86, which is the honest number to quote for unseen code.
+
+The "later" column (`r7_perf_r8.json`, best of 5) is the compiler after the work that r7 prompted:
+nested parallel loops (Sonnet nonce), one comparison per vector index, vectors of string views and
+a byte-wise split (logstats, mst, rooms), and loops that run on narrow copies of I64 vectors when
+every element fits a smaller width (Opus median, 2.01 -> 1.02). These changes were made after
+seeing these programs, so 0.88 is not a held-out number. What is left: terrain keeps I64 distances
+with a 1e18 sentinel where the Rust uses u32, and rooms and Opus logstats still trail. Single
+rows moved by up to 0.3 between runs on this machine (Opus patterns, particles), so read the
+mean, not single rows.
 
 What the run showed:
 
