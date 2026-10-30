@@ -68,6 +68,14 @@ machine lines to source lines that is read only when a trap happens.
   the edges run checked. If that loop only computes, its integer operations record overflow in a
   flag instead of branching, so LLVM can vectorize it; on overflow that part runs again checked
   and traps where it would have.
+- A loop whose inner loops index vectors with values read from other vectors (a graph walk over
+  offsets and adjacency lists) is bound by memory. It runs on 32-bit copies of its I64 vectors,
+  made on entry, and a vector whose elements serve as indices of another keeps them within that
+  one's length (checked on entry and at every store), so those reads need no bounds check. A
+  store that does not fit stops the fast run: what it printed was held and is dropped, the
+  variables it changed are put back, and the loop runs again as written. The fast run computes
+  the same values in the same order, so a trap inside it is the program's own trap.
+- `(pow 2 e)` is a shift while the result fits, the ordinary checked pow beyond.
 
 ## 7. Strings are values, read in place
 
@@ -141,6 +149,9 @@ thread pool, with no change to the program:
   (on the GPU, a device copy made at launch);
 - a scratch vector that every iteration overwrites before reading gets one copy per chunk;
 - `push` and `print` collect per chunk and are appended in iteration order.
+
+A loop of a few heavy iterations that do not split evenly over the cores (16 on 12) gives each
+one a thread of its own, so the cores share the last ones instead of letting them run alone.
 
 If any chunk traps, the parallel run is thrown away and the loop runs again sequentially, so the
 output and the trap are exactly the sequential ones. A loop that already uses `par-map` keeps that

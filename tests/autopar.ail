@@ -312,3 +312,34 @@
     (set (at b i) (% (+ (at b i) (at b (- i k))) 1000003))
     (set i (+ i 1)))
   (assert (== a b)))
+
+; A few heavy iterations that do not split evenly over the cores: each gets its own thread
+; (twice in a row, so the extra threads, kept by the pool, are reused).
+(test "a few heavy iterations each on a thread of its own"
+  (for round (range 0 2)
+    (let iters (+ 13 (* round 4)))
+    (var total 0)
+    (for i (range 0 iters)
+      (var s 0)
+      (for j (range 0 200000) (set s (+ s (work (+ (* i 1000) (% j 97)))))) 
+      (set total (+ total s)))
+    (var t2 0)
+    (var i 0)
+    (while (< i iters)
+      (var s 0)
+      (var j 0)
+      (while (< j 200000)
+        (set s (+ s (work (+ (* i 1000) (% j 97)))))
+        (set j (+ j 1)))
+      (set t2 (+ t2 s))
+      (set i (+ i 1)))
+    (assert (== total t2))))
+
+(test "pow of two is a shift while it fits"
+  (var p 1)
+  (for e (range 0 63)
+    (assert (== (pow 2 (as U32 e)) p))
+    (if (< e 62) (set p (* p 2))))
+  (assert (== (pow (as U8 2) (as U32 7)) (as U8 128)))
+  (assert (== (pow (as I32 2) (as U32 30)) (as I32 1073741824)))
+  (assert (== (pow (as U64 2) (as U32 63)) (* (as U64 4611686018427387904) (as U64 2)))))

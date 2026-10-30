@@ -1,0 +1,64 @@
+; No trap: a graph walk that runs on 32-bit copies of its vectors (on the CPU) until, on the
+; third source, distances no longer fit in 32 bits. That run is thrown away with what it printed,
+; and the loop runs again as written: every line comes out once. The first loop is only there
+; so the forced run launches a kernel.
+(fn doubled (params (n I64)) (returns (Vec I64))
+  (body
+    (var w (Vec I64) (fill n 0))
+    (for i (range 0 n) (set (at w i) (* i 2)))
+    w))
+
+; Its own fn: a fn that launches kernels, or calls one that does, keeps its loops as written.
+(fn walk (params (con Console) (n I64))
+  (body
+    ; A ring, built with while loops so that nothing here goes to the GPU.
+    (var off (Vec I64) (fill (+ n 1) 0))
+    (var adj (Vec I64) (fill (* 2 n) 0))
+    (var i 0)
+    (while (< i n)
+      (set (at off (+ i 1)) (* 2 (+ i 1)))
+      (set (at adj (* 2 i)) (% (+ i 1) n))
+      (set (at adj (+ (* 2 i) 1)) (% (+ i (- n 1)) n))
+      (set i (+ i 1)))
+    (let srcs (vec 0 5 7 11 9))
+    (var mark (Vec I64) (fill n 0))
+    (var dist (Vec I64) (fill n 0))
+    (var queue (Vec I64) (fill n 0))
+    (var grand 0)
+    (var k 0)
+    (while (< k (len srcs))
+      (let src (at srcs k))
+      (let stamp (+ k 1))
+      (let step (if (== k 2) 3000000001 1))
+      (set (at mark src) stamp)
+      (set (at dist src) 0)
+      (set (at queue 0) src)
+      (var head 0)
+      (var tail 1)
+      (var total 0)
+      (while (< head tail)
+        (let x (at queue head))
+        (set head (+ head 1))
+        (let dx (at dist x))
+        (set total (+ total dx))
+        (var e (at off x))
+        (let end (at off (+ x 1)))
+        (while (< e end)
+          (let y (at adj e))
+          (if (!= (at mark y) stamp)
+            (do
+              (set (at mark y) stamp)
+              (set (at dist y) (+ dx step))
+              (set (at queue tail) y)
+              (set tail (+ tail 1))))
+          (set e (+ e 1))))
+      (set grand (+ grand total))
+      (println con src " " tail " " total)
+      (set k (+ k 1)))
+    (println con grand)))
+
+(fn main (params (con Console))
+  (body
+    (let w (doubled 20000))
+    (walk con 20000)
+    (println con (at w 7))))

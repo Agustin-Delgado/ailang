@@ -252,6 +252,7 @@ mod ail_rt {
                 eprintln!("trap in a read handler (answered 500): {}", describe(info));
                 return;
             }
+            release_all();
             flush();
             eprintln!("trap: {}", describe(info));
             std::process::exit(101);
@@ -265,6 +266,35 @@ mod ail_rt {
             super::ail_web::trap(&describe(info));
         }));
     }
+
+    // Output of a loop running on narrow copies is held until the loop finishes: if the run is
+    // thrown away, so is what it printed. Runs nest (a held run may call a fn with its own).
+    #[cfg(not(target_arch = "wasm32"))]
+    thread_local! { static HOLD: RefCell<(String, usize)> = const { RefCell::new((String::new(), 0)) }; }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn hold_begin() -> usize { HOLD.with(|h| { let mut h = h.borrow_mut(); h.1 += 1; h.0.len() }) }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn hold_print(s: &str) { HOLD.with(|h| h.borrow_mut().0.push_str(s)); }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn hold_println(s: &str) { HOLD.with(|h| { let mut h = h.borrow_mut(); h.0.push_str(s); h.0.push('\n'); }); }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn hold_len() -> usize { HOLD.with(|h| h.borrow().0.len()) }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn hold_commit() {
+        let done = HOLD.with(|h| { let mut h = h.borrow_mut(); h.1 = h.1.saturating_sub(1); h.1 == 0 });
+        if done { release_hold(); }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn hold_discard(mark: usize) { HOLD.with(|h| { let mut h = h.borrow_mut(); h.1 = h.1.saturating_sub(1); h.0.truncate(mark); }); }
+    #[cfg(not(target_arch = "wasm32"))]
+    fn release_hold() {
+        let s = HOLD.with(|h| std::mem::take(&mut h.borrow_mut().0));
+        if !s.is_empty() { OUT.with(|o| { let _ = o.borrow_mut().write_all(s.as_bytes()); }); }
+    }
+
+    // A trap inside a held run is a real trap: what the run printed comes out before it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn release_all() { HOLD.with(|h| h.borrow_mut().1 = 0); release_hold(); }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn flush() { OUT.with(|o| { let _ = o.borrow_mut().flush(); }); }
@@ -315,6 +345,33 @@ mod ail_rt {
     #[track_caller] #[cold]
     fn neg_index(i: i64) -> ! { panic!("negative index {i}") }
 
+    // Loops that run on 32-bit copies of their vectors (see `narrow_region` in the emitter):
+    // every element stays within [lo, hi], a range that fits i32 and that the loop's index
+    // reads rely on. A store outside it stops the fast run, which is then thrown away.
+    pub fn narrow(v: &[i64], lo: i64, hi: i64) -> Option<Vec<i32>> {
+        let mut ok = true;
+        for &x in v {
+            ok &= x >= lo && x <= hi;
+        }
+        if ok { Some(v.iter().map(|&x| x as i32).collect()) } else { None }
+    }
+    #[inline(always)]
+    pub fn narrow_fill(n: usize, x: i64, lo: i64, hi: i64) -> Option<Vec<i32>> {
+        if x >= lo && x <= hi { Some(vec![x as i32; n]) } else { None }
+    }
+    #[track_caller] #[inline(always)]
+    pub fn nput(v: &mut [i32], i: usize, x: i64, lo: i64, hi: i64) -> bool {
+        if x >= lo && x <= hi { v[i] = x as i32; true } else { false }
+    }
+    /// Safety: `i` is proven in range by the caller.
+    #[inline(always)]
+    pub unsafe fn nput_unchecked(v: &mut [i32], i: usize, x: i64, lo: i64, hi: i64) -> bool {
+        if x >= lo && x <= hi { *v.get_unchecked_mut(i) = x as i32; true } else { false }
+    }
+    pub fn widen_into(dst: &mut [i64], src: &[i32]) {
+        for (d, s) in dst.iter_mut().zip(src) { *d = *s as i64; }
+    }
+
     pub trait ShiftAil: Sized { fn checked_shl_ail(self, s: u32) -> Self; fn checked_shr_ail(self, s: u32) -> Self; }
     macro_rules! shift_impl { ($($t:ty),*) => { $(
         impl ShiftAil for $t {
@@ -325,6 +382,19 @@ mod ail_rt {
         }
     )* } }
     shift_impl!(i8, i16, i32, i64, u8, u16, u32, u64);
+
+    // `(pow 2 e)`: below the width it is a shift; from there on the ordinary pow, which traps
+    // exactly as before.
+    pub trait Pow2: Sized { fn pow2_ail(e: u32) -> Self; }
+    macro_rules! pow2_impl { ($($t:ty),*) => { $(
+        impl Pow2 for $t {
+            #[track_caller] #[inline(always)]
+            fn pow2_ail(e: u32) -> Self {
+                if e < <$t>::BITS - (<$t>::MIN != 0) as u32 { (1 as $t) << e } else { (2 as $t).pow(e) }
+            }
+        }
+    )* } }
+    pow2_impl!(i8, i16, i32, i64, u8, u16, u32, u64);
 
     // Arithmetic with the overflow check deferred: the result wraps and `of` records that some
     // operation overflowed. A loop built from these has no branch per operation, so LLVM can
@@ -537,7 +607,9 @@ mod ail_rt {
 
         struct Job(*const (dyn Fn() + Sync));
         unsafe impl Send for Job {}
-        struct State { generation: u64, job: Option<Job>, running: usize, alive: usize, trapped: bool }
+        // `base` threads are the ones a job normally runs on; a job may ask for more (`run_wide`),
+        // which are started then and kept. `limit`: the threads (by index) the current job runs on.
+        struct State { generation: u64, job: Option<Job>, running: usize, alive: usize, trapped: bool, base: usize, spawned: usize, limit: usize }
         struct Pool { state: Mutex<State>, start: Condvar, end: Condvar, busy: Mutex<()> }
 
         thread_local! { static INSIDE: Cell<bool> = const { Cell::new(false) }; }
@@ -551,21 +623,20 @@ mod ail_rt {
                 let workers = wanted.unwrap_or(cores);
                 let workers = if workers <= 1 { 0 } else { workers };
                 let p: &'static Pool = Box::leak(Box::new(Pool {
-                    state: Mutex::new(State { generation: 0, job: None, running: 0, alive: workers, trapped: false }),
+                    state: Mutex::new(State { generation: 0, job: None, running: 0, alive: workers, trapped: false, base: workers, spawned: workers, limit: workers }),
                     start: Condvar::new(),
                     end: Condvar::new(),
                     busy: Mutex::new(()),
                 }));
-                for _ in 0..workers {
-                    std::thread::spawn(move || worker(p));
+                for i in 0..workers {
+                    std::thread::spawn(move || worker(p, i, 0));
                 }
                 p
             })
         }
 
-        fn worker(p: &'static Pool) {
+        fn worker(p: &'static Pool, idx: usize, mut seen: u64) {
             INSIDE.with(|c| c.set(true));
-            let mut seen = 0;
             loop {
                 let job = {
                     let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -573,7 +644,7 @@ mod ail_rt {
                         st = p.start.wait(st).unwrap_or_else(|e| e.into_inner());
                     }
                     seen = st.generation;
-                    st.job.as_ref().map(|j| j.0)
+                    if idx < st.limit { st.job.as_ref().map(|j| j.0) } else { None }
                 };
                 let ok = match job {
                     Some(f) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*f)() })).is_ok(),
@@ -590,7 +661,8 @@ mod ail_rt {
 
         /// Threads that run the work (the caller only waits).
         pub fn size() -> usize {
-            get().state.lock().unwrap_or_else(|e| e.into_inner()).alive
+            let st = get().state.lock().unwrap_or_else(|e| e.into_inner());
+            st.alive.min(st.base)
         }
 
         /// True on a pool thread: a parallel construct inside another runs sequentially there.
@@ -614,6 +686,15 @@ mod ail_rt {
         /// borrow from the caller's stack. False (and nothing ran) if the pool is in use by
         /// another thread or has no threads.
         pub fn run(work: &(dyn Fn() + Sync)) -> bool {
+            run_on(work, 0)
+        }
+
+        /// `run` on `threads` threads (at least the usual ones), starting the missing ones.
+        pub fn run_wide(work: &(dyn Fn() + Sync), threads: usize) -> bool {
+            run_on(work, threads)
+        }
+
+        fn run_on(work: &(dyn Fn() + Sync), threads: usize) -> bool {
             let p = get();
             let Ok(_busy) = p.busy.try_lock() else {
                 return false;
@@ -622,6 +703,13 @@ mod ail_rt {
                 let mut st = p.state.lock().unwrap_or_else(|e| e.into_inner());
                 if st.alive == 0 {
                     return false;
+                }
+                st.limit = threads.max(st.base);
+                while st.spawned < st.limit {
+                    let (i, g) = (st.spawned, st.generation);
+                    std::thread::spawn(move || worker(p, i, g));
+                    st.spawned += 1;
+                    st.alive += 1;
                 }
                 // The pointer outlives this call only in the pool's state, which is cleared below
                 // before returning; workers use it only while `running` counts them.
@@ -673,8 +761,11 @@ mod ail_rt {
         let n = (hi - lo) as usize;
         let threads = pool::size();
         // chunks: 0 = several per thread (balances uneven work), 1 = one per thread (for big
-        // private state), more = that many.
-        let k = (match chunks { 0 => threads * 8, 1 => threads, c => c }).clamp(1, n.max(1));
+        // private state), 2 = like 0 but never more threads than cores (big state per chunk).
+        let k = (match chunks { 1 => threads, _ => threads * 8 }).clamp(1, n.max(1));
+        // A few heavy iterations that do not split evenly over the cores (16 on 12): with one
+        // thread each, the cores share them to the end instead of the last ones running alone.
+        let wide = chunks == 0 && n > threads && n % threads != 0 && n <= threads * 4;
         let trapped = AtomicBool::new(false);
         let next = AtomicUsize::new(0);
         let mut out: Vec<std::mem::MaybeUninit<R>> = Vec::with_capacity(k);
@@ -712,7 +803,7 @@ mod ail_rt {
             }
             PAR_TRAP.with(|t| t.set(std::ptr::null()));
         };
-        let ran = pool::run(&work);
+        let ran = if wide { pool::run_wide(&work, n) } else { pool::run(&work) };
         let ok = ran && !trapped.load(Ordering::Acquire);
         if !ok {
             for (c, d) in done.iter().enumerate() {
