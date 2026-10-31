@@ -3238,6 +3238,26 @@ impl<'a> Emitter<'a> {
             };
             win_tests.push(format!("ail_rt::disjoint({s}, &[{}])", wins.join(", ")));
         }
+        // Index forms for a kernel with one work item per (i, j) (see `gpu::Collapse`): for
+        // every write and every read of a written vector, (vector, is a write, its inner range
+        // variable and the rest of the index as text). None: not of the affine form.
+        let mut idx_forms: Vec<(BindId, bool, Option<(Option<BindId>, String)>)> = Vec::new();
+        for (wb, ws) in &writes {
+            let reads = own_reads.iter().chain(stale.iter()).filter(|x| x.0 == *wb).map(|x| (false, x.2));
+            for (is_w, idx) in ws.iter().map(|w| (true, w.1)).chain(reads) {
+                let mut af = Aff::default();
+                let form = if aff(self, idx, lv, &lets, &ranges, &fixed, true, &mut af, 0) && af.lv {
+                    let mut t = format!("{}|{}|", af.neg, af.stride.map(|e| self.src_of(e).to_string()).unwrap_or_default());
+                    for (plus, c) in &af.consts {
+                        t.push_str(&format!("{}({})", if *plus { "+" } else { "-" }, self.src_of(c)));
+                    }
+                    Some((af.j, t))
+                } else {
+                    None
+                };
+                idx_forms.push((*wb, is_w, form));
+            }
+        }
         // Emit.
         let (mut pre, head) = match (range, each) {
             (Some((a, z)), _) => {
@@ -3510,7 +3530,7 @@ impl<'a> Emitter<'a> {
         self.no_par = was;
         let tuple = if ret.is_empty() { "()".to_string() } else { format!("({},)", ret.join(", ")) };
         let gpu = if range.is_some() && self.gpu_on && self.nr.is_none() && hists.is_empty() && pushes.is_empty() && maxes.is_empty() && modsums.is_empty() && lasts.is_empty() && scratch.is_empty() && !prints {
-            self.gpu_attempt(whole.id, lv, body, &sums, &writes, &own_reads, &stale, &tests)
+            self.gpu_attempt(whole.id, lv, body, &sums, &writes, &own_reads, &stale, &idx_forms, &tests)
         } else {
             None
         };
@@ -3542,6 +3562,7 @@ impl<'a> Emitter<'a> {
         writes: &[(BindId, Vec<(u32, &Expr)>)],
         own_reads: &[(BindId, u32, &Expr)],
         stale: &[(BindId, u32, &Expr)],
+        idx_forms: &[(BindId, bool, Option<(Option<BindId>, String)>)],
         tests: &[String],
     ) -> Option<String> {
         let mut sum_map = HashMap::new();
@@ -3552,7 +3573,18 @@ impl<'a> Emitter<'a> {
                 sum_map.insert(*id, r);
             }
         }
-        let collapse = self.collapse_plan(lv, body, &sum_vars);
+        // One item per (i, j) is only right when the items of a row touch different elements:
+        // every write of a vector at the same index made of j plus terms fixed for the row,
+        // and every read of a written vector at that same index (its own element). A write
+        // without j, or with the index of a loop nested deeper (as in `out[r][k] += a[r][c] *
+        // s[c][k]` collapsed over c), is shared by the items of the row: then each row stays
+        // one item, which runs its inner loop in order.
+        let collapse = self.collapse_plan(lv, body, &sum_vars).filter(|c| {
+            idx_forms.iter().all(|(v, _, f)| {
+                let Some((Some(j), t)) = f else { return false };
+                *j == c.j && idx_forms.iter().filter(|x| x.0 == *v).all(|x| matches!(&x.2, Some((_, u)) if u == t))
+            })
+        });
         let collapsed: Option<(&Expr, &Expr)> = collapse.as_ref().map(|c| (c.jlo, c.jhi));
         let inp = crate::gpu::Input {
             ck: self.ck,

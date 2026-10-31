@@ -1,0 +1,38 @@
+; Items of one row that write the same elements: the row must stay one work item. Collapsed
+; over c, the matrix product below had every c of row r add into out[r][k] at once (a race
+; that lost sums), and the row sums had every c of row r add into rs[r].
+(fn matmul (params (a (Vec F64)) (s (Vec F64)) (n I64)) (returns (Vec F64))
+  (body
+    (var out (Vec F64) (fill (* n n) 0.0))
+    (for r (range 0 n)
+      (let base (* r n))
+      (for c (range 0 n)
+        (let av (at a (+ base c)))
+        (let sb (* c n))
+        (for k (range 0 n)
+          (set (at out (+ base k)) (+ (at out (+ base k)) (* av (at s (+ sb k))))))))
+    out))
+
+(fn main (params (con Console))
+  (body
+    (let n 300)
+    (var a (Vec F64) (fill (* n n) 0.0))
+    (var s (Vec F64) (fill (* n n) 0.0))
+    (for i (range 0 (* n n))
+      (set (at a i) (as F64 (- (% (* i 7) 13) 6)))
+      (set (at s i) (as F64 (- (% (* i 5) 11) 5))))
+    (let p (matmul a s n))
+    (var out (Vec I64) (fill (* n n) 0))
+    (for i (range 0 (* n n))
+      (set (at out i) (as I64 (at p i))))
+    (var rs (Vec I64) (fill n 0))
+    (for r (range 0 n)
+      (for c (range 0 n)
+        (set (at rs r) (+ (at rs r) (* (at out (+ (* r n) c)) (+ c 1))))))
+    (var t 0)
+    (for i (range 0 (* n n))
+      (set t (+ t (* (at out i) (+ (% i 97) 1)))))
+    (var u 0)
+    (for r (range 0 n)
+      (set u (+ u (* (at rs r) (+ r 1)))))
+    (println con t " " u)))
